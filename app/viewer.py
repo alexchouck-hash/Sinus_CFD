@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.12.0-dual-frontal-curvy-main"
+APP_VERSION = "0.12.1-curvy-inhale-smooth-frontal"
 APP_VERSION_LABEL = (
-    "dual purple L/R naris→frontal · curvy inhale pathlines → trachea · magenta removal"
+    "curvy naris→trachea pathlines · high-|u| magenta on inhale path · smooth dual frontal"
 )
 
 DEFAULT_CASE = "P001"
@@ -751,10 +751,10 @@ def _fig_3d(
                     line=dict(width=0),
                     symbol="circle",
                 ),
-                name="Areas to remove (narrow / ostium)",
+                name="High |u| to relieve (naris→trachea)",
                 hovertemplate=(
-                    "removal target"
-                    + (" · r≈%{customdata:.2f} mm" if rp.shape[1] > 3 else "")
+                    "high velocity / restriction"
+                    + (" · |u|≈%{customdata:.2f} m/s" if rp.shape[1] > 3 else "")
                     + "<extra></extra>"
                 ),
                 customdata=rp[:, 3] if rp.shape[1] > 3 else None,
@@ -1193,9 +1193,9 @@ def main() -> None:
             help="Dual ipsilateral instrument corridors (straightish, open dark air).",
         )
         show_removal = st.checkbox(
-            "Magenta / pink: areas to remove",
+            "Magenta / pink: high velocity (relieve opening)",
             value=True,
-            help="Narrow bottlenecks / ostium-like zones along the frontal access path.",
+            help="Peak |u| along naris→trachea — sites a larger opening could decompress.",
         )
         show_frontal_sinus = st.checkbox("Frontal sinus", value=True)
         show_sphenoid = st.checkbox("Sphenoid sinus", value=False)

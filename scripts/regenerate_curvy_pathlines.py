@@ -31,15 +31,15 @@ from sinus_cfd.flow_field import compute_curvy_volume_pathlines  # noqa: E402
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--case", default="VisibleHuman_Head")
-    ap.add_argument("--volume-seeds", type=int, default=260)
-    ap.add_argument("--naris-seeds", type=int, default=90)
-    ap.add_argument("--max-lines", type=int, default=300)
-    ap.add_argument("--step-mm", type=float, default=0.20)
+    ap.add_argument("--volume-seeds", type=int, default=200)
+    ap.add_argument("--naris-seeds", type=int, default=220)
+    ap.add_argument("--max-lines", type=int, default=330)
+    ap.add_argument("--step-mm", type=float, default=0.16)
     ap.add_argument(
         "--swirl",
         type=float,
-        default=0.10,
-        help="0=pure streamlines; 0.05–0.15 light turbulent look",
+        default=0.20,
+        help="0=pure streamlines; 0.15–0.28 curvy/turbulent look toward trachea",
     )
     ap.add_argument("--no-bidirectional", action="store_true")
     args = ap.parse_args()

@@ -302,15 +302,17 @@ def compute_streamlines(
     use_trilinear: bool = True,
     swirl: float = 0.0,
     rng: np.random.Generator | None = None,
+    attract_mm: np.ndarray | None = None,
+    attract_strength: float = 0.0,
 ) -> list[np.ndarray]:
     """
     Integrate streamlines from seed points (physical mm).
 
-    - use_trilinear: smooth U sampling so paths curve around bends (not
-      staircase straight segments).
+    - use_trilinear: smooth U sampling so paths curve around bends.
     - RK2 mid-point step; reduced step near walls.
-    - swirl: optional light perpendicular jitter (0–0.25) for a turbulent
-      *look* in demo viz — not a LES model.
+    - swirl: perpendicular meander for a curvy / turbulent look (demo).
+    - attract_mm + attract_strength: soft pull toward a point (e.g. trachea
+      on inhale) so paths generally head downstream without erasing bends.
 
     Returns list of (N_i, 3) arrays of polyline vertices in mm.
     If reverse=True, integrates against the velocity field.
@@ -321,6 +323,11 @@ def compute_streamlines(
     lines: list[np.ndarray] = []
     sign = -1.0 if reverse else 1.0
     rng = rng or np.random.default_rng(0)
+    attract = (
+        np.asarray(attract_mm, dtype=float)
+        if attract_mm is not None and attract_strength > 0
+        else None
+    )
 
     def sample(pos_mm: np.ndarray) -> np.ndarray | None:
         if use_trilinear:
@@ -341,9 +348,13 @@ def compute_streamlines(
             return None
         return sign * np.array([ux[i0, j0, k0], uy[i0, j0, k0], uz[i0, j0, k0]], dtype=float)
 
-    for seed in seed_points_mm:
+    for seed_i, seed in enumerate(seed_points_mm):
         pts = [seed.astype(float)]
         pos = seed.astype(float)
+        # Per-seed phase so meander doesn't lock-step across all lines
+        phase = float(rng.uniform(0.0, 2.0 * np.pi))
+        # Stable perpendicular basis for smooth helical meander
+        meander_axis = rng.normal(0.0, 1.0, size=3)
         for step_i in range(max_steps):
             v = sample(pos)
             if v is None:
@@ -352,26 +363,55 @@ def compute_streamlines(
             if speed < 1e-12:
                 break
             direction = v / speed
-            # Mild swirl: small component perpendicular to flow (demo turbulence look)
+
+            # Soft pull toward trachea (or other attractor) — stronger when far
+            if attract is not None and not reverse:
+                to_att = attract - pos
+                d_att = float(np.linalg.norm(to_att))
+                if d_att > 1e-6:
+                    to_att = to_att / d_att
+                    # Fade pull as we near outlet so we don't overshoot
+                    fade = min(1.0, d_att / 40.0)
+                    direction = direction + float(attract_strength) * fade * to_att
+                    nrm = float(np.linalg.norm(direction))
+                    if nrm > 1e-12:
+                        direction = direction / nrm
+
+            # Curvy meander: smooth helical offset (not white noise spikes)
             if swirl > 1e-6:
-                noise = rng.normal(0.0, 1.0, size=3)
-                perp = noise - direction * float(np.dot(noise, direction))
-                pn = float(np.linalg.norm(perp))
-                if pn > 1e-9:
-                    # stronger swirl where flow is faster
-                    amp = swirl * min(1.0, speed / (speed + 0.4))
-                    direction = direction + amp * (perp / pn)
-                    direction = direction / (float(np.linalg.norm(direction)) + 1e-12)
+                # Build orthonormal frame around flow direction
+                tmp = meander_axis - direction * float(np.dot(meander_axis, direction))
+                tn = float(np.linalg.norm(tmp))
+                if tn < 1e-8:
+                    tmp = np.array([1.0, 0.0, 0.0])
+                    tmp = tmp - direction * float(np.dot(tmp, direction))
+                    tn = float(np.linalg.norm(tmp)) + 1e-12
+                e1 = tmp / tn
+                e2 = np.cross(direction, e1)
+                e2n = float(np.linalg.norm(e2)) + 1e-12
+                e2 = e2 / e2n
+                # Spatial frequency ~ one full turn every ~18 mm of travel
+                ang = phase + (step_i * float(step_mm) / 18.0) * 2.0 * np.pi
+                # Amplitude grows then settles; stronger when flow is faster
+                amp = float(swirl) * (0.55 + 0.45 * min(1.0, speed / (speed + 0.25)))
+                amp *= 0.85 + 0.15 * np.sin(0.37 * step_i)  # slight modulation
+                direction = direction + amp * (np.cos(ang) * e1 + np.sin(ang) * e2)
+                nrm = float(np.linalg.norm(direction))
+                if nrm > 1e-12:
+                    direction = direction / nrm
+
             # RK2
             h = float(step_mm)
             mid = pos + 0.5 * h * direction
             v2 = sample(mid)
             if v2 is not None and float(np.linalg.norm(v2)) > 1e-12:
-                direction = v2 / float(np.linalg.norm(v2))
+                d2 = v2 / float(np.linalg.norm(v2))
+                # Keep some meander at midpoint blend
+                direction = 0.55 * direction + 0.45 * d2
+                direction = direction / (float(np.linalg.norm(direction)) + 1e-12)
             new_pos = pos + h * direction
             idx = _phys_to_index(new_pos.reshape(1, 3), spacing_xyz_mm, origin_xyz_mm, shape)[0]
             if not airway[tuple(idx)]:
-                # adaptive retreat along the curved direction
                 advanced = False
                 for frac in (0.5, 0.25, 0.12):
                     trial = pos + frac * h * direction
@@ -824,30 +864,34 @@ def compute_curvy_volume_pathlines(
         use_trilinear=True,
         swirl=swirl,
         rng=rng,
+        attract_mm=trachea,
+        attract_strength=0.32 if trachea is not None else 0.0,
     )
 
     raw_lines: list[np.ndarray] = []
     for seed in seeds:
         s = seed.reshape(1, 3)
+        # Forward toward trachea (inhale); reverse stubs without attract
         fwd = compute_streamlines(**base_kw, seed_points_mm=s, reverse=False)
         f = fwd[0] if fwd else None
+        rev_kw = {**base_kw, "attract_strength": 0.0, "swirl": swirl * 0.5}
         rev = (
-            compute_streamlines(**base_kw, seed_points_mm=s, reverse=True)
+            compute_streamlines(**rev_kw, seed_points_mm=s, reverse=True)
             if bidirectional
             else []
         )
         r = rev[0] if rev else None
 
-        # Stitch reverse+forward at seed, then orient naris→trachea
+        # Prefer pure forward naris→trachea curves; use reverse only to reach naris
         candidates: list[np.ndarray] = []
+        if f is not None and len(f) >= 6:
+            candidates.append(f)
         if r is not None and f is not None and len(r) >= 2 and len(f) >= 2:
             up = r[::-1]
             if float(np.linalg.norm(up[-1] - f[0])) < 0.75:
                 candidates.append(np.vstack([up[:-1], f]))
             else:
                 candidates.append(np.vstack([up, f]))
-        if f is not None and len(f) >= 6:
-            candidates.append(f)
         if r is not None and len(r) >= 6:
             candidates.append(r[::-1])
 

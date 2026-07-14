@@ -250,6 +250,155 @@ def straighten_path_in_air(
     return np.asarray(out, dtype=float)
 
 
+def smooth_instrument_path(
+    path_mm: np.ndarray,
+    air: np.ndarray,
+    spacing_xyz: tuple[float, float, float],
+    origin_xyz: tuple[float, float, float],
+    n: int = 64,
+    smooth_passes: int = 4,
+    max_turn_deg: float = 22.0,
+) -> np.ndarray:
+    """
+    Smooth instrument corridor: relatively straight, **no sharp corners**.
+
+    Moving-average smooth + turn-angle clamp, then snap back into air.
+    Suitable for a rigid endoscope that bends gently only.
+    """
+    if path_mm is None or len(path_mm) < 3:
+        return path_mm
+    pts = resample_polyline(np.asarray(path_mm, dtype=float), n)
+    a0, a1 = pts[0].copy(), pts[-1].copy()
+
+    for _ in range(max(1, smooth_passes)):
+        sm = pts.copy()
+        for i in range(1, len(pts) - 1):
+            sm[i] = 0.25 * pts[i - 1] + 0.5 * pts[i] + 0.25 * pts[i + 1]
+        pts = sm
+        # Clamp sharp turns
+        max_rad = np.deg2rad(max_turn_deg)
+        for i in range(1, len(pts) - 1):
+            v0 = pts[i] - pts[i - 1]
+            v1 = pts[i + 1] - pts[i]
+            n0 = float(np.linalg.norm(v0))
+            n1 = float(np.linalg.norm(v1))
+            if n0 < 1e-9 or n1 < 1e-9:
+                continue
+            u0, u1 = v0 / n0, v1 / n1
+            cos_a = float(np.clip(np.dot(u0, u1), -1.0, 1.0))
+            ang = float(np.arccos(cos_a))
+            if ang > max_rad:
+                # Rotate v1 toward v0 to reduce turn
+                # Place next point along bisector closer to u0
+                blend = max_rad / max(ang, 1e-6)
+                u_new = u0 * (1.0 - blend) + u1 * blend
+                un = float(np.linalg.norm(u_new)) + 1e-12
+                pts[i + 1] = pts[i] + (u_new / un) * n1
+
+    # Snap to air (except endpoints)
+    out = [a0]
+    for p in pts[1:-1]:
+        zyx = nearest_air_index(air, _mm_to_zyx(p, spacing_xyz, origin_xyz, air.shape))
+        out.append(_zyx_to_mm(zyx, spacing_xyz, origin_xyz))
+    out.append(a1)
+    # Final light smooth on air-snapped points (preserve ends)
+    arr = np.asarray(out, dtype=float)
+    for _ in range(2):
+        sm = arr.copy()
+        for i in range(1, len(arr) - 1):
+            sm[i] = 0.2 * arr[i - 1] + 0.6 * arr[i] + 0.2 * arr[i + 1]
+        arr = sm
+        arr[0], arr[-1] = a0, a1
+    # Re-snap midpoints once more
+    final = [a0]
+    for p in arr[1:-1]:
+        zyx = nearest_air_index(air, _mm_to_zyx(p, spacing_xyz, origin_xyz, air.shape))
+        final.append(_zyx_to_mm(zyx, spacing_xyz, origin_xyz))
+    final.append(a1)
+    return np.asarray(final, dtype=float)
+
+
+def restriction_along_paths_high_speed(
+    path_mm_list: list[np.ndarray],
+    speed: np.ndarray,
+    air: np.ndarray,
+    spacing_xyz: tuple[float, float, float],
+    origin_xyz: tuple[float, float, float],
+    speed_percentile: float = 82.0,
+    tube_radius_mm: float = 4.0,
+    max_points: int = 6000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Magenta surgical targets: high |u| along naris→trachea pathways.
+
+    A larger opening here would relieve velocity / resistance.
+    Returns (mask, points_xyz_speed Nx4).
+    """
+    sx, sy, sz = spacing_xyz
+    ox, oy, oz = origin_xyz
+    mask = np.zeros_like(air, dtype=bool)
+    if not path_mm_list:
+        return mask, np.zeros((0, 4), dtype=np.float32)
+
+    # Corridor around paths
+    zz, yy, xx = np.where(air)
+    if len(zz) == 0:
+        return mask, np.zeros((0, 4), dtype=np.float32)
+    px = ox + xx * sx
+    py = oy + yy * sy
+    pz = oz + zz * sz
+    pts_air = np.column_stack([px, py, pz])
+
+    near = np.zeros(len(zz), dtype=bool)
+    for path in path_mm_list:
+        path = np.asarray(path, dtype=float)
+        if len(path) < 2:
+            continue
+        # subsample path for speed
+        if len(path) > 80:
+            path = path[:: max(1, len(path) // 80)]
+        # distance to polyline (approx nearest vertex)
+        # batch in chunks
+        dmin = np.full(len(zz), np.inf)
+        for i in range(0, len(path), 8):
+            chunk = path[i : i + 8]
+            # (N_air, K)
+            d = np.linalg.norm(pts_air[:, None, :] - chunk[None, :, :], axis=2).min(axis=1)
+            dmin = np.minimum(dmin, d)
+        near |= dmin <= tube_radius_mm
+
+    if not near.any():
+        return mask, np.zeros((0, 4), dtype=np.float32)
+
+    sp = speed[zz[near], yy[near], xx[near]]
+    thr = float(np.percentile(sp, speed_percentile)) if sp.size else 0.0
+    thr = max(thr, float(np.percentile(speed[air], 75)) if air.any() else thr)
+    hot = near.copy()
+    hot[near] = sp >= thr
+    mask[zz[hot], yy[hot], xx[hot]] = True
+
+    # Dilate slightly for visibility
+    if mask.any():
+        mask = morphology.binary_dilation(mask, footprint=morphology.ball(1)) & air
+
+    hz, hy, hx = np.where(mask)
+    if len(hz) == 0:
+        return mask, np.zeros((0, 4), dtype=np.float32)
+    if len(hz) > max_points:
+        rng = np.random.default_rng(9)
+        pick = rng.choice(len(hz), size=max_points, replace=False)
+        hz, hy, hx = hz[pick], hy[pick], hx[pick]
+    pts = np.column_stack(
+        [
+            ox + hx * sx,
+            oy + hy * sy,
+            oz + hz * sz,
+            speed[hz, hy, hx],
+        ]
+    ).astype(np.float32)
+    return mask, pts
+
+
 def path_restriction_highlights(
     path_zyx: list[tuple[int, int, int]],
     air: np.ndarray,

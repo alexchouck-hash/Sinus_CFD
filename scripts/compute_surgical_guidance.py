@@ -34,6 +34,8 @@ from sinus_cfd.open_path import (  # noqa: E402
     nearest_air_index,
     split_frontal_lr,
     straighten_path_in_air,
+    smooth_instrument_path,
+    restriction_along_paths_high_speed,
     _mm_to_zyx,
 )
 from sinus_cfd.pipeline import _mask_to_mesh  # noqa: E402
@@ -237,11 +239,19 @@ def main() -> int:
             straight_bias=4.5,  # instrument corridor: prefer straight naris→frontal
         )
         pts = path_zyx_to_mm(idx, spacing, origin)
-        # Pull toward straight chord for instrument corridor look
+        # Relatively straight instrument corridor, no sharp corners
         pts = straighten_path_in_air(
-            pts, air_domain, spacing, origin, blend=0.72, n=56
+            pts, air_domain, spacing, origin, blend=0.78, n=64
         )
-        # re-map straightened path to zyx for restriction sampling
+        pts = smooth_instrument_path(
+            pts,
+            air_domain,
+            spacing,
+            origin,
+            n=72,
+            smooth_passes=5,
+            max_turn_deg=18.0,
+        )
         idx_s = [
             nearest_air_index(air_domain, _mm_to_zyx(p, spacing, origin, shape))
             for p in pts
@@ -275,47 +285,94 @@ def main() -> int:
 
     notes.append("Dual purple paths: L naris→L frontal, R naris→R frontal")
 
-    # Magenta removal zones: bottlenecks on all frontal access paths
-    highlight, bottlenecks = path_restriction_highlights(
+    # Magenta = high-velocity zones along naris→trachea inhale pathways
+    # (places a larger opening could relieve resistance / peak speed)
+    speed = npz["speed"].astype(float)
+    airway_flow = npz["airway"].astype(bool)
+
+    # Build inhale path corridors from BC nares → trachea (open-path style)
+    trachea_mm = None
+    bc_path = out / f"{case_id}_boundary_conditions.json"
+    if bc_path.is_file():
+        bc = json.loads(bc_path.read_text(encoding="utf-8"))
+        for port in bc.get("ports", []):
+            if port.get("role") == "outlet" and port.get("center_mm"):
+                trachea_mm = [float(v) for v in port["center_mm"]]
+    inhale_paths_mm: list = []
+    if trachea_mm is not None:
+        for nm in naris_pts[:2]:
+            s = nearest_air_index(airway_flow, _mm_to_zyx(nm, spacing, origin, shape))
+            e = nearest_air_index(
+                airway_flow, _mm_to_zyx(trachea_mm, spacing, origin, shape)
+            )
+            idx_inh = most_open_path_zyx(
+                airway_flow, s, e, spacing, power=1.8, hu=hu, hu_weight=0.3
+            )
+            inhale_paths_mm.append(path_zyx_to_mm(idx_inh, spacing, origin))
+        notes.append(f"Inhale corridors for restriction: {len(inhale_paths_mm)} naris→trachea")
+
+    # Prefer streamlines if present (true flow)
+    sl_path = out / f"{case_id}_streamlines.json"
+    if sl_path.is_file():
+        try:
+            sl = json.loads(sl_path.read_text(encoding="utf-8"))
+            for line in (sl.get("lines") or [])[:80]:
+                arr = np.asarray(line, dtype=float)
+                if len(arr) >= 8:
+                    inhale_paths_mm.append(arr[:: max(1, len(arr) // 40)])
+            notes.append("Added streamline samples to restriction corridor.")
+        except Exception as exc:
+            notes.append(f"Streamline load for restriction skipped: {exc}")
+
+    highlight, rem_pts = restriction_along_paths_high_speed(
+        inhale_paths_mm,
+        speed,
+        airway_flow,
+        spacing,
+        origin,
+        speed_percentile=80.0,
+        tube_radius_mm=5.0,
+        max_points=6500,
+    )
+    # Also keep narrow bottlenecks on frontal instrument paths (secondary)
+    fb_mask, bottlenecks = path_restriction_highlights(
         all_path_zyx,
         air_domain,
         spacing,
         origin,
         radius=radius,
-        narrow_percentile=28.0,
-        ball_radius=2,
+        narrow_percentile=22.0,
+        ball_radius=1,
     )
-    # Also flag narrow junctions near frontal (ostium-like)
-    if anatomy.frontal.any():
-        fringe = morphology.binary_dilation(anatomy.frontal, footprint=morphology.ball(2))
-        fringe = fringe & air_domain & ~anatomy.frontal
-        narrow = fringe & (radius <= max(1.2, float(np.percentile(radius[air_domain], 20))))
-        highlight |= narrow
+    # Flow high-speed is primary magenta; instrument bottlenecks add a little
+    highlight = highlight | (fb_mask & airway_flow)
     notes.append(
-        f"Removal highlight voxels={int(highlight.sum())} bottlenecks={len(bottlenecks)}"
+        f"Removal (high |u| on naris→trachea): {int(highlight.sum())} vx; "
+        f"frontal bottlenecks={len(bottlenecks)}"
     )
 
     _write_mask(highlight, out / f"{case_id}_removal_highlight.nrrd", spacing, origin)
     _export_stl(highlight, out / f"{case_id}_removal_highlight.stl", spacing, origin, faces=8000)
 
-    # Point cloud for viewer (magenta)
+    # Re-sample points from final mask with speed for viewer color/hover
     zz, yy, xx = np.where(highlight)
-    if len(zz) > 5000:
+    if len(zz) > 6000:
         rng = np.random.default_rng(5)
-        pick = rng.choice(len(zz), size=5000, replace=False)
+        pick = rng.choice(len(zz), size=6000, replace=False)
         zz, yy, xx = zz[pick], yy[pick], xx[pick]
     rem_pts = np.column_stack(
         [
             origin[0] + xx * spacing[0],
             origin[1] + yy * spacing[1],
             origin[2] + zz * spacing[2],
-            radius[zz, yy, xx],
+            speed[zz, yy, xx] if len(zz) else np.array([]),
         ]
     ).astype(np.float32)
     np.savez_compressed(
         out / f"{case_id}_removal_highlight.npz",
-        points_xyz_r_mm=rem_pts,
+        points_xyz_r_mm=rem_pts,  # col3 = speed m/s (legacy key name)
         n_points=np.int32(len(zz)),
+        metric="speed_m_s_along_naris_trachea",
     )
 
     guidance = {
