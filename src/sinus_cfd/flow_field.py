@@ -229,6 +229,65 @@ def scale_velocity_to_flow_rate(
     return ux_s, uy_s, uz_s, speed_s, achieved
 
 
+def sample_velocity_trilinear(
+    pos_mm: np.ndarray,
+    ux: np.ndarray,
+    uy: np.ndarray,
+    uz: np.ndarray,
+    airway: np.ndarray,
+    spacing_xyz_mm: tuple[float, float, float],
+    origin_xyz_mm: tuple[float, float, float],
+) -> np.ndarray | None:
+    """
+    Smooth velocity sample so streamlines bend continuously around corners
+    (nearest-neighbor makes angular, “straight segment” paths).
+    """
+    sx, sy, sz = spacing_xyz_mm
+    ox, oy, oz = origin_xyz_mm
+    nz, ny, nx = airway.shape
+    x, y, z = float(pos_mm[0]), float(pos_mm[1]), float(pos_mm[2])
+    fx = (x - ox) / sx
+    fy = (y - oy) / sy
+    fz = (z - oz) / sz
+    i0 = int(np.floor(fz))
+    j0 = int(np.floor(fy))
+    k0 = int(np.floor(fx))
+    if not (0 <= i0 < nz - 1 and 0 <= j0 < ny - 1 and 0 <= k0 < nx - 1):
+        return None
+    if not airway[i0, j0, k0]:
+        # allow sample if any corner of cell is air
+        corners = airway[i0 : i0 + 2, j0 : j0 + 2, k0 : k0 + 2]
+        if not corners.any():
+            return None
+    di = fz - i0
+    dj = fy - j0
+    dk = fx - k0
+
+    def _corner(ii: int, jj: int, kk: int) -> np.ndarray:
+        if not airway[ii, jj, kk]:
+            return np.zeros(3, dtype=float)
+        return np.array([ux[ii, jj, kk], uy[ii, jj, kk], uz[ii, jj, kk]], dtype=float)
+
+    c000 = _corner(i0, j0, k0)
+    c001 = _corner(i0, j0, k0 + 1)
+    c010 = _corner(i0, j0 + 1, k0)
+    c011 = _corner(i0, j0 + 1, k0 + 1)
+    c100 = _corner(i0 + 1, j0, k0)
+    c101 = _corner(i0 + 1, j0, k0 + 1)
+    c110 = _corner(i0 + 1, j0 + 1, k0)
+    c111 = _corner(i0 + 1, j0 + 1, k0 + 1)
+    c00 = c000 * (1 - dk) + c001 * dk
+    c01 = c010 * (1 - dk) + c011 * dk
+    c10 = c100 * (1 - dk) + c101 * dk
+    c11 = c110 * (1 - dk) + c111 * dk
+    c0 = c00 * (1 - dj) + c01 * dj
+    c1 = c10 * (1 - dj) + c11 * dj
+    v = c0 * (1 - di) + c1 * di
+    if float(np.linalg.norm(v)) < 1e-14:
+        return None
+    return v
+
+
 def compute_streamlines(
     ux: np.ndarray,
     uy: np.ndarray,
@@ -240,9 +299,18 @@ def compute_streamlines(
     max_steps: int = 400,
     step_mm: float = 0.4,
     reverse: bool = False,
+    use_trilinear: bool = True,
+    swirl: float = 0.0,
+    rng: np.random.Generator | None = None,
 ) -> list[np.ndarray]:
     """
-    RK2 integration of streamlines from seed points (physical mm).
+    Integrate streamlines from seed points (physical mm).
+
+    - use_trilinear: smooth U sampling so paths curve around bends (not
+      staircase straight segments).
+    - RK2 mid-point step; reduced step near walls.
+    - swirl: optional light perpendicular jitter (0–0.25) for a turbulent
+      *look* in demo viz — not a LES model.
 
     Returns list of (N_i, 3) arrays of polyline vertices in mm.
     If reverse=True, integrates against the velocity field.
@@ -252,10 +320,17 @@ def compute_streamlines(
     shape = airway.shape
     lines: list[np.ndarray] = []
     sign = -1.0 if reverse else 1.0
+    rng = rng or np.random.default_rng(0)
 
     def sample(pos_mm: np.ndarray) -> np.ndarray | None:
+        if use_trilinear:
+            v = sample_velocity_trilinear(
+                pos_mm, ux, uy, uz, airway, spacing_xyz_mm, origin_xyz_mm
+            )
+            if v is None:
+                return None
+            return sign * v
         x, y, z = pos_mm
-        # continuous index
         ix = (x - ox) / sx
         iy = (y - oy) / sy
         iz = (z - oz) / sz
@@ -264,38 +339,115 @@ def compute_streamlines(
             return None
         if not airway[i0, j0, k0]:
             return None
-        # nearest-neighbor sample (fast, good enough for viz)
         return sign * np.array([ux[i0, j0, k0], uy[i0, j0, k0], uz[i0, j0, k0]], dtype=float)
 
     for seed in seed_points_mm:
         pts = [seed.astype(float)]
         pos = seed.astype(float)
-        for _ in range(max_steps):
+        for step_i in range(max_steps):
             v = sample(pos)
             if v is None:
                 break
-            speed = np.linalg.norm(v)
+            speed = float(np.linalg.norm(v))
             if speed < 1e-12:
                 break
             direction = v / speed
+            # Mild swirl: small component perpendicular to flow (demo turbulence look)
+            if swirl > 1e-6:
+                noise = rng.normal(0.0, 1.0, size=3)
+                perp = noise - direction * float(np.dot(noise, direction))
+                pn = float(np.linalg.norm(perp))
+                if pn > 1e-9:
+                    # stronger swirl where flow is faster
+                    amp = swirl * min(1.0, speed / (speed + 0.4))
+                    direction = direction + amp * (perp / pn)
+                    direction = direction / (float(np.linalg.norm(direction)) + 1e-12)
             # RK2
-            mid = pos + 0.5 * step_mm * direction
+            h = float(step_mm)
+            mid = pos + 0.5 * h * direction
             v2 = sample(mid)
-            if v2 is not None and np.linalg.norm(v2) > 1e-12:
-                direction = v2 / np.linalg.norm(v2)
-            new_pos = pos + step_mm * direction
+            if v2 is not None and float(np.linalg.norm(v2)) > 1e-12:
+                direction = v2 / float(np.linalg.norm(v2))
+            new_pos = pos + h * direction
             idx = _phys_to_index(new_pos.reshape(1, 3), spacing_xyz_mm, origin_xyz_mm, shape)[0]
             if not airway[tuple(idx)]:
-                # try smaller step once
-                new_pos = pos + 0.25 * step_mm * direction
-                idx = _phys_to_index(new_pos.reshape(1, 3), spacing_xyz_mm, origin_xyz_mm, shape)[0]
-                if not airway[tuple(idx)]:
+                # adaptive retreat along the curved direction
+                advanced = False
+                for frac in (0.5, 0.25, 0.12):
+                    trial = pos + frac * h * direction
+                    idx2 = _phys_to_index(
+                        trial.reshape(1, 3), spacing_xyz_mm, origin_xyz_mm, shape
+                    )[0]
+                    if airway[tuple(idx2)]:
+                        new_pos = trial
+                        advanced = True
+                        break
+                if not advanced:
                     break
             pos = new_pos
             pts.append(pos.copy())
         if len(pts) >= 5:
             lines.append(np.vstack(pts))
     return lines
+
+
+def seeds_throughout_volume(
+    airway: np.ndarray,
+    spacing_xyz_mm: tuple[float, float, float],
+    origin_xyz_mm: tuple[float, float, float],
+    n_seeds: int = 200,
+    speed: np.ndarray | None = None,
+    prefer_speed: bool = True,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """
+    Scatter seeds through the full air domain (sinuses + nasal + pharynx).
+
+    When prefer_speed, mix high-speed cores with uniform coverage so secondary
+    passages still get streamlines.
+    """
+    rng = rng or np.random.default_rng(11)
+    sx, sy, sz = spacing_xyz_mm
+    ox, oy, oz = origin_xyz_mm
+    mask = airway.astype(bool)
+    if speed is not None:
+        active = mask & (speed > 1e-6)
+        if not active.any():
+            active = mask
+    else:
+        active = mask
+    zz, yy, xx = np.where(active)
+    if len(zz) == 0:
+        return np.zeros((0, 3), dtype=float)
+    n = min(int(n_seeds), len(zz))
+    if prefer_speed and speed is not None and n >= 8:
+        sp = speed[zz, yy, xx]
+        # half by speed weight, half uniform
+        n_fast = n // 2
+        n_uni = n - n_fast
+        w = np.clip(sp, 1e-6, None)
+        w = w / w.sum()
+        try:
+            pick_fast = rng.choice(len(zz), size=n_fast, replace=False, p=w)
+        except ValueError:
+            pick_fast = rng.choice(len(zz), size=n_fast, replace=True, p=w)
+        pick_uni = rng.choice(len(zz), size=n_uni, replace=False)
+        pick = np.unique(np.concatenate([pick_fast, pick_uni]))
+        if len(pick) < n:
+            extra = rng.choice(len(zz), size=n - len(pick), replace=True)
+            pick = np.concatenate([pick, extra])
+    else:
+        pick = rng.choice(len(zz), size=n, replace=False)
+    pts = np.column_stack(
+        [
+            ox + xx[pick] * sx,
+            oy + yy[pick] * sy,
+            oz + zz[pick] * sz,
+        ]
+    ).astype(float)
+    # small jitter inside voxel so lines don't stack
+    pts += rng.normal(0.0, 0.25 * min(sx, sy, sz), size=pts.shape)
+    return pts
 
 
 def seeds_near_ports(
@@ -541,6 +693,123 @@ def compute_inhale_streamlines(
     kept.sort(key=sort_key, reverse=True)
     n_keep = max(1, int(max_lines))
     return kept[:n_keep]
+
+
+def compute_curvy_volume_pathlines(
+    ux: np.ndarray,
+    uy: np.ndarray,
+    uz: np.ndarray,
+    airway: np.ndarray,
+    spacing_xyz_mm: tuple[float, float, float],
+    origin_xyz_mm: tuple[float, float, float],
+    naris_centers_mm: list[list[float]] | None = None,
+    outlet_center_mm: list[float] | None = None,
+    n_volume_seeds: int = 220,
+    n_naris_seeds: int = 80,
+    max_steps: int = 1600,
+    step_mm: float = 0.22,
+    swirl: float = 0.08,
+    max_lines: int = 320,
+    bidirectional: bool = True,
+    rng_seed: int = 19,
+) -> list[np.ndarray]:
+    """
+    Dense curvy pathlines seeded throughout the air domain + nares.
+
+    - Volume seeds fill sinuses / turbinates / pharynx (not only inlets).
+    - Bidirectional integration from each seed → full passage traces.
+    - Trilinear U + small step → paths bend around corners.
+    - Optional swirl for a gentle turbulent look (demo viz).
+    """
+    rng = np.random.default_rng(rng_seed)
+    speed = np.sqrt(ux * ux + uy * uy + uz * uz)
+    seeds_list: list[np.ndarray] = []
+
+    vol = seeds_throughout_volume(
+        airway,
+        spacing_xyz_mm,
+        origin_xyz_mm,
+        n_seeds=n_volume_seeds,
+        speed=speed,
+        prefer_speed=True,
+        rng=rng,
+    )
+    if len(vol):
+        seeds_list.append(vol)
+
+    if naris_centers_mm:
+        port = seeds_near_ports(
+            airway,
+            spacing_xyz_mm,
+            origin_xyz_mm,
+            naris_centers_mm,
+            n_per_port=max(8, n_naris_seeds // max(1, len(naris_centers_mm))),
+            radius_mm=10.0,
+            speed=speed,
+        )
+        if len(port):
+            seeds_list.append(port)
+
+    if not seeds_list:
+        return []
+    seeds = np.vstack(seeds_list)
+
+    # Per-seed integration so bidirectional stitch stays aligned
+    lines: list[np.ndarray] = []
+    base_kw = dict(
+        ux=ux,
+        uy=uy,
+        uz=uz,
+        airway=airway,
+        spacing_xyz_mm=spacing_xyz_mm,
+        origin_xyz_mm=origin_xyz_mm,
+        max_steps=max_steps,
+        step_mm=step_mm,
+        use_trilinear=True,
+        swirl=swirl,
+        rng=rng,
+    )
+    for seed in seeds:
+        s = seed.reshape(1, 3)
+        fwd = compute_streamlines(**base_kw, seed_points_mm=s, reverse=False)
+        f = fwd[0] if fwd else None
+        if bidirectional:
+            rev = compute_streamlines(**base_kw, seed_points_mm=s, reverse=True)
+            r = rev[0] if rev else None
+            if r is not None and f is not None and len(r) >= 2 and len(f) >= 2:
+                up = r[::-1]
+                if float(np.linalg.norm(up[-1] - f[0])) < 0.75:
+                    joined = np.vstack([up[:-1], f])
+                else:
+                    joined = np.vstack([up, f])
+                if len(joined) >= 8:
+                    lines.append(joined)
+                    continue
+            if r is not None and len(r) >= 8:
+                lines.append(r[::-1])
+                continue
+        if f is not None and len(f) >= 8:
+            lines.append(f)
+
+    # Prefer longer, more curved paths (higher arc length / chord)
+    scored: list[tuple[float, np.ndarray]] = []
+    for line in lines:
+        line = np.asarray(line, dtype=float)
+        if len(line) < 8:
+            continue
+        seg = np.linalg.norm(np.diff(line, axis=0), axis=1)
+        arc = float(seg.sum())
+        chord = float(np.linalg.norm(line[-1] - line[0]))
+        curve = arc / max(chord, 1e-3)
+        score = arc + 8.0 * max(0.0, curve - 1.0)
+        if outlet_center_mm is not None:
+            out = np.asarray(outlet_center_mm, dtype=float)
+            d0 = float(np.linalg.norm(line[0] - out))
+            d1 = float(np.linalg.norm(line[-1] - out))
+            score += max(0.0, d0 - d1) * 1.5
+        scored.append((score, line))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [ln for _, ln in scored[: max(1, int(max_lines))]]
 
 
 def extend_paths_to_outlet_via_centerline(

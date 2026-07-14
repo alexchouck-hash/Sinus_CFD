@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.9.2-tip-vestibule"
+APP_VERSION = "0.10.0-curvy-volume-pathlines"
 APP_VERSION_LABEL = (
-    "nasal air extended to skin tip · dual vestibules · ~50/50 pathlines"
+    "curvy trilinear pathlines · volume seeds through sinuses/airways · mild swirl"
 )
 
 DEFAULT_CASE = "P001"
@@ -1009,10 +1009,10 @@ def main() -> None:
         max_pathlines = st.slider(
             "Max pathlines shown",
             20,
-            400,
-            180,
+            500,
+            260,
             10,
-            help="Dense semi-transparent lines; lower if the plot is slow.",
+            help="Dense curvy semi-transparent lines; lower if the plot is slow.",
         )
         animate_pathlines = st.checkbox(
             "Animate particles along pathlines",
