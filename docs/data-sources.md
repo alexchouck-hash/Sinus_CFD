@@ -16,6 +16,15 @@ Ideal for this project: **130** 3D CT volumes with pixel-wise labels for:
 
 These labels can seed airway segmentation and virtual-surgery experiments without starting from raw unlabeled CT alone.
 
+**nnU-Net training scaffold (this repo):**
+
+```powershell
+py -3.12 scripts\download_nasalseg.py
+py -3.12 scripts\prepare_nnunet_nasalseg.py
+```
+
+See **`docs/nnunet_nasal.md`**.
+
 ## Full head: Visible Human Project CT (recommended whole-head)
 
 | | |
@@ -27,6 +36,23 @@ These labels can seed airway segmentation and virtual-surgery experiments withou
 | **Local download** | `py -3.12 scripts/download_visible_human_head.py` → `data/VisibleHuman_Head/` |
 
 NasalSeg is a **cropped nasal/sinus FOV with labels**. Visible Human is a **full head without nasal labels** — complementary.
+
+## Which anatomy for the demo?
+
+| Goal | Prefer | Why |
+|------|--------|-----|
+| **Accurate L/R nasal cavity + maxillary sinuses** | **NasalSeg** (labels) | Expert pixel labels; no guessing air vs mucosa |
+| **Whole path nostrils → pharynx → trachea** | **Visible Human head** | Only full FOV with caudal airway |
+| **Best of both (longer term)** | nnU-Net on NasalSeg → apply to head CTs | Auto bone / soft tissue / air / nasal classes |
+
+**Recommendation for CFD demo quality today:**
+
+1. Keep **Visible Human** for *anatomy context* (skin, skull outline, trachea).  
+2. Trust **CT air thresholding + CT naris opening shell** only as a bootstrap — it is weak at 1 mm partial-volume nares.  
+3. Prefer **NasalSeg-labeled cases** when you need correct nasal airways without fighting HU thresholds.  
+4. For production patient CTs: **auto-segment** (nnU-Net / TotalSegmentator-style) into bone / soft tissue / air / nasal lumen, then place ports on labeled openings.
+
+Rough physiology for the viewer: **inspiration ~50% left naris + 50% right naris → single trachea outlet** (adjustable later for septal deviation / NAO).
 
 ## Large research archives
 

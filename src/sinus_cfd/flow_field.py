@@ -239,16 +239,19 @@ def compute_streamlines(
     seed_points_mm: np.ndarray,
     max_steps: int = 400,
     step_mm: float = 0.4,
+    reverse: bool = False,
 ) -> list[np.ndarray]:
     """
     RK2 integration of streamlines from seed points (physical mm).
 
     Returns list of (N_i, 3) arrays of polyline vertices in mm.
+    If reverse=True, integrates against the velocity field.
     """
     sx, sy, sz = spacing_xyz_mm
     ox, oy, oz = origin_xyz_mm
     shape = airway.shape
     lines: list[np.ndarray] = []
+    sign = -1.0 if reverse else 1.0
 
     def sample(pos_mm: np.ndarray) -> np.ndarray | None:
         x, y, z = pos_mm
@@ -262,7 +265,7 @@ def compute_streamlines(
         if not airway[i0, j0, k0]:
             return None
         # nearest-neighbor sample (fast, good enough for viz)
-        return np.array([ux[i0, j0, k0], uy[i0, j0, k0], uz[i0, j0, k0]], dtype=float)
+        return sign * np.array([ux[i0, j0, k0], uy[i0, j0, k0], uz[i0, j0, k0]], dtype=float)
 
     for seed in seed_points_mm:
         pts = [seed.astype(float)]
@@ -293,6 +296,296 @@ def compute_streamlines(
         if len(pts) >= 5:
             lines.append(np.vstack(pts))
     return lines
+
+
+def seeds_near_ports(
+    airway: np.ndarray,
+    spacing_xyz_mm: tuple[float, float, float],
+    origin_xyz_mm: tuple[float, float, float],
+    port_centers_mm: list[list[float] | np.ndarray],
+    n_per_port: int = 20,
+    radius_mm: float = 6.0,
+    speed: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Seed points on airway voxels nearest each port center (for inhale streamlines).
+    """
+    sx, sy, sz = spacing_xyz_mm
+    ox, oy, oz = origin_xyz_mm
+    zz, yy, xx = np.where(airway if speed is None else (airway & (speed > 1e-5)))
+    if len(zz) == 0:
+        zz, yy, xx = np.where(airway)
+    if len(zz) == 0:
+        return np.zeros((0, 3), dtype=float)
+    px = ox + xx * sx
+    py = oy + yy * sy
+    pz = oz + zz * sz
+    seeds: list[np.ndarray] = []
+    rng = np.random.default_rng(7)
+    for center in port_centers_mm:
+        c = np.asarray(center, dtype=float)
+        d2 = (px - c[0]) ** 2 + (py - c[1]) ** 2 + (pz - c[2]) ** 2
+        near = d2 <= radius_mm**2
+        if not near.any():
+            k = min(n_per_port, len(d2))
+            pick = np.argpartition(d2, k - 1)[:k]
+        else:
+            ids = np.where(near)[0]
+            if len(ids) > n_per_port:
+                pick = rng.choice(ids, size=n_per_port, replace=False)
+            else:
+                pick = ids
+        for j in pick:
+            seeds.append(np.array([px[j], py[j], pz[j]], dtype=float))
+            # small jitter inside lumen
+            for _ in range(1):
+                seeds.append(
+                    np.array([px[j], py[j], pz[j]], dtype=float)
+                    + rng.normal(0, 0.6, size=3)
+                )
+    return np.array(seeds, dtype=float) if seeds else np.zeros((0, 3), dtype=float)
+
+
+def project_skin_naris_into_lumen(
+    skin_naris_mm: np.ndarray,
+    airway: np.ndarray,
+    spacing_xyz_mm: tuple[float, float, float],
+    origin_xyz_mm: tuple[float, float, float],
+    toward_mm: np.ndarray | None = None,
+    max_steps: int = 80,
+    step_mm: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Walk from external skin naris into the lumen along the path toward the airway.
+
+    Returns (entry_on_lumen_mm, polyline_skin_to_entry including both ends).
+    """
+    sx, sy, sz = spacing_xyz_mm
+    ox, oy, oz = origin_xyz_mm
+    shape = airway.shape
+    start = np.asarray(skin_naris_mm, dtype=float)
+
+    # Direction: prefer toward lumen centroid / given target; default +y (posterior)
+    if toward_mm is not None:
+        direction = np.asarray(toward_mm, dtype=float) - start
+    else:
+        # Nearest airway voxel direction
+        zz, yy, xx = np.where(airway)
+        if len(zz) == 0:
+            return start, start.reshape(1, 3)
+        pts = np.column_stack(
+            [ox + xx * sx, oy + yy * sy, oz + zz * sz]
+        )
+        j = int(np.argmin(np.sum((pts - start) ** 2, axis=1)))
+        direction = pts[j] - start
+    n = np.linalg.norm(direction)
+    if n < 1e-9:
+        direction = np.array([0.0, 1.0, 0.0])
+    else:
+        direction = direction / n
+
+    poly = [start.copy()]
+    pos = start.copy()
+    entry = start.copy()
+    for _ in range(max_steps):
+        pos = pos + step_mm * direction
+        poly.append(pos.copy())
+        idx = _phys_to_index(pos.reshape(1, 3), spacing_xyz_mm, origin_xyz_mm, shape)[0]
+        if airway[tuple(idx)]:
+            entry = pos.copy()
+            break
+    return entry, np.vstack(poly)
+
+
+def compute_inhale_streamlines(
+    ux: np.ndarray,
+    uy: np.ndarray,
+    uz: np.ndarray,
+    airway: np.ndarray,
+    spacing_xyz_mm: tuple[float, float, float],
+    origin_xyz_mm: tuple[float, float, float],
+    inlet_centers_mm: list[list[float] | np.ndarray],
+    outlet_center_mm: list[float] | np.ndarray | None = None,
+    skin_naris_centers_mm: list[list[float] | np.ndarray] | None = None,
+    n_per_naris: int = 22,
+    max_steps: int = 900,
+    step_mm: float = 0.35,
+    reach_outlet_mm: float = 12.0,
+    max_lines: int = 200,
+    seed_radius_mm: float = 10.0,
+) -> list[np.ndarray]:
+    """
+    Streamlines for inspiration: skin nares → nasal passage → trachea.
+
+    - Prefer integration only on the provided airway mask (use *passage lumen*,
+      not sinus-inflated solid, to avoid maxillary detours).
+    - Seeds from lumen near inlets; prepend skin→lumen segment when skin
+      naris centers are given (external openings on the face).
+    - Prefer paths that approach the trachea / caudal outlet.
+    """
+    # Lumen seeds near open ports (internal openings)
+    seeds = seeds_near_ports(
+        airway,
+        spacing_xyz_mm,
+        origin_xyz_mm,
+        inlet_centers_mm,
+        n_per_port=n_per_naris,
+        radius_mm=seed_radius_mm,
+        speed=np.sqrt(ux * ux + uy * uy + uz * uz),
+    )
+    if seeds.size == 0:
+        return []
+
+    outlet = (
+        np.asarray(outlet_center_mm, dtype=float)
+        if outlet_center_mm is not None
+        else None
+    )
+
+    # Map each seed to a skin naris (for entry stub) by nearest skin point
+    skin_list = (
+        [np.asarray(s, dtype=float) for s in skin_naris_centers_mm]
+        if skin_naris_centers_mm
+        else []
+    )
+
+    def score_lines(lines: list[np.ndarray]) -> float:
+        if not lines:
+            return -1.0
+        scores = []
+        for line in lines:
+            if len(line) < 8:
+                continue
+            progress = float(np.linalg.norm(line[-1] - line[0]))
+            if outlet is not None:
+                d0 = float(np.linalg.norm(line[0] - outlet))
+                d1 = float(np.linalg.norm(line[-1] - outlet))
+                progress += max(0.0, d0 - d1) * 3.0
+                if d1 < reach_outlet_mm:
+                    progress += 80.0
+            scores.append(progress)
+        if not scores:
+            return 0.0
+        return float(np.mean(sorted(scores, reverse=True)[: min(12, len(scores))]))
+
+    fwd = compute_streamlines(
+        ux, uy, uz, airway, spacing_xyz_mm, origin_xyz_mm, seeds,
+        max_steps=max_steps, step_mm=step_mm, reverse=False,
+    )
+    rev = compute_streamlines(
+        ux, uy, uz, airway, spacing_xyz_mm, origin_xyz_mm, seeds,
+        max_steps=max_steps, step_mm=step_mm, reverse=True,
+    )
+    lines = fwd if score_lines(fwd) >= score_lines(rev) else rev
+
+    # Prepend skin → lumen entry so paths start at the face, not deep inside
+    if skin_list:
+        lumen_centroid = None
+        zz, yy, xx = np.where(airway)
+        if len(zz):
+            sx, sy, sz = spacing_xyz_mm
+            ox, oy, oz = origin_xyz_mm
+            lumen_centroid = np.array(
+                [
+                    ox + xx.mean() * sx,
+                    oy + yy.mean() * sy,
+                    oz + zz.mean() * sz,
+                ],
+                dtype=float,
+            )
+        extended: list[np.ndarray] = []
+        for line in lines:
+            # nearest skin naris to line start
+            skin = min(skin_list, key=lambda s: float(np.linalg.norm(s - line[0])))
+            _entry, stub = project_skin_naris_into_lumen(
+                skin,
+                airway,
+                spacing_xyz_mm,
+                origin_xyz_mm,
+                toward_mm=lumen_centroid if lumen_centroid is not None else line[0],
+            )
+            # join stub (skin→entry) + streamline from first point near entry
+            if len(stub) >= 2:
+                # drop first streamline points if far from stub end
+                joined = np.vstack([stub, line])
+            else:
+                joined = np.vstack([skin.reshape(1, 3), line])
+            extended.append(joined)
+        lines = extended
+
+    # Keep paths that travel toward the outlet
+    kept: list[np.ndarray] = []
+    for line in lines:
+        travel = float(np.linalg.norm(line[-1] - line[0]))
+        if travel < 15.0:  # mm
+            continue
+        if outlet is not None:
+            d0 = float(np.linalg.norm(line[0] - outlet))
+            d1 = float(np.linalg.norm(line[-1] - outlet))
+            # must get closer to trachea overall
+            if d1 > d0 - 5.0 and d1 > reach_outlet_mm * 2:
+                # allow if still long and y-progress toward outlet
+                if line[-1, 1] <= line[0, 1] + 10 and travel < 40:
+                    continue
+        kept.append(line)
+
+    def sort_key(line: np.ndarray) -> float:
+        travel = float(np.linalg.norm(line[-1] - line[0]))
+        if outlet is None:
+            return travel
+        d0 = float(np.linalg.norm(line[0] - outlet))
+        d1 = float(np.linalg.norm(line[-1] - outlet))
+        bonus = 100.0 if d1 < reach_outlet_mm else 0.0
+        return travel + max(0.0, d0 - d1) * 2.0 + bonus
+
+    kept.sort(key=sort_key, reverse=True)
+    n_keep = max(1, int(max_lines))
+    return kept[:n_keep]
+
+
+def extend_paths_to_outlet_via_centerline(
+    lines: list[np.ndarray],
+    centerline_mm: np.ndarray,
+    outlet_center_mm: np.ndarray | list[float],
+    max_end_dist_mm: float = 14.0,
+) -> list[np.ndarray]:
+    """
+    If a streamline stops short of the trachea, append the remaining centerline.
+
+    This keeps skin→lumen CFD paths but completes the anatomical route to the
+    caudal outlet when the discrete CFD field is weak near the outlet.
+    """
+    if centerline_mm is None or len(centerline_mm) < 2:
+        return lines
+    cl = np.asarray(centerline_mm, dtype=float)
+    outlet = np.asarray(outlet_center_mm, dtype=float)
+    out: list[np.ndarray] = []
+    for line in lines:
+        line = np.asarray(line, dtype=float)
+        end = line[-1]
+        if float(np.linalg.norm(end - outlet)) <= max_end_dist_mm:
+            out.append(line)
+            continue
+        # nearest centerline node to current end
+        d = np.linalg.norm(cl - end, axis=1)
+        i0 = int(np.argmin(d))
+        # walk centerline toward the end that is closer to the outlet
+        d_start = float(np.linalg.norm(cl[0] - outlet))
+        d_end = float(np.linalg.norm(cl[-1] - outlet))
+        if d_end <= d_start:
+            tail = cl[i0:]
+        else:
+            tail = cl[: i0 + 1][::-1]
+        if len(tail) < 2:
+            # direct finish
+            tail = np.vstack([end, outlet])
+        else:
+            # ensure last point is outlet
+            if float(np.linalg.norm(tail[-1] - outlet)) > 1.0:
+                tail = np.vstack([tail, outlet])
+        joined = np.vstack([line, tail])
+        out.append(joined)
+    return out
 
 
 def compute_flow_field(

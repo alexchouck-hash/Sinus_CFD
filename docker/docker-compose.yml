@@ -1,0 +1,24 @@
+# OpenFOAM via Docker for Sinus_CFD
+#
+# From repo root (Docker Desktop running):
+#   docker compose -f docker/docker-compose.yml run --rm openfoam
+#
+# Or use:
+#   scripts/run_openfoam_docker.ps1
+
+services:
+  openfoam:
+    image: opencfd/openfoam-run:2412
+    # Fallback if 2412 tag missing — override with:
+    #   docker compose ... run -e IMAGE=opencfd/openfoam-run:2312
+    working_dir: /case
+    volumes:
+      # Mount the foam case (read-write for mesh/results)
+      - ../foam/VisibleHuman_Head:/case
+      # Geometry source (read-only)
+      - ../outputs/VisibleHuman_Head/openfoam_geometry:/geometry:ro
+    # OpenFOAM ESI images often use an entrypoint that sources bashrc
+    stdin_open: true
+    tty: true
+    # Keep user as image default (often openfoam user)
+    command: bash

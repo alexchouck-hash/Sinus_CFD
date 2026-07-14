@@ -24,6 +24,7 @@ import numpy as np
 import SimpleITK as sitk
 import trimesh
 from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
 from skimage import measure, morphology
 
 from .pipeline import _mask_to_mesh
@@ -191,6 +192,197 @@ def build_solid_air_body(
     return solid.astype(bool)
 
 
+def seal_solid_for_watertight_mesh(
+    solid: np.ndarray,
+    port_masks: list[np.ndarray | None],
+    close_radius: int = 2,
+) -> np.ndarray:
+    """
+    Close open nares/trachea holes so marching cubes yields a closed shell.
+
+    Strategy:
+      1. Dilate open-port voxels into the solid (caps the openings on the mask)
+      2. Morphological closing
+      3. binary_fill_holes (multiple passes)
+      4. Keep largest connected component
+    """
+    sealed = solid.astype(bool)
+    ball_port = morphology.ball(max(close_radius + 1, 2))
+    for pm in port_masks:
+        if pm is None:
+            continue
+        pm = pm.astype(bool)
+        if not pm.any():
+            continue
+        sealed = sealed | morphology.dilation(pm, footprint=ball_port)
+
+    ball = morphology.ball(close_radius)
+    sealed = morphology.closing(sealed, footprint=ball)
+    sealed = ndi.binary_fill_holes(sealed)
+    # Second close catches residual tunnels
+    sealed = morphology.closing(sealed, footprint=morphology.ball(1))
+    sealed = ndi.binary_fill_holes(sealed)
+
+    lab, n = ndi.label(sealed)
+    if n > 1:
+        counts = np.bincount(lab.ravel())
+        counts[0] = 0
+        sealed = lab == int(np.argmax(counts))
+    return sealed
+
+
+def solid_mask_to_watertight_mesh(
+    solid_closed: np.ndarray,
+    spacing: tuple[float, float, float],
+    origin: tuple[float, float, float],
+    target_faces: int = 40000,
+) -> tuple[trimesh.Trimesh, list[str]]:
+    """
+    Marching cubes + hole fill + careful decimation for snappyHexMesh.
+
+    Returns (mesh, notes). Prefers a watertight result over aggressive decimation.
+    """
+    notes: list[str] = []
+    mesh = _mask_to_mesh(solid_closed, spacing, origin)
+    try:
+        mesh.process(validate=True)
+    except Exception:
+        pass
+
+    for _ in range(6):
+        if bool(mesh.is_watertight):
+            break
+        try:
+            mesh.fill_holes()
+        except Exception:
+            break
+        try:
+            trimesh.repair.fix_normals(mesh)
+        except Exception:
+            pass
+
+    if not bool(mesh.is_watertight):
+        # Slight dilation of the mask often closes remaining pinholes
+        notes.append("First mesh not watertight — retry after +1 voxel dilation.")
+        dil = morphology.dilation(solid_closed, footprint=morphology.ball(1))
+        dil = ndi.binary_fill_holes(dil)
+        mesh = _mask_to_mesh(dil, spacing, origin)
+        for _ in range(6):
+            if bool(mesh.is_watertight):
+                break
+            try:
+                mesh.fill_holes()
+            except Exception:
+                break
+
+    was_wt = bool(mesh.is_watertight)
+    n_faces_raw = len(mesh.faces)
+    if n_faces_raw > target_faces:
+        simplified = _decimate(mesh, target_faces)
+        # Re-fill after decimation (often opens small holes)
+        for _ in range(4):
+            if bool(simplified.is_watertight):
+                break
+            try:
+                simplified.fill_holes()
+            except Exception:
+                break
+        if bool(simplified.is_watertight) or not was_wt:
+            mesh = simplified
+            notes.append(
+                f"Decimated solid mesh {n_faces_raw} → {len(mesh.faces)} faces."
+            )
+        else:
+            # Keep denser mesh to preserve watertightness
+            notes.append(
+                f"Kept unsimplified solid mesh ({n_faces_raw} faces) to stay watertight."
+            )
+    try:
+        mesh.fix_normals()
+    except Exception:
+        pass
+
+    if bool(mesh.is_watertight):
+        try:
+            vol = float(abs(mesh.volume))
+            notes.append(f"Watertight solid mesh volume ≈ {vol / 1000.0:.2f} mL.")
+        except Exception:
+            notes.append("Solid mesh is watertight.")
+    else:
+        notes.append(
+            f"WARNING: solid_air_body still not watertight "
+            f"(faces={len(mesh.faces)}, verts={len(mesh.vertices)})."
+        )
+    return mesh, notes
+
+
+def _write_multiregion_stl(
+    mesh: trimesh.Trimesh,
+    face_region: np.ndarray,
+    path: Path,
+) -> dict[str, int]:
+    """
+    Write ASCII STL with named solids (OpenFOAM multi-region triSurfaceMesh).
+
+    face_region: object array of region name per face.
+    """
+    counts: dict[str, int] = {}
+    lines: list[str] = []
+    verts = mesh.vertices
+    faces = mesh.faces
+    # group face indices by region
+    regions: dict[str, list[int]] = {}
+    for i, name in enumerate(face_region):
+        regions.setdefault(str(name), []).append(i)
+
+    for rname, idxs in sorted(regions.items()):
+        lines.append(f"solid {rname}")
+        for fi in idxs:
+            f = faces[fi]
+            tri = verts[f]
+            n = np.cross(tri[1] - tri[0], tri[2] - tri[0])
+            nn = np.linalg.norm(n)
+            if nn > 0:
+                n = n / nn
+            else:
+                n = np.array([0.0, 0.0, 1.0])
+            lines.append(f"  facet normal {n[0]:.6e} {n[1]:.6e} {n[2]:.6e}")
+            lines.append("    outer loop")
+            for v in tri:
+                lines.append(f"      vertex {v[0]:.6e} {v[1]:.6e} {v[2]:.6e}")
+            lines.append("    endloop")
+            lines.append("  endfacet")
+        lines.append(f"endsolid {rname}")
+        counts[rname] = len(idxs)
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return counts
+
+
+def label_solid_faces_by_ports(
+    solid_mesh: trimesh.Trimesh,
+    port_meshes: dict[str, trimesh.Trimesh | None],
+    max_dist_mm: float = 5.0,
+) -> np.ndarray:
+    """
+    Assign each solid face to nearest open-port patch if within max_dist_mm, else wall.
+    """
+    centers = solid_mesh.triangles_center
+    labels = np.full(len(centers), "wall", dtype=object)
+    best_d = np.full(len(centers), np.inf, dtype=float)
+
+    for name, pm in port_meshes.items():
+        if pm is None or len(pm.faces) == 0:
+            continue
+        tree = cKDTree(pm.triangles_center)
+        d, _ = tree.query(centers, k=1, workers=-1)
+        nearer = d < best_d
+        take = nearer & (d <= max_dist_mm)
+        labels[take] = name
+        best_d[take] = d[take]
+    return labels
+
+
 def export_openfoam_geometry(
     case_id: str,
     output_dir: Path | str,
@@ -223,25 +415,7 @@ def export_openfoam_geometry(
         f"({'passage + connected sinuses' if include_sinuses else 'passage only'})."
     )
 
-    # Save solid air mask
-    solid_img = sitk.GetImageFromArray(solid.astype(np.uint8))
-    solid_img.SetSpacing(spacing)
-    solid_img.SetOrigin(origin)
-    if reference_image is not None:
-        solid_img.SetDirection(reference_image.GetDirection())
-    solid_mask_path = geom_dir / f"{case_id}_solid_air_body.nrrd"
-    sitk.WriteImage(solid_img, str(solid_mask_path))
-
-    # Solid air surface (closed envelope of the fluid domain)
-    solid_mesh = _decimate(_mask_to_mesh(solid, spacing, origin), 40000)
-    solid_stl = geom_dir / f"{case_id}_solid_air_body.stl"
-    solid_mesh.export(solid_stl)
-    notes.append(
-        "solid_air_body.stl = outer surface of the air solid (nasal airway ± sinuses). "
-        "Air is modeled *inside* this body."
-    )
-
-    # Split inlets L/R if separate masks not provided: use x-median of inlet_open
+    # Split inlets L/R early — needed to seal ports for a closed solid mesh
     if left_inlet_mask is None or right_inlet_mask is None:
         zz, yy, xx = np.where(inlet_open)
         if len(xx) > 0:
@@ -256,10 +430,66 @@ def export_openfoam_geometry(
             left_inlet_mask = inlet_open.copy()
             right_inlet_mask = np.zeros_like(inlet_open)
 
+    # Seal open ports + morph close so snappy can use locationInMesh / mode inside
+    solid_closed = seal_solid_for_watertight_mesh(
+        solid,
+        port_masks=[left_inlet_mask, right_inlet_mask, outlet_open],
+        close_radius=2,
+    )
+    vol_closed_ml = float(solid_closed.sum() * sp_vol / 1000.0)
+    notes.append(
+        f"Sealed solid (ports closed) voxel volume = {vol_closed_ml:.2f} mL."
+    )
+
+    # Save sealed solid air mask (what snappy should keep as fluid)
+    solid_img = sitk.GetImageFromArray(solid_closed.astype(np.uint8))
+    solid_img.SetSpacing(spacing)
+    solid_img.SetOrigin(origin)
+    if reference_image is not None:
+        solid_img.SetDirection(reference_image.GetDirection())
+    solid_mask_path = geom_dir / f"{case_id}_solid_air_body.nrrd"
+    sitk.WriteImage(solid_img, str(solid_mask_path))
+
+    solid_mesh, mesh_notes = solid_mask_to_watertight_mesh(
+        solid_closed, spacing, origin, target_faces=40000
+    )
+    notes.extend(mesh_notes)
+    is_wt = bool(solid_mesh.is_watertight)
+    if is_wt:
+        notes.append("solid_air_body mesh is watertight (good for snappyHexMesh).")
+    else:
+        notes.append(
+            "WARNING: solid_air_body mesh is not fully watertight; "
+            "snappy may keep the background box."
+        )
+    # Write watertight flag for scaffold
+    (geom_dir / f"{case_id}_solid_watertight.flag").write_text(
+        "1" if is_wt else "0", encoding="utf-8"
+    )
+
+    # Interior seed for snappy locationInMesh (mm): centroid of sealed mask
+    zz, yy, xx = np.where(solid_closed)
+    sx, sy, sz = spacing
+    ox, oy, oz = origin
+    if len(zz):
+        loc_mm = [
+            float(ox + xx.mean() * sx),
+            float(oy + yy.mean() * sy),
+            float(oz + zz.mean() * sz),
+        ]
+    else:
+        b = solid_mesh.bounds
+        loc_mm = (0.5 * (b[0] + b[1])).tolist()
+    (geom_dir / f"{case_id}_locationInMesh_mm.json").write_text(
+        json.dumps({"locationInMesh_mm": loc_mm}, indent=2), encoding="utf-8"
+    )
+    notes.append(f"locationInMesh (mm) = {loc_mm}")
+
     names_in = port_names_inlet or ["left_nostril", "right_nostril"]
     patches: dict[str, str] = {}
 
-    # Open-port patches
+    # Open-port patches (separate STLs for QC + face labeling)
+    port_meshes: dict[str, trimesh.Trimesh | None] = {}
     for name, m in (
         (names_in[0], left_inlet_mask),
         (names_in[1] if len(names_in) > 1 else "right_nostril", right_inlet_mask),
@@ -267,6 +497,7 @@ def export_openfoam_geometry(
         patch = _surface_from_mask_region(m, solid, spacing, origin)
         if patch is None:
             patch = _planar_cap_mesh(m, spacing, origin)
+        port_meshes[name] = patch
         if patch is not None and len(patch.faces) > 0:
             p = geom_dir / f"{case_id}_patch_{name}.stl"
             patch.export(p)
@@ -276,39 +507,44 @@ def export_openfoam_geometry(
     out_patch = _surface_from_mask_region(outlet_open, solid, spacing, origin)
     if out_patch is None:
         out_patch = _planar_cap_mesh(outlet_open, spacing, origin)
+    port_meshes[port_name_outlet] = out_patch
     if out_patch is not None and len(out_patch.faces) > 0:
         p = geom_dir / f"{case_id}_patch_{port_name_outlet}.stl"
         out_patch.export(p)
         patches[port_name_outlet] = p.name
         notes.append(f"Open outlet patch: {p.name} ({len(out_patch.faces)} faces)")
 
-    # Wall = solid surface minus open-port neighborhoods
-    # Approximate: mesh solid, remove faces near open masks
-    wall_open = left_inlet_mask | right_inlet_mask | outlet_open
-    wall_open = morphology.dilation(wall_open, footprint=morphology.ball(2))
-    try:
-        full = _mask_to_mesh(solid, spacing, origin)
-        centers = full.triangles_center
-        sx, sy, sz = spacing
-        ox, oy, oz = origin
-        ix = np.clip(np.rint((centers[:, 0] - ox) / sx).astype(int), 0, solid.shape[2] - 1)
-        iy = np.clip(np.rint((centers[:, 1] - oy) / sy).astype(int), 0, solid.shape[1] - 1)
-        iz = np.clip(np.rint((centers[:, 2] - oz) / sz).astype(int), 0, solid.shape[0] - 1)
-        keep = ~wall_open[iz, iy, ix]
-        faces = full.faces[keep]
-        used = np.unique(faces.ravel())
-        remap = -np.ones(len(full.vertices), dtype=int)
-        remap[used] = np.arange(len(used))
-        wall_mesh = trimesh.Trimesh(
-            vertices=full.vertices[used], faces=remap[faces], process=True
-        )
-        wall_mesh = _decimate(wall_mesh, 35000)
-        p = geom_dir / f"{case_id}_patch_wall.stl"
-        wall_mesh.export(p)
-        patches["wall"] = p.name
-        notes.append(f"Wall patch: {p.name} ({len(wall_mesh.faces)} faces, mucosa no-slip)")
-    except Exception as exc:
-        notes.append(f"Wall patch failed: {exc}")
+    # Multi-region closed solid (single STL with named solids for snappy patches)
+    face_regions = label_solid_faces_by_ports(solid_mesh, port_meshes, max_dist_mm=5.0)
+    solid_stl = geom_dir / f"{case_id}_solid_air_body.stl"
+    region_counts = _write_multiregion_stl(solid_mesh, face_regions, solid_stl)
+    notes.append(
+        "solid_air_body.stl = multi-region closed surface "
+        f"(regions={region_counts}). Air is *inside* this body."
+    )
+    for rname, nfaces in region_counts.items():
+        if rname not in patches:
+            patches[rname] = solid_stl.name
+        notes.append(f"  multi-region '{rname}': {nfaces} faces")
+
+    # Also export wall-only faces for preview
+    wall_ids = np.where(face_regions == "wall")[0]
+    if len(wall_ids) > 0:
+        try:
+            wf = solid_mesh.faces[wall_ids]
+            used = np.unique(wf.ravel())
+            remap = -np.ones(len(solid_mesh.vertices), dtype=int)
+            remap[used] = np.arange(len(used))
+            wall_mesh = trimesh.Trimesh(
+                vertices=solid_mesh.vertices[used], faces=remap[wf], process=False
+            )
+            wall_mesh = _decimate(wall_mesh, 35000)
+            p = geom_dir / f"{case_id}_patch_wall.stl"
+            wall_mesh.export(p)
+            patches["wall"] = p.name
+            notes.append(f"Wall patch: {p.name} ({len(wall_mesh.faces)} faces, mucosa no-slip)")
+        except Exception as exc:
+            notes.append(f"Wall patch failed: {exc}")
 
     # Combined multi-body scene note file for snappyHexMesh
     readme = geom_dir / "README_OPENFOAM.txt"
@@ -321,6 +557,10 @@ def export_openfoam_geometry(
     manifest = {
         "case_id": case_id,
         "solid_air_volume_ml": vol_ml,
+        "solid_air_sealed_volume_ml": vol_closed_ml,
+        "solid_mesh_watertight": is_wt,
+        "locationInMesh_mm": loc_mm,
+        "multi_region_face_counts": region_counts,
         "include_sinuses": include_sinuses,
         "solid_air_body_stl": solid_stl.name,
         "solid_air_body_nrrd": solid_mask_path.name,

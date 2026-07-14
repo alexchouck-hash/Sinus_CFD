@@ -1,0 +1,9 @@
+# Optional: neural-net segmentation (train/infer). Install separately from requirements.txt
+# GPU: install CUDA PyTorch from https://pytorch.org then:
+#   py -3.12 -m pip install -r requirements-nn.txt
+
+nnunetv2>=2.5.0
+torch>=2.1.0
+SimpleITK>=2.3
+numpy>=1.26
+tqdm>=4.66

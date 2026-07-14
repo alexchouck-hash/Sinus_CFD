@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -24,6 +25,34 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _scale_stl_mm_to_m(src: Path, dst: Path) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Scale STL mm → m. Preserves multi-region ASCII 'solid name' blocks for OpenFOAM.
+    """
+    text = src.read_text(encoding="utf-8", errors="replace")
+    # Multi-region ASCII: rewrite vertex lines in place
+    if "endsolid" in text.lower() and "facet" in text.lower():
+        def scale_vertex(m: re.Match) -> str:
+            x, y, z = (float(m.group(i)) / 1000.0 for i in (1, 2, 3))
+            return f"vertex {x:.8e} {y:.8e} {z:.8e}"
+
+        scaled = re.sub(
+            r"vertex\s+([-+eE0-9.]+)\s+([-+eE0-9.]+)\s+([-+eE0-9.]+)",
+            scale_vertex,
+            text,
+            flags=re.I,
+        )
+        # also scale normals? normals are unitless direction — leave as-is
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(scaled, encoding="utf-8")
+        # bounds from vertices
+        nums = re.findall(
+            r"vertex\s+([-+eE0-9.]+)\s+([-+eE0-9.]+)\s+([-+eE0-9.]+)",
+            scaled,
+            flags=re.I,
+        )
+        pts = np.array([[float(a), float(b), float(c)] for a, b, c in nums], dtype=float)
+        return pts.min(axis=0), pts.max(axis=0)
+
     mesh = trimesh.load(src, force="mesh")
     if not isinstance(mesh, trimesh.Trimesh):
         mesh = mesh.dump(concatenate=True)
@@ -43,7 +72,7 @@ def scaffold(
     case_id: str = "VisibleHuman_Head",
     outputs_root: Path | None = None,
     foam_root: Path | None = None,
-    cells: int = 40,
+    cells: int = 32,
 ) -> Path:
     outputs_root = outputs_root or (REPO_ROOT / "outputs")
     geom_dir = outputs_root / case_id / "openfoam_geometry"
@@ -95,9 +124,17 @@ def scaffold(
     bmin = bounds[0]
     bmax = bounds[1]
     # Background box margin (m)
-    margin = 0.025
+    margin = 0.020
     xmin, ymin, zmin = (bmin - margin).tolist()
     xmax, ymax, zmax = (bmax + margin).tolist()
+
+    # Prefer sealed-mask centroid for locationInMesh (mm → m)
+    loc_json = geom_dir / f"{case_id}_locationInMesh_mm.json"
+    if loc_json.is_file():
+        loc_mm = json.loads(loc_json.read_text(encoding="utf-8"))["locationInMesh_mm"]
+        loc = np.array(loc_mm, dtype=float) / 1000.0
+    else:
+        loc = 0.5 * (bmin + bmax)
 
     # ---- system/blockMeshDict ----
     _write(
@@ -159,8 +196,7 @@ mergePatchPairs
     )
 
     # ---- system/snappyHexMeshDict ----
-    # Location in mesh: slightly inside solid air body (centroid of bounds)
-    loc = 0.5 * (bmin + bmax)
+    # Single multi-region closed solid; locationInMesh must be inside fluid
     _write(
         system / "snappyHexMeshDict",
         f"""
@@ -172,7 +208,7 @@ FoamFile
     object      snappyHexMeshDict;
 }}
 
-// Minimal snap: castellation + snap (no layers — add later for accuracy)
+// Castellation + snap on ONE watertight multi-region solid (ports as regions)
 castellatedMesh true;
 snap            true;
 addLayers       false;
@@ -183,34 +219,22 @@ geometry
     {{
         type triSurfaceMesh;
         name solid_air_body;
-    }}
-    left_nostril.stl
-    {{
-        type triSurfaceMesh;
-        name left_nostril;
-    }}
-    right_nostril.stl
-    {{
-        type triSurfaceMesh;
-        name right_nostril;
-    }}
-    trachea.stl
-    {{
-        type triSurfaceMesh;
-        name trachea;
-    }}
-    wall.stl
-    {{
-        type triSurfaceMesh;
-        name wall;
+        regions
+        {{
+            left_nostril  {{ name left_nostril; }}
+            right_nostril {{ name right_nostril; }}
+            trachea       {{ name trachea; }}
+            wall          {{ name wall; }}
+        }}
     }}
 }}
 
 castellatedMeshControls
 {{
-    maxLocalCells 2000000;
-    maxGlobalCells 4000000;
-    minRefinementCells 10;
+    // Docker ~8 GB: moderate snap; true fluid keep uses topoSet surfaceToCell
+    maxLocalCells 600000;
+    maxGlobalCells 900000;
+    minRefinementCells 0;
     maxLoadUnbalance 0.10;
     nCellsBetweenLevels 2;
 
@@ -222,45 +246,39 @@ castellatedMeshControls
     {{
         solid_air_body
         {{
-            level (2 3);
-            // Region-wise patch assignment after snap
+            level (1 2);
             regions
             {{
+                left_nostril  {{ level (2 2); patchInfo {{ type patch; }} }}
+                right_nostril {{ level (2 2); patchInfo {{ type patch; }} }}
+                trachea       {{ level (2 2); patchInfo {{ type patch; }} }}
+                wall          {{ level (1 2); patchInfo {{ type wall; }} }}
             }}
         }}
-        left_nostril  {{ level (3 4); patchInfo {{ type patch; }} }}
-        right_nostril {{ level (3 4); patchInfo {{ type patch; }} }}
-        trachea       {{ level (3 4); patchInfo {{ type patch; }} }}
-        wall          {{ level (2 3); patchInfo {{ type wall; }} }}
     }}
 
     resolveFeatureAngle 30;
 
     refinementRegions
     {{
-        solid_air_body
-        {{
-            mode inside;
-            levels ((1E15 2));
-        }}
     }}
 
-    // Seed point MUST lie inside the air solid (metres)
+    // Seed for snap (fluid keep is enforced later by surfaceToCell + subsetMesh)
     locationInMesh ({loc[0]:.6f} {loc[1]:.6f} {loc[2]:.6f});
 
-    allowFreeStandingZoneFaces true;
+    allowFreeStandingZoneFaces false;
 }}
 
 snapControls
 {{
     nSmoothPatch 3;
     tolerance 2.0;
-    nSolveIter 100;
+    nSolveIter 30;
     nRelaxIter 5;
-    nFeatureSnapIter 10;
-    implicitFeatureSnap false;
-    explicitFeatureSnap true;
-    multiRegionFeatureSnap false;
+    nFeatureSnapIter 5;
+    implicitFeatureSnap true;
+    explicitFeatureSnap false;
+    multiRegionFeatureSnap true;
 }}
 
 addLayersControls
@@ -328,8 +346,8 @@ stopAt          endTime;
 endTime         500;
 deltaT          1;
 writeControl    timeStep;
-writeInterval   100;
-purgeWrite      2;
+writeInterval   50;
+purgeWrite      6;
 writeFormat     ascii;
 writePrecision  8;
 writeCompression off;
@@ -425,22 +443,28 @@ solvers
 
 SIMPLE
 {
-    nNonOrthogonalCorrectors 1;
-    consistent      yes;
+    nNonOrthogonalCorrectors 2;
+    consistent      no;
+    pRefCell        0;
+    pRefValue       0;
     residualControl
     {
-        p               1e-4;
-        U               1e-4;
-        "(k|epsilon|omega|f|v2)" 1e-4;
+        p               1e-3;
+        U               1e-3;
+        "(k|epsilon|omega|f|v2)" 1e-3;
     }
 }
 
 relaxationFactors
 {
+    fields
+    {
+        p               0.3;
+    }
     equations
     {
-        U               0.7;
-        ".*"            0.7;
+        U               0.5;
+        ".*"            0.5;
     }
 }
 """,
@@ -484,6 +508,41 @@ solid_air_body.stl
     }
     writeObj            yes;
 }
+""",
+    )
+
+    # ---- system/topoSetDict: keep cells geometrically inside watertight solid ----
+    # outsidePoints = background box corner (outside airway)
+    _write(
+        system / "topoSetDict",
+        f"""
+FoamFile
+{{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      topoSetDict;
+}}
+
+actions
+(
+    {{
+        name    fluidCells;
+        type    cellSet;
+        action  new;
+        source  surfaceToCell;
+        sourceInfo
+        {{
+            file            "constant/triSurface/solid_air_body.stl";
+            outsidePoints   (({xmin:.6f} {ymin:.6f} {zmin:.6f}));
+            includeCut      false;
+            includeInside   true;
+            includeOutside  false;
+            nearDistance    -1;
+            curvature       -100;
+        }}
+    }}
+);
 """,
     )
 
@@ -797,7 +856,12 @@ def main() -> int:
     p.add_argument("--case", default="VisibleHuman_Head")
     p.add_argument("--outputs-root", type=Path, default=REPO_ROOT / "outputs")
     p.add_argument("--foam-root", type=Path, default=None)
-    p.add_argument("--cells", type=int, default=40, help="blockMesh cells per edge")
+    p.add_argument(
+        "--cells",
+        type=int,
+        default=32,
+        help="blockMesh cells per edge (32 helps seal watertight cut in Docker ~8 GB)",
+    )
     args = p.parse_args()
     try:
         scaffold(

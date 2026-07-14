@@ -1,0 +1,44 @@
+#!/bin/bash
+# Full mesh + simpleFoam in Docker (opencfd/openfoam-run).
+# Multi-region watertight solid_air_body.stl keeps only airway cells.
+set -e
+cd /case
+echo "PWD=$(pwd)  OpenFOAM=${WM_PROJECT_VERSION:-?}"
+
+command -v blockMesh >/dev/null
+command -v snappyHexMesh >/dev/null
+command -v simpleFoam >/dev/null
+
+echo "== clean =="
+rm -rf constant/polyMesh constant/extendedFeatureEdgeMesh
+rm -f constant/triSurface/*.eMesh
+for d in [1-9]* [1-9][0-9]* [1-9][0-9][0-9]* processor*; do
+  [ -e "$d" ] && rm -rf "$d"
+done
+rm -f log.blockMesh log.surfaceFeatureExtract log.snappyHexMesh log.topoSet log.subsetMesh log.checkMesh log.simpleFoam
+
+echo "== blockMesh =="
+blockMesh 2>&1 | tee log.blockMesh
+
+echo "== surfaceFeatureExtract =="
+surfaceFeatureExtract 2>&1 | tee log.surfaceFeatureExtract || true
+
+echo "== snappyHexMesh =="
+snappyHexMesh -overwrite 2>&1 | tee log.snappyHexMesh
+
+echo "== topoSet / subsetMesh (optional; snappy often already keeps fluid) =="
+if topoSet 2>&1 | tee log.topoSet; then
+  subsetMesh fluidCells -overwrite 2>&1 | tee log.subsetMesh || true
+else
+  echo "topoSet skipped/failed (OK if snappy locationInMesh already kept airway)"
+fi
+
+echo "== checkMesh =="
+checkMesh 2>&1 | tee log.checkMesh
+grep -E "Total volume|cells:" log.checkMesh || true
+
+echo "== simpleFoam =="
+simpleFoam 2>&1 | tee log.simpleFoam
+
+echo "DONE"
+ls -la | head -40

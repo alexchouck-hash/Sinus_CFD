@@ -1,0 +1,10 @@
+# OpenFOAM environment for Sinus_CFD nasal case
+# Base: ESI OpenCFD prebuilt image (Ubuntu) with OpenFOAM tools
+FROM opencfd/openfoam-run:2412
+
+USER root
+# Ensure common mesh/solver tools are on PATH via entrypoint of base image
+WORKDIR /case
+
+# Default: interactive shell with OpenFOAM sourced (handled by base image)
+CMD ["bash"]

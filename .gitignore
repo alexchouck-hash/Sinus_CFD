@@ -3,6 +3,8 @@ data/**
 !data/README.md
 outputs/**
 !outputs/.gitkeep
+models/**
+!models/README.md
 *.npz
 .streamlit/secrets.toml
 *.dcm
@@ -17,6 +19,14 @@ outputs/**
 *.stl
 *.obj
 *.vtk
+
+# nnU-Net workspaces (can be huge)
+nnUNet_raw/
+nnUNet_preprocessed/
+nnUNet_results/
+**/nnUNet_raw/
+**/nnUNet_preprocessed/
+**/nnUNet_results/
 
 # Python
 __pycache__/

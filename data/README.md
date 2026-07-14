@@ -5,24 +5,33 @@ Place downloaded CT volumes here. This folder’s contents (except this README) 
 ## 1. NasalSeg (labeled nasal / sinus FOV)
 
 Best for **segmentation labels** (L/R cavity, nasopharynx, maxillary sinuses).  
-Not a whole-head FOV.
+Not a whole-head FOV. Primary training set for **nnU-Net**.
 
 - https://zenodo.org/records/13893419  
 
 ```powershell
-Invoke-WebRequest -Uri "https://zenodo.org/records/13893419/files/NasalSeg.zip?download=1" -OutFile "NasalSeg.zip"
-Expand-Archive -Path "NasalSeg.zip" -DestinationPath "NasalSeg"
+# Preferred (checksum + extract)
+py -3.12 scripts\download_nasalseg.py
+
+# Convert to nnU-Net v2 Dataset501_NasalSeg
+py -3.12 scripts\prepare_nnunet_nasalseg.py
+py -3.12 scripts\verify_nnunet_dataset.py
 ```
 
 ```text
 NasalSeg/
   images/P001_img.nrrd … P130_img.nrrd
   labels/P001_seg.nrrd … P130_seg.nrrd
+nnUNet_raw/Dataset501_NasalSeg/
+  dataset.json
+  imagesTr/  labelsTr/
 ```
 
 ```powershell
 py -3.12 scripts\process_case.py --case P001
 ```
+
+Full training instructions: **`docs/nnunet_nasal.md`**.
 
 ## 2. Visible Human Female — whole head CT (1 mm)
 

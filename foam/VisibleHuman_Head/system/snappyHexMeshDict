@@ -6,7 +6,7 @@ FoamFile
     object      snappyHexMeshDict;
 }
 
-// Minimal snap: castellation + snap (no layers — add later for accuracy)
+// Castellation + snap on ONE watertight multi-region solid (ports as regions)
 castellatedMesh true;
 snap            true;
 addLayers       false;
@@ -17,34 +17,22 @@ geometry
     {
         type triSurfaceMesh;
         name solid_air_body;
-    }
-    left_nostril.stl
-    {
-        type triSurfaceMesh;
-        name left_nostril;
-    }
-    right_nostril.stl
-    {
-        type triSurfaceMesh;
-        name right_nostril;
-    }
-    trachea.stl
-    {
-        type triSurfaceMesh;
-        name trachea;
-    }
-    wall.stl
-    {
-        type triSurfaceMesh;
-        name wall;
+        regions
+        {
+            left_nostril  { name left_nostril; }
+            right_nostril { name right_nostril; }
+            trachea       { name trachea; }
+            wall          { name wall; }
+        }
     }
 }
 
 castellatedMeshControls
 {
-    maxLocalCells 2000000;
-    maxGlobalCells 4000000;
-    minRefinementCells 10;
+    // Docker ~8 GB: moderate snap; true fluid keep uses topoSet surfaceToCell
+    maxLocalCells 600000;
+    maxGlobalCells 900000;
+    minRefinementCells 0;
     maxLoadUnbalance 0.10;
     nCellsBetweenLevels 2;
 
@@ -56,45 +44,39 @@ castellatedMeshControls
     {
         solid_air_body
         {
-            level (2 3);
-            // Region-wise patch assignment after snap
+            level (1 2);
             regions
             {
+                left_nostril  { level (2 2); patchInfo { type patch; } }
+                right_nostril { level (2 2); patchInfo { type patch; } }
+                trachea       { level (2 2); patchInfo { type patch; } }
+                wall          { level (1 2); patchInfo { type wall; } }
             }
         }
-        left_nostril  { level (3 4); patchInfo { type patch; } }
-        right_nostril { level (3 4); patchInfo { type patch; } }
-        trachea       { level (3 4); patchInfo { type patch; } }
-        wall          { level (2 3); patchInfo { type wall; } }
     }
 
     resolveFeatureAngle 30;
 
     refinementRegions
     {
-        solid_air_body
-        {
-            mode inside;
-            levels ((1E15 2));
-        }
     }
 
-    // Seed point MUST lie inside the air solid (metres)
-    locationInMesh (0.251500 0.201000 1.580000);
+    // Seed for snap (fluid keep is enforced later by surfaceToCell + subsetMesh)
+    locationInMesh (0.252623 0.188993 1.600920);
 
-    allowFreeStandingZoneFaces true;
+    allowFreeStandingZoneFaces false;
 }
 
 snapControls
 {
     nSmoothPatch 3;
     tolerance 2.0;
-    nSolveIter 100;
+    nSolveIter 30;
     nRelaxIter 5;
-    nFeatureSnapIter 10;
-    implicitFeatureSnap false;
-    explicitFeatureSnap true;
-    multiRegionFeatureSnap false;
+    nFeatureSnapIter 5;
+    implicitFeatureSnap true;
+    explicitFeatureSnap false;
+    multiRegionFeatureSnap true;
 }
 
 addLayersControls

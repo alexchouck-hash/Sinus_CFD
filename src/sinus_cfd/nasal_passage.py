@@ -77,13 +77,167 @@ def nearest_lumen_index(
     zyx: tuple[int, int, int],
 ) -> tuple[int, int, int]:
     """Snap a point to the nearest true lumen voxel."""
-    if lumen[zyx]:
+    if (
+        0 <= zyx[0] < lumen.shape[0]
+        and 0 <= zyx[1] < lumen.shape[1]
+        and 0 <= zyx[2] < lumen.shape[2]
+        and lumen[zyx]
+    ):
         return zyx
     pts = np.column_stack(np.where(lumen))
     if len(pts) == 0:
         raise ValueError("Empty lumen")
     d = np.linalg.norm(pts.astype(float) - np.array(zyx, dtype=float), axis=1)
     return tuple(int(v) for v in pts[int(np.argmin(d))])
+
+
+def _line_zyx(
+    a: tuple[int, int, int],
+    b: tuple[int, int, int],
+) -> list[tuple[int, int, int]]:
+    """Voxel indices along a straight segment a→b (inclusive)."""
+    a_arr = np.array(a, dtype=float)
+    b_arr = np.array(b, dtype=float)
+    dist = float(np.linalg.norm(b_arr - a_arr))
+    n = max(int(np.ceil(dist)) + 1, 2)
+    out: list[tuple[int, int, int]] = []
+    for t in np.linspace(0.0, 1.0, n):
+        p = np.round((1.0 - t) * a_arr + t * b_arr).astype(int)
+        out.append((int(p[0]), int(p[1]), int(p[2])))
+    # unique while preserving order
+    seen = set()
+    uniq: list[tuple[int, int, int]] = []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def _paint_ball(
+    mask: np.ndarray,
+    center: tuple[int, int, int],
+    radius_vox: int,
+) -> None:
+    """OR a ball of radius_vox into mask (in-place)."""
+    z0, y0, x0 = center
+    r = max(int(radius_vox), 1)
+    zmin = max(0, z0 - r)
+    zmax = min(mask.shape[0], z0 + r + 1)
+    ymin = max(0, y0 - r)
+    ymax = min(mask.shape[1], y0 + r + 1)
+    xmin = max(0, x0 - r)
+    xmax = min(mask.shape[2], x0 + r + 1)
+    zz, yy, xx = np.ogrid[zmin:zmax, ymin:ymax, xmin:xmax]
+    ball = (zz - z0) ** 2 + (yy - y0) ** 2 + (xx - x0) ** 2 <= r * r
+    mask[zmin:zmax, ymin:ymax, xmin:xmax] |= ball
+
+
+def extend_lumen_to_external_nares(
+    lumen: np.ndarray,
+    skin_naris_centers_mm: list[list[float]],
+    spacing: tuple[float, float, float],
+    origin: tuple[float, float, float],
+    tunnel_radius_mm: float = 3.5,
+) -> tuple[np.ndarray, list[str], list[tuple[int, int, int]]]:
+    """
+    Add open-air corridors from external skin nares into the internal airway.
+
+    The CT/airway mask often stops inside the nose (~3 cm deep of the face).
+    Without these tunnels the fluid domain and centerline never reach the
+    nostrils where air actually enters.
+
+    Returns (extended_lumen, notes, naris_seed_zyx_list).
+    """
+    notes: list[str] = []
+    if not skin_naris_centers_mm:
+        return lumen.astype(bool), ["No skin naris centers — lumen not extended."], []
+
+    extended = lumen.astype(bool).copy()
+    sp = float(np.mean(spacing))
+    r_vox = max(int(round(tunnel_radius_mm / sp)), 2)
+    shape = lumen.shape
+    naris_seeds: list[tuple[int, int, int]] = []
+    gaps_mm: list[float] = []
+
+    for c_mm in skin_naris_centers_mm:
+        skin_zyx = _zyx_from_mm(c_mm, spacing, origin, shape)
+        if not lumen.any():
+            continue
+        # Target: nearest *original* lumen voxel (internal nasal cavity)
+        target = nearest_lumen_index(lumen, skin_zyx)
+        a = np.array(skin_zyx, dtype=float)
+        b = np.array(target, dtype=float)
+        gap = float(np.linalg.norm((b - a) * np.array([spacing[2], spacing[1], spacing[0]])))
+        # spacing is xyz; zyx indices → physical: dz*sz, dy*sy, dx*sx
+        gap = float(
+            np.linalg.norm(
+                np.array(
+                    [
+                        (b[2] - a[2]) * spacing[0],
+                        (b[1] - a[1]) * spacing[1],
+                        (b[0] - a[0]) * spacing[2],
+                    ]
+                )
+            )
+        )
+        gaps_mm.append(gap)
+        for pt in _line_zyx(skin_zyx, target):
+            if (
+                0 <= pt[0] < shape[0]
+                and 0 <= pt[1] < shape[1]
+                and 0 <= pt[2] < shape[2]
+            ):
+                _paint_ball(extended, pt, r_vox)
+        # Ensure a full opening at the skin surface
+        _paint_ball(extended, skin_zyx, r_vox + 1)
+        naris_seeds.append(skin_zyx)
+
+    # Keep only components that touch the original lumen (drop stray paint)
+    lab, nlab = ndi.label(extended)
+    if nlab > 1:
+        keep = np.zeros(nlab + 1, dtype=bool)
+        touch = lab[lumen]
+        for i in np.unique(touch):
+            if i > 0:
+                keep[i] = True
+        # Always keep components containing naris seeds
+        for s in naris_seeds:
+            li = lab[s]
+            if li > 0:
+                keep[li] = True
+        extended = keep[lab]
+
+    # Fill small holes in tunnels
+    extended = morphology.closing(extended, footprint=morphology.ball(1))
+    extended = ndi.binary_fill_holes(extended) | extended
+
+    # Re-keep largest component that includes a naris (or original lumen)
+    lab2, n2 = ndi.label(extended)
+    if n2 > 1:
+        best_i, best_score = 1, -1
+        for i in range(1, n2 + 1):
+            comp = lab2 == i
+            score = int(comp.sum())
+            # bonus if contains naris
+            if any(comp[s] for s in naris_seeds):
+                score += 1_000_000
+            if score > best_score:
+                best_score = score
+                best_i = i
+        extended = lab2 == best_i
+
+    notes.append(
+        f"Extended lumen to {len(naris_seeds)} external skin nares "
+        f"(tunnel radius ≈ {tunnel_radius_mm:.1f} mm; "
+        f"skin→cavity gap was {np.mean(gaps_mm):.1f} mm mean)."
+        if gaps_mm
+        else f"Extended lumen to {len(naris_seeds)} external skin nares."
+    )
+    notes.append(
+        "Open-air model now includes nostrils at the face; centerline starts at skin nares."
+    )
+    return extended.astype(bool), notes, naris_seeds
 
 
 def open_ports_on_lumen(
@@ -241,9 +395,14 @@ def analyze_nasal_passage(
     outlet_center_mm: list[float],
     case_id: str = "case",
     open_radius_mm: float = 6.0,
+    skin_naris_centers_mm: list[list[float]] | None = None,
+    tunnel_radius_mm: float = 3.5,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any], PassageMetrics]:
     """
     Full passage analysis.
+
+    Extends the lumen to external skin nares when provided so the open-air
+    model and centerline include the nostrils on the face.
 
     Returns:
       masks: lumen, wall, inlet_open, outlet_open, fluid_interior
@@ -255,7 +414,7 @@ def analyze_nasal_passage(
     if not lumen.any():
         raise ValueError("Empty lumen mask")
 
-    # Single component containing path from first inlet to outlet
+    # Single component (internal cavity) first
     lab, n = ndi.label(lumen)
     if n > 1:
         notes.append(f"Lumen had {n} components; keeping largest only for passage.")
@@ -263,24 +422,81 @@ def analyze_nasal_passage(
         counts[0] = 0
         lumen = lab == int(np.argmax(counts))
 
-    inlet_open, outlet_open, inlet_seeds, out_seed = open_ports_on_lumen(
-        lumen, inlet_centers_mm, outlet_center_mm, spacing, origin, open_radius_mm
+    # Prefer explicit skin naris points; fall back to inlet BC centers
+    skin_pts = skin_naris_centers_mm or list(inlet_centers_mm)
+    lumen, ext_notes, skin_seeds = extend_lumen_to_external_nares(
+        lumen,
+        skin_pts,
+        spacing,
+        origin,
+        tunnel_radius_mm=tunnel_radius_mm,
     )
+    notes.extend(ext_notes)
+
+    # Open ports: use skin nares for inlets so openings are at the face
+    port_inlets = skin_pts if skin_pts else inlet_centers_mm
+    inlet_open, outlet_open, inlet_seeds, out_seed = open_ports_on_lumen(
+        lumen, port_inlets, outlet_center_mm, spacing, origin, open_radius_mm
+    )
+    # Prefer true skin seeds if extension created them
+    if skin_seeds:
+        inlet_seeds = skin_seeds
     wall = wall_mask_from_lumen(lumen, inlet_open, outlet_open)
     # Interior fluid = lumen (ports are still fluid, just open BC)
     fluid = lumen.copy()
 
-    # Centerline from average of inlet seeds → outlet
-    if inlet_seeds:
-        start = tuple(
-            int(np.round(np.mean([s[i] for s in inlet_seeds]))) for i in range(3)
+    # Dual centerlines: each external naris → trachea (magenta paths in viewer)
+    left_cl = right_cl = None
+    skin_arr = np.array(skin_pts, dtype=float) if skin_pts else np.zeros((0, 3))
+
+    def _naris_path(skin_mm: np.ndarray) -> np.ndarray:
+        start = nearest_lumen_index(
+            lumen, _zyx_from_mm(skin_mm.tolist(), spacing, origin, lumen.shape)
         )
-        start = nearest_lumen_index(lumen, start)  # type: ignore
+        path, _ = compute_centerline(lumen, start, out_seed, spacing, origin)
+        if len(path) == 0:
+            return skin_mm.reshape(1, 3)
+        if float(np.linalg.norm(path[0] - skin_mm)) > 1.0:
+            path = np.vstack([skin_mm, path])
+        return path
+
+    if len(skin_arr) >= 2:
+        # LPS: higher x = patient left
+        order = np.argsort(skin_arr[:, 0])  # low x first = patient right
+        right_mm = skin_arr[order[0]]
+        left_mm = skin_arr[order[-1]]
+        left_cl = _naris_path(left_mm)
+        right_cl = _naris_path(right_mm)
+        notes.append(
+            "Dual centerlines: left naris→trachea and right naris→trachea."
+        )
+    elif len(skin_arr) == 1:
+        left_cl = _naris_path(skin_arr[0])
+        notes.append("Single naris centerline only (one skin point).")
+    elif inlet_seeds:
+        start = nearest_lumen_index(
+            lumen,
+            tuple(int(np.round(np.mean([s[i] for s in inlet_seeds]))) for i in range(3)),  # type: ignore
+        )
+        left_cl, _ = compute_centerline(lumen, start, out_seed, spacing, origin)
+
+    # Combined reference path (mean of dual if both exist) for metrics
+    if left_cl is not None and right_cl is not None and len(left_cl) and len(right_cl):
+        # For metrics length use average of both paths
+        length_mm = 0.5 * (
+            float(np.linalg.norm(np.diff(left_cl, axis=0), axis=1).sum())
+            + float(np.linalg.norm(np.diff(right_cl, axis=0), axis=1).sum())
+        )
+        cl_mm = left_cl  # metrics sample along left; both stored separately
+    elif left_cl is not None and len(left_cl):
+        cl_mm = left_cl
+        length_mm = float(np.linalg.norm(np.diff(cl_mm, axis=0), axis=1).sum()) if len(cl_mm) > 1 else 0.0
     else:
         start = nearest_lumen_index(
-            lumen, _zyx_from_mm(inlet_centers_mm[0], spacing, origin, lumen.shape)
+            lumen, _zyx_from_mm(port_inlets[0], spacing, origin, lumen.shape)
         )
-    cl_mm, length_mm = compute_centerline(lumen, start, out_seed, spacing, origin)
+        cl_mm, length_mm = compute_centerline(lumen, start, out_seed, spacing, origin)
+
     cl_idx = centerline_indices_from_mm_path(cl_mm, spacing, origin, lumen.shape)
     sections = cross_sections_along_centerline(lumen, cl_idx, spacing)
 
@@ -301,8 +517,8 @@ def analyze_nasal_passage(
         notes=notes
         + [
             "Wall = lumen surface excluding open nares/trachea ports.",
-            "Flow domain = connected airway lumen from nares to trachea.",
-            "Centerline follows medial axis (distance-to-wall weighted geodesic).",
+            "Flow domain = open air from external nostrils through nasal passage to trachea.",
+            "Dual magenta centerlines: each external naris back to caudal trachea.",
         ],
     )
 
@@ -317,13 +533,17 @@ def analyze_nasal_passage(
         "case_id": case_id,
         "spacing_xyz_mm": list(spacing),
         "origin_xyz_mm": list(origin),
+        "skin_naris_centers_mm": skin_pts,
+        "includes_external_nares": True,
         "inlet_seeds_zyx": [list(s) for s in inlet_seeds],
         "outlet_seed_zyx": list(out_seed),
         "centerline_mm": cl_mm.tolist() if len(cl_mm) else [],
+        "centerline_left_mm": left_cl.tolist() if left_cl is not None and len(left_cl) else [],
+        "centerline_right_mm": right_cl.tolist() if right_cl is not None and len(right_cl) else [],
         "cross_sections": sections,
         "boundary_roles": {
             "wall": "no_slip_mucosa",
-            "inlet_open": "volumetric_flow_nares",
+            "inlet_open": "volumetric_flow_nares_at_skin",
             "outlet_open": "pressure_outlet_trachea",
         },
         "metrics": metrics.to_dict(),

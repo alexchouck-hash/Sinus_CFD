@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.5.1-openfoam-geometry"
+APP_VERSION = "0.9.2-tip-vestibule"
 APP_VERSION_LABEL = (
-    "solid air body · open-port STLs · nasal-passage · dense vectors"
+    "nasal air extended to skin tip · dual vestibules · ~50/50 pathlines"
 )
 
 DEFAULT_CASE = "P001"
@@ -48,12 +48,20 @@ def case_data_fingerprint(case_id: str) -> str:
     case_dir = OUTPUTS / case_id
     keys = [
         f"{case_id}_flow.npz",
+        f"{case_id}_flow_meta.json",
+        f"{case_id}_streamlines.json",
         f"{case_id}_boundary_conditions.json",
         f"{case_id}_stats.json",
         f"{case_id}_skin.stl",
         f"{case_id}_airway.stl",
         f"{case_id}_nares.json",
         f"{case_id}_passage.json",
+        f"{case_id}_open_paths.json",
+        f"{case_id}_restriction.npz",
+        f"{case_id}_septum.stl",
+        f"{case_id}_cavity_left.stl",
+        f"{case_id}_cavity_right.stl",
+        f"{case_id}_ct_nasal_meta.json",
     ]
     return "|".join(f"{n}:{int(_file_mtime(case_dir / n))}" for n in keys)
 
@@ -94,9 +102,12 @@ def load_case(case_id: str, data_fingerprint: str) -> dict:
     sl_path = case_dir / f"{case_id}_streamlines.json"
     if sl_path.is_file():
         with sl_path.open(encoding="utf-8") as f:
-            out["streamlines"] = json.load(f)["lines"]
+            sl = json.load(f)
+        out["streamlines"] = sl.get("lines") or []
+        out["streamline_speeds"] = sl.get("speeds_m_s") or []
     else:
         out["streamlines"] = []
+        out["streamline_speeds"] = []
 
     meta_path = case_dir / f"{case_id}_flow_meta.json"
     if meta_path.is_file():
@@ -104,6 +115,31 @@ def load_case(case_id: str, data_fingerprint: str) -> dict:
             out["meta"] = json.load(f)
     else:
         out["meta"] = {}
+
+    open_paths = case_dir / f"{case_id}_open_paths.json"
+    if open_paths.is_file():
+        with open_paths.open(encoding="utf-8") as f:
+            out["open_paths"] = json.load(f)
+    else:
+        out["open_paths"] = {}
+
+    rest_path = case_dir / f"{case_id}_restriction.npz"
+    if rest_path.is_file():
+        rd = np.load(rest_path)
+        out["restriction_pts"] = rd["points_xyz_score_r_mm"].astype(np.float32)
+        out["restriction_thr"] = float(rd["threshold_1_over_r"]) if "threshold_1_over_r" in rd else 0.0
+        out["restriction_min_r"] = float(rd["min_radius_mm"]) if "min_radius_mm" in rd else 0.0
+    else:
+        out["restriction_pts"] = None
+        out["restriction_thr"] = 0.0
+        out["restriction_min_r"] = 0.0
+
+    nares_path = case_dir / f"{case_id}_nares.json"
+    if nares_path.is_file():
+        with nares_path.open(encoding="utf-8") as f:
+            out["nares"] = json.load(f)
+    else:
+        out["nares"] = {}
 
     stl_path = case_dir / f"{case_id}_airway.stl"
     out["stl_path"] = str(stl_path) if stl_path.is_file() else None
@@ -113,6 +149,20 @@ def load_case(case_id: str, data_fingerprint: str) -> dict:
     out["skin_stl_path"] = str(skin_stl) if skin_stl.is_file() else None
     bone_stl = case_dir / f"{case_id}_bone.stl"
     out["bone_stl_path"] = str(bone_stl) if bone_stl.is_file() else None
+    septum_stl = case_dir / f"{case_id}_septum.stl"
+    out["septum_stl_path"] = str(septum_stl) if septum_stl.is_file() else None
+    left_stl = case_dir / f"{case_id}_cavity_left.stl"
+    out["left_cavity_stl_path"] = str(left_stl) if left_stl.is_file() else None
+    right_stl = case_dir / f"{case_id}_cavity_right.stl"
+    out["right_cavity_stl_path"] = str(right_stl) if right_stl.is_file() else None
+    mucosa_stl = case_dir / f"{case_id}_mucosa_wall.stl"
+    out["mucosa_stl_path"] = str(mucosa_stl) if mucosa_stl.is_file() else None
+    ct_meta = case_dir / f"{case_id}_ct_nasal_meta.json"
+    if ct_meta.is_file():
+        with ct_meta.open(encoding="utf-8") as f:
+            out["ct_nasal"] = json.load(f)
+    else:
+        out["ct_nasal"] = {}
 
     bc_path = case_dir / f"{case_id}_boundary_conditions.json"
     if bc_path.is_file():
@@ -289,38 +339,69 @@ def _add_surface_mesh(
     show_wireframe: bool,
     edge_color: str,
     wireframe_max_edges: int = 6000,
+    is_skin: bool = False,
 ) -> None:
     v = mesh.vertices
     f = mesh.faces
-    fig.add_trace(
-        go.Mesh3d(
-            x=v[:, 0],
-            y=v[:, 1],
-            z=v[:, 2],
-            i=f[:, 0],
-            j=f[:, 1],
-            k=f[:, 2],
-            color=color,
-            opacity=float(np.clip(opacity, 0.02, 1.0)),
-            name=name,
-            flatshading=False,
-            lighting=dict(
-                ambient=0.55,
-                diffuse=0.85,
-                specular=0.35,
-                roughness=0.45,
-                fresnel=0.15,
-            ),
-            lightposition=dict(x=80, y=120, z=200),
-            hoverinfo="skip",
-            showlegend=True,
+    # Solid surface (not a point cloud): Mesh3d with lighting.
+    # Skin gets slightly stronger lighting so the head silhouette reads clearly.
+    if is_skin:
+        lighting = dict(
+            ambient=0.42,
+            diffuse=0.95,
+            specular=0.55,
+            roughness=0.35,
+            fresnel=0.25,
         )
+        lightpos = dict(x=120, y=180, z=280)
+    else:
+        lighting = dict(
+            ambient=0.55,
+            diffuse=0.85,
+            specular=0.35,
+            roughness=0.45,
+            fresnel=0.15,
+        )
+        lightpos = dict(x=80, y=120, z=200)
+    mesh_kwargs = dict(
+        x=v[:, 0],
+        y=v[:, 1],
+        z=v[:, 2],
+        i=f[:, 0],
+        j=f[:, 1],
+        k=f[:, 2],
+        color=color,
+        opacity=float(np.clip(opacity, 0.02, 1.0)),
+        name=name,
+        flatshading=False,
+        lighting=lighting,
+        lightposition=lightpos,
+        hoverinfo="skip",
+        showlegend=True,
     )
+    fig.add_trace(go.Mesh3d(**mesh_kwargs))
     if show_wireframe:
         wf = _mesh_wireframe_trace(mesh, max_edges=wireframe_max_edges, color=edge_color)
         if wf is not None:
             wf.name = f"{name} edges"
+            wf.opacity = 0.75 if is_skin else 0.55
             fig.add_trace(wf)
+
+
+def _sample_speed_along_line(
+    line: np.ndarray,
+    speed: np.ndarray,
+    spacing: np.ndarray,
+    origin: np.ndarray,
+) -> np.ndarray:
+    """Nearest-neighbor sample of |u| (m/s) at each pathline vertex."""
+    ox, oy, oz = origin
+    sx, sy, sz = spacing
+    nz, ny, nx = speed.shape
+    ix = np.clip(np.rint((line[:, 0] - ox) / sx).astype(int), 0, nx - 1)
+    iy = np.clip(np.rint((line[:, 1] - oy) / sy).astype(int), 0, ny - 1)
+    iz = np.clip(np.rint((line[:, 2] - oz) / sz).astype(int), 0, nz - 1)
+    return speed[iz, iy, ix].astype(float)
 
 
 def _fig_3d(
@@ -329,6 +410,7 @@ def _fig_3d(
     skin_mesh,
     bone_mesh,
     streamlines: list,
+    streamline_speeds: list | None,
     ux: np.ndarray,
     uy: np.ndarray,
     uz: np.ndarray,
@@ -347,6 +429,8 @@ def _fig_3d(
     show_wireframe: bool,
     show_streamlines: bool,
     streamline_width: float,
+    streamline_opacity: float,
+    max_pathlines: int,
     show_vectors: bool,
     vector_stride: int,
     max_vector_speed: float,
@@ -354,6 +438,25 @@ def _fig_3d(
     bg_mode: str = "dark",
     max_vectors: int = 6000,
     centerline_mm: list | None = None,
+    centerline_left_mm: list | None = None,
+    centerline_right_mm: list | None = None,
+    show_centerlines: bool = False,
+    left_mesh=None,
+    right_mesh=None,
+    septum_mesh=None,
+    mucosa_mesh=None,
+    show_left: bool = False,
+    show_right: bool = False,
+    show_septum: bool = False,
+    show_mucosa: bool = False,
+    left_opacity: float = 0.5,
+    right_opacity: float = 0.5,
+    septum_opacity: float = 0.9,
+    mucosa_opacity: float = 0.35,
+    restriction_pts: np.ndarray | None = None,
+    show_restriction: bool = True,
+    animate_pathlines: bool = False,
+    n_anim_frames: int = 24,
 ) -> go.Figure:
     fig = go.Figure()
     dark = bg_mode == "dark"
@@ -377,8 +480,9 @@ def _fig_3d(
             color=skin_color,
             opacity=skin_opacity,
             show_wireframe=show_wireframe,
-            edge_color="#2a1810" if not dark else "#ffd7b0",
-            wireframe_max_edges=12000,
+            edge_color="#3d2314" if not dark else "#ffd7b0",
+            wireframe_max_edges=18000,
+            is_skin=True,
         )
     elif show_head and head_mesh is not None:
         _add_surface_mesh(
@@ -403,8 +507,8 @@ def _fig_3d(
             edge_color="#dddddd",
         )
 
-    # --- Airway cavity (air space) ---
-    if show_mesh and mesh is not None:
+    # --- Airway cavity (combined air space) ---
+    if show_mesh and mesh is not None and not (show_left or show_right):
         _add_surface_mesh(
             fig,
             mesh,
@@ -416,12 +520,84 @@ def _fig_3d(
             wireframe_max_edges=5000,
         )
 
-    # --- Streamlines (thinner by default so mesh stays primary) ---
-    if show_streamlines:
-        for li, line in enumerate(streamlines):
-            arr = np.asarray(line, dtype=float)
-            if arr.shape[0] < 2:
+    # --- L/R cavities (CT-native; septum is the gap/wall between them) ---
+    if show_left and left_mesh is not None:
+        _add_surface_mesh(
+            fig,
+            left_mesh,
+            name="Left nasal cavity",
+            color="#4fc3f7",
+            opacity=left_opacity,
+            show_wireframe=False,
+            edge_color=edge_color,
+        )
+    if show_right and right_mesh is not None:
+        _add_surface_mesh(
+            fig,
+            right_mesh,
+            name="Right nasal cavity",
+            color="#81d4fa",
+            opacity=right_opacity,
+            show_wireframe=False,
+            edge_color=edge_color,
+        )
+    if show_septum and septum_mesh is not None:
+        _add_surface_mesh(
+            fig,
+            septum_mesh,
+            name="Nasal septum",
+            color="#ff8a65",
+            opacity=septum_opacity,
+            show_wireframe=False,
+            edge_color="#bf360c",
+        )
+    if show_mucosa and mucosa_mesh is not None:
+        _add_surface_mesh(
+            fig,
+            mucosa_mesh,
+            name="Mucosa / walls",
+            color="#ce93d8",
+            opacity=mucosa_opacity,
+            show_wireframe=False,
+            edge_color="#6a1b9a",
+        )
+
+    # --- Dense pathlines colored by local flow speed (Turbo) ---
+    path_arrays: list[np.ndarray] = []
+    path_speeds: list[np.ndarray] = []
+    if show_streamlines and streamlines:
+        # subsample if too many for interactive Plotly
+        n_avail = len(streamlines)
+        n_show = min(int(max_pathlines), n_avail)
+        if n_show < n_avail:
+            idx = np.linspace(0, n_avail - 1, n_show, dtype=int)
+        else:
+            idx = np.arange(n_avail)
+        speed_lists = streamline_speeds or []
+        cmax_u = max(float(max_vector_speed), 1e-6)
+        for k, li in enumerate(idx):
+            full = np.asarray(streamlines[li], dtype=float)
+            if full.ndim != 2 or full.shape[0] < 2 or full.shape[1] < 3:
                 continue
+            if li < len(speed_lists) and speed_lists[li]:
+                sp_full = np.asarray(speed_lists[li], dtype=float)
+                if len(sp_full) != len(full):
+                    sp_full = _sample_speed_along_line(full, speed, spacing, origin)
+            else:
+                sp_full = _sample_speed_along_line(full, speed, spacing, origin)
+            # light decimation for long traces (keeps plot responsive)
+            if len(full) > 280:
+                step = max(1, len(full) // 220)
+                arr = full[::step]
+                sp = sp_full[::step]
+            else:
+                arr = full
+                sp = sp_full
+            if len(sp) != len(arr):
+                n = min(len(sp), len(arr))
+                arr, sp = arr[:n], sp[:n]
+            path_arrays.append(arr)
+            path_speeds.append(sp)
             fig.add_trace(
                 go.Scatter3d(
                     x=arr[:, 0],
@@ -430,17 +606,53 @@ def _fig_3d(
                     mode="lines",
                     line=dict(
                         width=stream_width,
-                        color=np.linspace(0, 1, len(arr)),
+                        color=sp,
                         colorscale="Turbo",
+                        cmin=0.0,
+                        cmax=cmax_u,
+                        colorbar=dict(title="|u| m/s", x=1.02) if k == 0 else None,
                     ),
-                    name="Streamlines" if li == 0 else None,
-                    showlegend=(li == 0),
+                    name="Pathlines (velocity)" if k == 0 else f"pathline {k}",
+                    showlegend=(k == 0),
                     hoverinfo="skip",
-                    opacity=0.9,
+                    opacity=float(np.clip(streamline_opacity, 0.12, 1.0)),
                 )
             )
 
-    # --- Velocity cones (dense by default) ---
+    # --- Max-restriction cloud (narrow lumen / high 1/r) ---
+    if show_restriction and restriction_pts is not None and len(restriction_pts) > 0:
+        rp = np.asarray(restriction_pts, dtype=float)
+        # columns: x,y,z, score(1/r), r_mm
+        fig.add_trace(
+            go.Scatter3d(
+                x=rp[:, 0],
+                y=rp[:, 1],
+                z=rp[:, 2],
+                mode="markers",
+                marker=dict(
+                    size=3.5,
+                    color=rp[:, 3] if rp.shape[1] > 3 else "orangered",
+                    colorscale=[
+                        [0.0, "rgba(255,200,80,0.15)"],
+                        [0.45, "rgba(255,120,40,0.55)"],
+                        [1.0, "rgba(180,0,40,0.95)"],
+                    ],
+                    opacity=0.55,
+                    line=dict(width=0),
+                    colorbar=dict(title="1/r (1/mm)", x=1.12) if not show_streamlines else None,
+                    showscale=not show_streamlines,
+                ),
+                name="Max restriction (narrow lumen)",
+                hovertemplate=(
+                    "restriction 1/r=%{marker.color:.2f}<br>"
+                    + ("r≈%{customdata:.2f} mm" if rp.shape[1] > 4 else "")
+                    + "<extra></extra>"
+                ),
+                customdata=rp[:, 4] if rp.shape[1] > 4 else None,
+            )
+        )
+
+    # --- Velocity cones (optional, denser cones) ---
     if show_vectors:
         zz, yy, xx = np.where(airway)
         step = max(int(vector_stride), 1)
@@ -497,30 +709,59 @@ def _fig_3d(
             )
         )
 
-    # Nasal-passage centerline (nares → trachea)
-    if centerline_mm is not None and len(centerline_mm) >= 2:
-        cl = np.asarray(centerline_mm, dtype=float)
-        fig.add_trace(
-            go.Scatter3d(
-                x=cl[:, 0],
-                y=cl[:, 1],
-                z=cl[:, 2],
-                mode="lines",
-                line=dict(color="#ff00aa", width=8),
-                name="Passage centerline",
-                hoverinfo="skip",
+    # Optional dual centerlines (off by default — low visual value vs pathlines)
+    if show_centerlines:
+        dual_drawn = False
+        for name, cl_pts, width in (
+            ("Centerline left naris → trachea", centerline_left_mm, 5),
+            ("Centerline right naris → trachea", centerline_right_mm, 5),
+        ):
+            if cl_pts is not None and len(cl_pts) >= 2:
+                cl = np.asarray(cl_pts, dtype=float)
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=cl[:, 0],
+                        y=cl[:, 1],
+                        z=cl[:, 2],
+                        mode="lines",
+                        line=dict(color="rgba(255,0,170,0.45)", width=width),
+                        name=name,
+                        hoverinfo="skip",
+                    )
+                )
+                dual_drawn = True
+        if not dual_drawn and centerline_mm is not None and len(centerline_mm) >= 2:
+            cl = np.asarray(centerline_mm, dtype=float)
+            fig.add_trace(
+                go.Scatter3d(
+                    x=cl[:, 0],
+                    y=cl[:, 1],
+                    z=cl[:, 2],
+                    mode="lines",
+                    line=dict(color="rgba(255,0,170,0.5)", width=6),
+                    name="Centerline (nares → trachea)",
+                    hoverinfo="skip",
+                )
             )
-        )
 
-    # Port markers (larger so nares are unambiguous in 3D)
+    # Port markers — tip-accurate nares + trachea only (no per-path clutter)
     for port in ports:
         c = port.get("center_mm", [0, 0, 0])
         is_inlet = port.get("role") == "inlet"
-        color = "#00ff66" if is_inlet else "#ff5c7a"
-        label = port.get("name", "port")
-        method = port.get("method") or ""
-        if method:
-            label = f"{label}\n[{method}]"
+        name = str(port.get("name", "port"))
+        if is_inlet:
+            color = "#00c853"
+            short = "L naris" if "left" in name.lower() else (
+                "R naris" if "right" in name.lower() else "Naris"
+            )
+            label = short
+            size = 10
+            symbol = "circle"
+        else:
+            color = "#ff1744"
+            label = "Trachea"
+            size = 11
+            symbol = "diamond"
         fig.add_trace(
             go.Scatter3d(
                 x=[c[0]],
@@ -528,20 +769,82 @@ def _fig_3d(
                 z=[c[2]],
                 mode="markers+text",
                 marker=dict(
-                    size=14 if is_inlet else 10,
+                    size=size,
                     color=color,
-                    symbol="diamond" if is_inlet else "circle",
-                    line=dict(width=2, color="white"),
+                    symbol=symbol,
+                    line=dict(width=1.5, color="white"),
+                    opacity=0.95,
                 ),
                 text=[label],
                 textposition="top center",
-                textfont=dict(size=11, color=color),
-                name=port.get("name", "port"),
+                textfont=dict(size=11, color=color, family="Arial"),
+                name=name,
             )
         )
 
+    # Animated particles riding pathlines (optional)
+    frames: list = []
+    if animate_pathlines and path_arrays:
+        particle_trace_idx = len(fig.data)
+        xs0 = [float(a[0, 0]) for a in path_arrays]
+        ys0 = [float(a[0, 1]) for a in path_arrays]
+        zs0 = [float(a[0, 2]) for a in path_arrays]
+        cs0 = [float(s[0]) for s in path_speeds]
+        cmax_u = max(float(max_vector_speed), 1e-6)
+        fig.add_trace(
+            go.Scatter3d(
+                x=xs0,
+                y=ys0,
+                z=zs0,
+                mode="markers",
+                marker=dict(
+                    size=5,
+                    color=cs0,
+                    colorscale="Turbo",
+                    cmin=0.0,
+                    cmax=cmax_u,
+                    line=dict(width=0),
+                ),
+                name="Flow particles",
+                showlegend=True,
+            )
+        )
+        n_f = max(8, int(n_anim_frames))
+        for fi in range(n_f):
+            frac = fi / max(n_f - 1, 1)
+            xs, ys, zs, cs = [], [], [], []
+            for arr, sp in zip(path_arrays, path_speeds):
+                j = int(frac * (len(arr) - 1))
+                xs.append(float(arr[j, 0]))
+                ys.append(float(arr[j, 1]))
+                zs.append(float(arr[j, 2]))
+                cs.append(float(sp[min(j, len(sp) - 1)]))
+            frames.append(
+                go.Frame(
+                    data=[
+                        go.Scatter3d(
+                            x=xs,
+                            y=ys,
+                            z=zs,
+                            mode="markers",
+                            marker=dict(
+                                size=5,
+                                color=cs,
+                                colorscale="Turbo",
+                                cmin=0.0,
+                                cmax=cmax_u,
+                                line=dict(width=0),
+                            ),
+                        )
+                    ],
+                    name=str(fi),
+                    traces=[particle_trace_idx],
+                )
+            )
+        fig.frames = frames
+
     fig.update_layout(
-        height=700,
+        height=720,
         margin=dict(l=0, r=0, t=30, b=0),
         scene=dict(
             xaxis_title="X mm",
@@ -558,6 +861,46 @@ def _fig_3d(
         font_color=font_c,
         legend=dict(bgcolor="rgba(0,0,0,0.3)" if dark else "rgba(255,255,255,0.7)"),
     )
+    if frames:
+        fig.update_layout(
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    showactive=False,
+                    y=0,
+                    x=0.05,
+                    xanchor="left",
+                    yanchor="bottom",
+                    buttons=[
+                        dict(
+                            label="Play",
+                            method="animate",
+                            args=[
+                                None,
+                                dict(
+                                    frame=dict(duration=80, redraw=True),
+                                    fromcurrent=True,
+                                    mode="immediate",
+                                    transition=dict(duration=0),
+                                ),
+                            ],
+                        ),
+                        dict(
+                            label="Pause",
+                            method="animate",
+                            args=[
+                                [None],
+                                dict(
+                                    frame=dict(duration=0, redraw=False),
+                                    mode="immediate",
+                                    transition=dict(duration=0),
+                                ),
+                            ],
+                        ),
+                    ],
+                )
+            ]
+        )
     return fig
 
 
@@ -576,7 +919,7 @@ def main() -> None:
     st.title("Sinus_CFD — Airflow Viewer")
     st.caption(
         "Tri-planar velocity · 3D cavity · streamlines  ·  "
-        "Potential-flow preview (not full Navier–Stokes CFD yet)"
+        "OpenFOAM simpleFoam when imported (else potential-flow preview)"
     )
 
     # Always-visible version banner (confirm you are not on a stale app/session)
@@ -616,41 +959,112 @@ def main() -> None:
         st.header("3D display")
         preset = st.radio(
             "Preset",
-            ["Head + airway", "Cavity first", "Flow overlay", "Cavity only"],
+            [
+                "Inhale: nares → trachea",
+                "Head + airway",
+                "Cavity first",
+                "Flow overlay",
+                "Cavity only",
+            ],
             index=0,
-            help="Head + airway: semi-transparent solid head with airway inside.",
+            help="Inhale: streamlines seeded at nostrils flowing toward trachea.",
         )
         show_skin = st.checkbox("Show skin surface", value=True)
-        skin_opacity = st.slider("Skin opacity", 0.05, 0.95, 0.55, 0.01)
+        skin_opacity = st.slider(
+            "Skin opacity",
+            0.05,
+            0.95,
+            0.38,
+            0.01,
+            help="Filled outer skin mesh from CT body mask (not a point cloud).",
+        )
         show_head = st.checkbox("Show soft-tissue solid (if no skin)", value=False)
         head_opacity = st.slider("Soft-tissue opacity", 0.05, 0.85, 0.25, 0.01)
         show_bone = st.checkbox("Show bone", value=False)
         bone_opacity = st.slider("Bone opacity", 0.05, 1.0, 0.45, 0.01)
-        show_mesh = st.checkbox("Show air space (airway)", value=True)
+        show_mesh = st.checkbox("Show combined air space", value=False)
         mesh_opacity = st.slider("Air space opacity", 0.15, 1.0, 0.40, 0.01)
-        show_wireframe = st.checkbox("Skin/airway wireframe edges", value=True)
+        show_left = st.checkbox("Left nasal cavity (CT)", value=True)
+        show_right = st.checkbox("Right nasal cavity (CT)", value=True)
+        show_septum = st.checkbox(
+            "Nasal septum (off by default)",
+            value=False,
+            help="CT tissue between L/R cavities; usually leave off for air/path view.",
+        )
+        show_mucosa = st.checkbox("Mucosa / passage walls", value=False)
+        left_opacity = st.slider("Left cavity opacity", 0.05, 1.0, 0.40, 0.01)
+        right_opacity = st.slider("Right cavity opacity", 0.05, 1.0, 0.40, 0.01)
+        septum_opacity = st.slider("Septum opacity", 0.1, 1.0, 0.55, 0.01)
+        show_wireframe = st.checkbox(
+            "Skin wireframe edges",
+            value=True,
+            help="On by default so head extent reads clearly over translucent skin.",
+        )
         show_streamlines = st.checkbox(
-            "Streamlines (curved)",
+            "Flow pathlines (velocity-colored)",
             value=(preset not in ("Cavity only",)),
         )
-        streamline_width = st.slider("Streamline width", 1.0, 8.0, 2.0, 0.5)
-        show_vectors = st.checkbox(
-            "Velocity cones (many)",
+        streamline_width = st.slider("Pathline width", 1.0, 8.0, 2.5, 0.5)
+        streamline_opacity = st.slider("Pathline opacity", 0.15, 1.0, 0.55, 0.05)
+        max_pathlines = st.slider(
+            "Max pathlines shown",
+            20,
+            400,
+            180,
+            10,
+            help="Dense semi-transparent lines; lower if the plot is slow.",
+        )
+        animate_pathlines = st.checkbox(
+            "Animate particles along pathlines",
+            value=False,
+            help="Play button on the 3D plot rides particles naris→trachea.",
+        )
+        show_restriction = st.checkbox(
+            "Highlight max restriction (narrow lumen)",
             value=True,
+            help="Hot cloud where distance-to-wall is smallest (high 1/r).",
+        )
+        show_centerlines = st.checkbox(
+            "Show anatomical centerlines (magenta)",
+            value=False,
+            help="Usually off — dense pathlines carry more information.",
+        )
+        show_vectors = st.checkbox(
+            "Velocity cones (glyphs)",
+            value=False,
         )
         vector_stride = st.slider(
             "Vector density (1=max, higher=sparser)",
             1,
             8,
-            2,
-            help="Lower = many more cones. Default 2 is dense.",
+            3,
+            help="Lower = many more cones. Default 3 is moderate.",
         )
-        max_vectors = st.slider("Max velocity cones", 500, 12000, 6000, 500)
+        max_vectors = st.slider("Max velocity cones", 500, 12000, 3000, 500)
         bg_mode = st.selectbox("Background", ["dark", "light"], index=1)
 
-        if preset == "Cavity only":
+        if preset == "Inhale: nares → trachea":
+            show_streamlines = True
+            show_vectors = False
+            show_restriction = True
+            show_centerlines = False
+            show_skin = True
+            show_wireframe = True
+            # Keep skin readable as a surface shell, not vanishing
+            skin_opacity = min(max(skin_opacity, 0.28), 0.42)
+            show_mesh = False
+            show_left = True
+            show_right = True
+            show_septum = False
+            streamline_width = max(streamline_width, 2.5)
+            streamline_opacity = min(streamline_opacity, 0.6)
+            max_pathlines = max(max_pathlines, 160)
+            vector_stride = max(vector_stride, 3)
+            max_vectors = min(max_vectors, 2500)
+        elif preset == "Cavity only":
             show_streamlines = False
             show_vectors = True
+            show_restriction = True
             show_head = False
             show_skin = False
             mesh_opacity = max(mesh_opacity, 0.7)
@@ -659,13 +1073,17 @@ def main() -> None:
             skin_opacity = max(skin_opacity, 0.5)
             mesh_opacity = min(mesh_opacity, 0.45)
             streamline_width = min(streamline_width, 2.5)
-            show_vectors = True
+            show_vectors = False
+            show_streamlines = True
             vector_stride = min(vector_stride, 2)
         elif preset == "Flow overlay":
             show_skin = True
-            skin_opacity = min(skin_opacity, 0.35)
-            show_vectors = True
-            vector_stride = 1
+            skin_opacity = min(skin_opacity, 0.28)
+            show_vectors = False
+            show_streamlines = True
+            show_restriction = True
+            streamline_opacity = min(streamline_opacity, 0.5)
+            max_pathlines = max(max_pathlines, 200)
         elif preset == "Cavity first":
             show_head = False
             show_skin = False
@@ -720,17 +1138,33 @@ def main() -> None:
         else:
             st.warning("No inlet ports in loaded BC JSON.")
 
-        # Guardrail: latest pipeline uses edge_nose_tip_skin_naris
+        # Guardrail: tip-accurate CT naris openings
         methods = [p.get("method") for p in bc.get("ports", []) if p.get("role") == "inlet"]
-        if methods and all(m == "edge_nose_tip_skin_naris" for m in methods):
-            st.success(
-                "Nares method is `edge_nose_tip_skin_naris` (nose tip / external openings)."
-            )
+        tip_ok = {
+            "skin_tip_vestibule",
+            "ct_naris_opening_air",
+            "ct_naris_opening_tip",
+            "ct_naris_opening",
+            "edge_nose_tip_skin_naris",
+        }
+        if methods and all(m in tip_ok for m in methods):
+            if all(m == "skin_tip_vestibule" for m in methods):
+                st.success(
+                    "Nares at **skin nose tip** with **open vestibules** painted into "
+                    "each cavity (CT often seals this region). "
+                    "Pathlines ~50% L / ~50% R → trachea."
+                )
+            elif all(m == "ct_naris_opening_air" for m in methods):
+                st.info(
+                    "Nares on CT opening∩air. For tip openings run: "
+                    "`py -3.12 scripts/extend_nasal_to_tip.py`"
+                )
+            else:
+                st.info(f"Nares methods: `{methods}`.")
         elif methods:
-            st.error(
-                "Loaded BC methods are not the latest nose-tip detector "
-                f"({methods}). Click **Clear cache & reload data**, or re-run "
-                "`process_whole_head.py`."
+            st.warning(
+                f"Unexpected naris methods `{methods}`. "
+                "Click **Clear cache & reload data**, or re-run pathline regen."
             )
 
         notes = stats.get("notes") or []
@@ -752,7 +1186,7 @@ def main() -> None:
         passage = data.get("passage") or {}
         pm = passage.get("metrics") or {}
         if pm:
-            st.markdown("**Nasal passage domain (walls + open ports + centerline)**")
+            st.markdown("**Nasal passage domain (walls + open ports)**")
             st.markdown(
                 f"- Lumen volume: **{pm.get('lumen_volume_ml', 0):.1f} mL**\n"
                 f"- Centerline length: **{pm.get('centerline_length_mm', 0):.1f} mm**\n"
@@ -764,20 +1198,47 @@ def main() -> None:
                 f"inlet open: `{pm.get('inlet_open_voxels')}` · "
                 f"outlet open: `{pm.get('outlet_open_voxels')}`"
             )
+        n_sl = len(data.get("streamlines") or [])
+        st.caption(
+            f"**{n_sl} pathlines** colored by **|u| (Turbo)** · "
+            "restriction cloud = narrowest lumen (high 1/r). "
+            "Magenta centerlines are optional and off by default."
+        )
+        if data.get("restriction_pts") is not None:
             st.caption(
-                "Magenta line in 3D = passage centerline (nares → trachea). "
-                "Walls = mucosa (no-slip); open ports = flow BCs."
+                f"Restriction: min radius ≈ **{data.get('restriction_min_r', 0):.2f} mm** · "
+                f"hot threshold 1/r ≥ **{data.get('restriction_thr', 0):.2f}**"
             )
+
+    method = str(meta.get("method", "potential_flow"))
+    is_openfoam = "openfoam" in method.lower()
+    if is_openfoam:
+        st.success(
+            f"**Flow source: OpenFOAM simpleFoam** · time=`{meta.get('openfoam_time', '?')}` · "
+            f"cells=`{meta.get('n_cells', '?')}` · mapped voxels=`{meta.get('n_mapped_voxels', '?')}`"
+        )
+        st.markdown(
+            "**Inspiration path:** dense **pathlines colored by velocity** (|u| m/s, Turbo) "
+            "from **tip nares** through the nasal passage to the **trachea**. "
+            "Orange/red cloud = **max restriction** (narrowest lumen / high 1/r)."
+        )
+    else:
+        st.warning(
+            f"**Flow source: `{method}`** (not OpenFOAM). "
+            "After a Docker run, import with: "
+            "`py -3.12 scripts/import_openfoam_results.py --case VisibleHuman_Head`"
+        )
 
     # Metrics
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Max |u|", f"{meta.get('max_speed_m_s', float(speed[airway].max())):.3f} m/s")
-    c2.metric("Mean |u|", f"{meta.get('mean_speed_m_s', float(speed[airway].mean())):.3f} m/s")
+    c1.metric("Max |u|", f"{meta.get('max_speed_m_s', float(speed[airway].max() if airway.any() else 0)):.3f} m/s")
+    c2.metric("Mean |u|", f"{meta.get('mean_speed_m_s', float(speed[airway].mean() if airway.any() else 0)):.3f} m/s")
     c3.metric("Target Q", f"{meta.get('target_flow_L_per_min', 18):.1f} L/min")
     c4.metric("App ver", APP_VERSION.split("-")[0])
 
     if meta.get("notes"):
-        with st.expander("Method notes / caveats", expanded=False):
+        with st.expander("Method notes / caveats", expanded=is_openfoam):
+            st.markdown(f"**Method:** `{method}`")
             for n in meta["notes"]:
                 st.write(f"- {n}")
             if bc.get("outlet_is_proxy"):
@@ -811,7 +1272,8 @@ def main() -> None:
             st.warning(f"Could not load airway STL: {exc}")
     if data.get("skin_stl_path"):
         try:
-            skin_mesh = _load_mesh_decimated(data["skin_stl_path"], target_faces=22000)
+            # Keep more faces so skin reads as a continuous surface + wireframe
+            skin_mesh = _load_mesh_decimated(data["skin_stl_path"], target_faces=40000)
         except Exception as exc:
             st.warning(f"Could not load skin STL: {exc}")
     if data.get("head_stl_path"):
@@ -827,17 +1289,72 @@ def main() -> None:
         except Exception as exc:
             st.warning(f"Could not load bone STL: {exc}")
 
+    left_mesh = right_mesh = septum_mesh = mucosa_mesh = None
+    if data.get("left_cavity_stl_path"):
+        try:
+            left_mesh = _load_mesh_decimated(data["left_cavity_stl_path"], target_faces=12000)
+        except Exception as exc:
+            st.warning(f"Left cavity STL: {exc}")
+    if data.get("right_cavity_stl_path"):
+        try:
+            right_mesh = _load_mesh_decimated(data["right_cavity_stl_path"], target_faces=12000)
+        except Exception as exc:
+            st.warning(f"Right cavity STL: {exc}")
+    if data.get("septum_stl_path"):
+        try:
+            septum_mesh = _load_mesh_decimated(data["septum_stl_path"], target_faces=10000)
+        except Exception as exc:
+            st.warning(f"Septum STL: {exc}")
+    if data.get("mucosa_stl_path"):
+        try:
+            mucosa_mesh = _load_mesh_decimated(data["mucosa_stl_path"], target_faces=18000)
+        except Exception as exc:
+            st.warning(f"Mucosa STL: {exc}")
+
+    ct_nasal = data.get("ct_nasal") or {}
+    if ct_nasal:
+        st.info(
+            f"**CT-native nasal model** (`{ct_nasal.get('method', '?')}`): "
+            f"L={ct_nasal.get('left_voxels', '?')} · R={ct_nasal.get('right_voxels', '?')} · "
+            f"septum={ct_nasal.get('septum_voxels', '?')} voxels · "
+            f"naris openings={ct_nasal.get('naris_opening_voxels', '?')}"
+        )
+    elif show_septum or show_left or show_right:
+        st.warning(
+            "No CT L/R/septum meshes yet. Run: "
+            "`py -3.12 scripts/refine_nasal_ct.py --case VisibleHuman_Head`"
+        )
+
     streamlines = data["streamlines"] if show_streamlines else []
+    streamline_speeds = data.get("streamline_speeds") or []
     ports = bc.get("ports", [])
-    ports_lite = [
-        {
-            "name": p.get("name"),
-            "role": p.get("role"),
-            "center_mm": p.get("center_mm"),
-            "method": p.get("method"),
-        }
-        for p in ports
-    ]
+    # Prefer tip-accurate centers from nares.json when present
+    tip_by_name: dict[str, list[float]] = {}
+    for npnt in (data.get("nares") or {}).get("naris_points") or []:
+        nm = str(npnt.get("name") or "")
+        if npnt.get("center_mm"):
+            tip_by_name[nm] = [float(v) for v in npnt["center_mm"]]
+    ports_lite = []
+    for p in ports:
+        center = p.get("center_mm")
+        name = str(p.get("name") or "")
+        if name in tip_by_name:
+            center = tip_by_name[name]
+        ports_lite.append(
+            {
+                "name": name,
+                "role": p.get("role"),
+                "center_mm": center,
+                "method": p.get("method"),
+            }
+        )
+
+    # Prefer dual open-paths when passage dual missing
+    op = data.get("open_paths") or {}
+    passage = data.get("passage") or {}
+    cl_left = passage.get("centerline_left_mm") or op.get("centerline_left_mm")
+    cl_right = passage.get("centerline_right_mm") or op.get("centerline_right_mm")
+    cl_mid = passage.get("centerline_mm") or op.get("centerline_mid_mm")
 
     fig3d = _fig_3d(
         mesh=mesh,
@@ -845,6 +1362,7 @@ def main() -> None:
         skin_mesh=skin_mesh,
         bone_mesh=bone_mesh,
         streamlines=streamlines if show_streamlines else [],
+        streamline_speeds=streamline_speeds if show_streamlines else [],
         ux=data["ux"],
         uy=data["uy"],
         uz=data["uz"],
@@ -863,19 +1381,40 @@ def main() -> None:
         show_wireframe=show_wireframe,
         show_streamlines=show_streamlines,
         streamline_width=streamline_width,
+        streamline_opacity=streamline_opacity,
+        max_pathlines=max_pathlines,
         show_vectors=show_vectors,
         vector_stride=vector_stride,
         max_vector_speed=vmax,
         ports=ports_lite,
         bg_mode=bg_mode,
         max_vectors=max_vectors,
-        centerline_mm=(data.get("passage") or {}).get("centerline_mm"),
+        centerline_mm=cl_mid,
+        centerline_left_mm=cl_left,
+        centerline_right_mm=cl_right,
+        show_centerlines=show_centerlines,
+        left_mesh=left_mesh,
+        right_mesh=right_mesh,
+        septum_mesh=septum_mesh,
+        mucosa_mesh=mucosa_mesh,
+        show_left=show_left and left_mesh is not None,
+        show_right=show_right and right_mesh is not None,
+        show_septum=show_septum and septum_mesh is not None,
+        show_mucosa=show_mucosa and mucosa_mesh is not None,
+        left_opacity=left_opacity,
+        right_opacity=right_opacity,
+        septum_opacity=septum_opacity,
+        restriction_pts=data.get("restriction_pts"),
+        show_restriction=show_restriction,
+        animate_pathlines=animate_pathlines and show_streamlines,
+        n_anim_frames=28,
     )
     st.plotly_chart(fig3d, use_container_width=True)
     st.caption(
-        "Tip: preset **Head + airway** — solid head shell (semi-transparent) with "
-        "airway inside. Raise head opacity to see the face/skull outline; lower it "
-        "to see streamlines through the head."
+        "Pathlines: **Turbo color = local speed** (|u| m/s). "
+        "Orange/red points = **max restriction**. "
+        "Enable **Animate particles** + Play for motion along paths. "
+        "Lower skin opacity / cavity opacity if the flow is hard to see."
     )
 
     # ---- BC summary ----

@@ -11,11 +11,12 @@ application     simpleFoam;
 startFrom       startTime;
 startTime       0;
 stopAt          endTime;
+// Stable re-solve on watertight airway mesh (~71 mL)
 endTime         500;
 deltaT          1;
 writeControl    timeStep;
-writeInterval   100;
-purgeWrite      2;
+writeInterval   50;
+purgeWrite      6;
 writeFormat     ascii;
 writePrecision  8;
 writeCompression off;

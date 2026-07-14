@@ -58,7 +58,21 @@ def main() -> int:
     if not inlets or not outlets:
         raise SystemExit("BC JSON needs inlet and outlet ports with center_mm")
 
-    print(f"[{args.case}] analyzing nasal passage domain…")
+    # External skin nares (face) — required so open-air model includes nostrils
+    skin_nares: list[list[float]] = []
+    nares_path = case_dir / f"{args.case}_nares.json"
+    if nares_path.is_file():
+        nj = json.loads(nares_path.read_text(encoding="utf-8"))
+        for npnt in nj.get("naris_points") or []:
+            if npnt.get("center_mm"):
+                skin_nares.append([float(v) for v in npnt["center_mm"]])
+    if not skin_nares:
+        skin_nares = [list(map(float, c)) for c in inlets]
+        print(f"[{args.case}] WARNING: no nares.json — using BC inlet centers as skin nares")
+    else:
+        print(f"[{args.case}] skin nares from nares.json: {skin_nares}")
+
+    print(f"[{args.case}] analyzing nasal passage domain (extend to external nostrils)…")
     masks, passage, metrics = analyze_nasal_passage(
         lumen=lumen,
         spacing=spacing,
@@ -67,6 +81,8 @@ def main() -> int:
         outlet_center_mm=outlets[0],
         case_id=args.case,
         open_radius_mm=args.open_radius_mm,
+        skin_naris_centers_mm=skin_nares,
+        tunnel_radius_mm=3.5,
     )
     paths = write_passage_outputs(
         args.case,
@@ -91,10 +107,24 @@ def main() -> int:
     for k, path in paths.items():
         print(f"  wrote {k}: {path.name}")
 
-    # Keep airway mask in sync with passage lumen (geometry preserved)
+    # Keep airway mask + air-space STL in sync with extended passage (includes nares)
     out_img = sitk.GetImageFromArray(masks["lumen"].astype("uint8"))
     out_img.CopyInformation(img)
     sitk.WriteImage(out_img, str(case_dir / f"{args.case}_airway_mask.nrrd"))
+    # Viewer "Air space" mesh
+    try:
+        from sinus_cfd.pipeline import _mask_to_mesh  # noqa: E402
+
+        amesh = _mask_to_mesh(masks["lumen"], spacing, origin)
+        if len(amesh.faces) > 30000:
+            try:
+                amesh = amesh.simplify_quadric_decimation(30000)
+            except Exception:
+                pass
+        amesh.export(case_dir / f"{args.case}_airway.stl")
+        print(f"[{args.case}] wrote airway.stl (includes external nares)")
+    except Exception as exc:
+        print(f"[{args.case}] airway.stl export failed: {exc}")
 
     if not args.skip_flow:
         print(f"[{args.case}] path-aware flow field…")

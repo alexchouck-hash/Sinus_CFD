@@ -18,10 +18,10 @@ Geometry STLs are in **metres** (scaled from medical mm).
 ## Background box (m)
 
 ```
-x [0.1855, 0.3175]
-y [0.1345, 0.2675]
-z [1.4975, 1.6625]
-locationInMesh (0.2515 0.2010 1.5800)
+x [0.1895, 0.3135]
+y [0.1385, 0.2635]
+z [1.5015, 1.6585]
+locationInMesh (0.2526 0.1890 1.6009)
 ```
 
 ## Run (Linux / WSL)
