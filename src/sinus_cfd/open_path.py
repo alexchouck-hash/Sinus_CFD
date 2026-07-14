@@ -114,17 +114,58 @@ def most_open_cost(
     return cost.astype(np.float64), radius.astype(np.float32)
 
 
+def most_open_cost_hu(
+    air: np.ndarray,
+    hu: np.ndarray | None,
+    spacing_xyz: tuple[float, float, float],
+    power: float = 2.0,
+    eps: float = 0.5,
+    hu_weight: float = 0.55,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Most-open cost favoring wide lumen (high EDT) and dark air (low HU).
+
+    Instrument path: stay centered between bone (EDT) and in the darkest
+    air voxels on DICOM (most negative HU).
+    """
+    cost, radius = most_open_cost(air, spacing_xyz, power=power, eps=eps)
+    if hu is None or hu_weight <= 0:
+        return cost, radius
+    inside = air.astype(bool)
+    if not inside.any():
+        return cost, radius
+    # Map HU: darker (more negative) → lower multiplier
+    h = hu.astype(np.float64)
+    h_in = h[inside]
+    # clip typical air range
+    h_clip = np.clip(h_in, -1000.0, -50.0)
+    # 0 at darkest, 1 at least-dark air
+    h_norm = (h_clip - h_clip.min()) / max(float(h_clip.max() - h_clip.min()), 1.0)
+    # cost *= (1 + hu_weight * h_norm) so bright partial-volume is pricier
+    mult = np.ones_like(cost)
+    mult[inside] = 1.0 + float(hu_weight) * h_norm
+    cost = cost * mult
+    return cost.astype(np.float64), radius
+
+
 def most_open_path_zyx(
     air: np.ndarray,
     start_zyx: tuple[int, int, int],
     end_zyx: tuple[int, int, int],
     spacing_xyz: tuple[float, float, float],
     power: float = 2.0,
+    hu: np.ndarray | None = None,
+    hu_weight: float = 0.55,
 ) -> list[tuple[int, int, int]]:
-    """Discrete most-open path indices (z,y,x)."""
+    """Discrete most-open path indices (z,y,x). Optional HU preference."""
     start = nearest_air_index(air, start_zyx)
     end = nearest_air_index(air, end_zyx)
-    cost, _ = most_open_cost(air, spacing_xyz, power=power)
+    if hu is not None:
+        cost, _ = most_open_cost_hu(
+            air, hu, spacing_xyz, power=power, hu_weight=hu_weight
+        )
+    else:
+        cost, _ = most_open_cost(air, spacing_xyz, power=power)
     try:
         indices, _ = route_through_array(
             cost, start=start, end=end, fully_connected=True, geometric=True
@@ -132,6 +173,61 @@ def most_open_path_zyx(
     except Exception:
         indices = [start, end]
     return [(int(a), int(b), int(c)) for a, b, c in indices]
+
+
+def path_restriction_highlights(
+    path_zyx: list[tuple[int, int, int]],
+    air: np.ndarray,
+    spacing_xyz: tuple[float, float, float],
+    origin_xyz: tuple[float, float, float],
+    radius: np.ndarray | None = None,
+    narrow_percentile: float = 30.0,
+    ball_radius: int = 2,
+) -> tuple[np.ndarray, list[dict]]:
+    """
+    Magenta surgical targets: narrowest segments along an access path.
+
+    Returns (highlight_mask, list of bottleneck records with mm coords).
+    """
+    sx, sy, sz = spacing_xyz
+    if radius is None:
+        radius = ndi.distance_transform_edt(air, sampling=(sz, sy, sx)).astype(np.float32)
+    if not path_zyx:
+        return np.zeros_like(air), []
+    r_along = np.array([float(radius[p]) for p in path_zyx], dtype=float)
+    thr = float(np.percentile(r_along, narrow_percentile))
+    thr = max(thr, float(min(sx, sy, sz)) * 0.9)
+    highlight = np.zeros_like(air, dtype=bool)
+    bottlenecks: list[dict] = []
+    for i, p in enumerate(path_zyx):
+        if r_along[i] <= thr:
+            highlight[p] = True
+    if highlight.any():
+        highlight = morphology.binary_dilation(
+            highlight, footprint=morphology.ball(ball_radius)
+        )
+        highlight &= air
+    # Cluster bottleneck centers for labels
+    lab, n = ndi.label(highlight)
+    for li in range(1, n + 1):
+        zz, yy, xx = np.where(lab == li)
+        if len(zz) < 3:
+            continue
+        zc, yc, xc = int(zz.mean()), int(yy.mean()), int(xx.mean())
+        bottlenecks.append(
+            {
+                "center_mm": [
+                    float(origin_xyz[0] + xc * sx),
+                    float(origin_xyz[1] + yc * sy),
+                    float(origin_xyz[2] + zc * sz),
+                ],
+                "voxels": int(len(zz)),
+                "mean_radius_mm": float(radius[zz, yy, xx].mean()),
+                "min_radius_mm": float(radius[zz, yy, xx].min()),
+            }
+        )
+    bottlenecks.sort(key=lambda b: b["min_radius_mm"])
+    return highlight, bottlenecks
 
 
 def path_zyx_to_mm(

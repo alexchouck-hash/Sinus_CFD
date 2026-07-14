@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.10.1-naris-to-trachea"
+APP_VERSION = "0.11.0-surgical-frontal-path"
 APP_VERSION_LABEL = (
-    "curvy pathlines enter nostrils → exit trachea · mild swirl"
+    "sinus labels · purple naris→frontal instrument path · magenta removal zones"
 )
 
 DEFAULT_CASE = "P001"
@@ -58,6 +58,9 @@ def case_data_fingerprint(case_id: str) -> str:
         f"{case_id}_passage.json",
         f"{case_id}_open_paths.json",
         f"{case_id}_restriction.npz",
+        f"{case_id}_surgical_guidance.json",
+        f"{case_id}_removal_highlight.npz",
+        f"{case_id}_sinus_frontal.stl",
         f"{case_id}_septum.stl",
         f"{case_id}_cavity_left.stl",
         f"{case_id}_cavity_right.stl",
@@ -140,6 +143,29 @@ def load_case(case_id: str, data_fingerprint: str) -> dict:
             out["nares"] = json.load(f)
     else:
         out["nares"] = {}
+
+    surg_path = case_dir / f"{case_id}_surgical_guidance.json"
+    if surg_path.is_file():
+        with surg_path.open(encoding="utf-8") as f:
+            out["surgical"] = json.load(f)
+    else:
+        out["surgical"] = {}
+
+    rem_npz = case_dir / f"{case_id}_removal_highlight.npz"
+    if rem_npz.is_file():
+        rd = np.load(rem_npz)
+        out["removal_pts"] = rd["points_xyz_r_mm"].astype(np.float32)
+    else:
+        out["removal_pts"] = None
+
+    for key, fname in (
+        ("frontal_stl", f"{case_id}_sinus_frontal.stl"),
+        ("sphenoid_stl", f"{case_id}_sinus_sphenoid.stl"),
+        ("maxillary_left_stl", f"{case_id}_sinus_maxillary_left.stl"),
+        ("maxillary_right_stl", f"{case_id}_sinus_maxillary_right.stl"),
+    ):
+        fp = case_dir / fname
+        out[key] = str(fp) if fp.is_file() else None
 
     stl_path = case_dir / f"{case_id}_airway.stl"
     out["stl_path"] = str(stl_path) if stl_path.is_file() else None
@@ -457,6 +483,18 @@ def _fig_3d(
     show_restriction: bool = True,
     animate_pathlines: bool = False,
     n_anim_frames: int = 24,
+    frontal_path_mm: list | None = None,
+    show_frontal_path: bool = False,
+    removal_pts: np.ndarray | None = None,
+    show_removal: bool = False,
+    frontal_mesh=None,
+    sphenoid_mesh=None,
+    max_l_mesh=None,
+    max_r_mesh=None,
+    show_frontal_sinus: bool = False,
+    show_sphenoid: bool = False,
+    show_maxillary: bool = False,
+    sinus_opacity: float = 0.35,
 ) -> go.Figure:
     fig = go.Figure()
     dark = bg_mode == "dark"
@@ -562,6 +600,49 @@ def _fig_3d(
             edge_color="#6a1b9a",
         )
 
+    # --- Paranasal sinuses (labeled) ---
+    if show_frontal_sinus and frontal_mesh is not None:
+        _add_surface_mesh(
+            fig,
+            frontal_mesh,
+            name="Frontal sinus",
+            color="#ffb74d",
+            opacity=sinus_opacity,
+            show_wireframe=False,
+            edge_color="#e65100",
+        )
+    if show_sphenoid and sphenoid_mesh is not None:
+        _add_surface_mesh(
+            fig,
+            sphenoid_mesh,
+            name="Sphenoid sinus",
+            color="#4db6ac",
+            opacity=sinus_opacity,
+            show_wireframe=False,
+            edge_color="#00695c",
+        )
+    if show_maxillary:
+        if max_l_mesh is not None:
+            _add_surface_mesh(
+                fig,
+                max_l_mesh,
+                name="Maxillary sinus (L)",
+                color="#64b5f6",
+                opacity=sinus_opacity,
+                show_wireframe=False,
+                edge_color="#1565c0",
+            )
+        if max_r_mesh is not None:
+            _add_surface_mesh(
+                fig,
+                max_r_mesh,
+                name="Maxillary sinus (R)",
+                color="#4fc3f7",
+                opacity=sinus_opacity,
+                show_wireframe=False,
+                edge_color="#0277bd",
+            )
+
     # --- Dense pathlines colored by local flow speed (Turbo) ---
     path_arrays: list[np.ndarray] = []
     path_speeds: list[np.ndarray] = []
@@ -649,6 +730,68 @@ def _fig_3d(
                     + "<extra></extra>"
                 ),
                 customdata=rp[:, 4] if rp.shape[1] > 4 else None,
+            )
+        )
+
+    # --- Magenta / pink: surgical areas to remove (path bottlenecks) ---
+    if show_removal and removal_pts is not None and len(removal_pts) > 0:
+        rp = np.asarray(removal_pts, dtype=float)
+        fig.add_trace(
+            go.Scatter3d(
+                x=rp[:, 0],
+                y=rp[:, 1],
+                z=rp[:, 2],
+                mode="markers",
+                marker=dict(
+                    size=4.5,
+                    color="#ff2d95",  # magenta/pink
+                    opacity=0.75,
+                    line=dict(width=0),
+                    symbol="circle",
+                ),
+                name="Areas to remove (narrow / ostium)",
+                hovertemplate=(
+                    "removal target"
+                    + (" · r≈%{customdata:.2f} mm" if rp.shape[1] > 3 else "")
+                    + "<extra></extra>"
+                ),
+                customdata=rp[:, 3] if rp.shape[1] > 3 else None,
+            )
+        )
+
+    # --- Purple: least-resistance instrument path naris → frontal sinus ---
+    if show_frontal_path and frontal_path_mm is not None and len(frontal_path_mm) >= 2:
+        fp = np.asarray(frontal_path_mm, dtype=float)
+        fig.add_trace(
+            go.Scatter3d(
+                x=fp[:, 0],
+                y=fp[:, 1],
+                z=fp[:, 2],
+                mode="lines",
+                line=dict(color="#9c27b0", width=10),  # purple
+                name="Instrument path: naris → frontal (least resistance)",
+                hoverinfo="skip",
+                opacity=0.95,
+            )
+        )
+        # Start (naris) / end (frontal) markers
+        fig.add_trace(
+            go.Scatter3d(
+                x=[fp[0, 0], fp[-1, 0]],
+                y=[fp[0, 1], fp[-1, 1]],
+                z=[fp[0, 2], fp[-1, 2]],
+                mode="markers+text",
+                marker=dict(
+                    size=[9, 10],
+                    color=["#ce93d8", "#7b1fa2"],
+                    symbol=["circle", "diamond"],
+                    line=dict(width=1, color="white"),
+                ),
+                text=["Naris entry", "Frontal sinus"],
+                textposition="top center",
+                textfont=dict(size=11, color="#6a1b9a"),
+                name="Frontal path ends",
+                showlegend=False,
             )
         )
 
@@ -1025,10 +1168,25 @@ def main() -> None:
             help="Hot cloud where distance-to-wall is smallest (high 1/r).",
         )
         show_centerlines = st.checkbox(
-            "Show anatomical centerlines (magenta)",
+            "Show anatomical centerlines (dim)",
             value=False,
             help="Usually off — dense pathlines carry more information.",
         )
+        st.subheader("Surgical guidance")
+        show_frontal_path = st.checkbox(
+            "Purple path: naris → frontal sinus (least resistance)",
+            value=True,
+            help="Most-open instrument corridor: dark air + centered between bone (EDT).",
+        )
+        show_removal = st.checkbox(
+            "Magenta / pink: areas to remove",
+            value=True,
+            help="Narrow bottlenecks / ostium-like zones along the frontal access path.",
+        )
+        show_frontal_sinus = st.checkbox("Frontal sinus", value=True)
+        show_sphenoid = st.checkbox("Sphenoid sinus", value=False)
+        show_maxillary = st.checkbox("Maxillary sinuses (L/R)", value=False)
+        sinus_opacity = st.slider("Sinus opacity", 0.05, 0.9, 0.32, 0.01)
         show_vectors = st.checkbox(
             "Velocity cones (glyphs)",
             value=False,
@@ -1200,14 +1358,29 @@ def main() -> None:
             )
         n_sl = len(data.get("streamlines") or [])
         st.caption(
-            f"**{n_sl} pathlines** colored by **|u| (Turbo)** · "
-            "restriction cloud = narrowest lumen (high 1/r). "
-            "Magenta centerlines are optional and off by default."
+            f"**{n_sl} pathlines** (Turbo = |u|) · "
+            "**Purple** = least-resistance naris→frontal · "
+            "**Magenta** = areas to remove (narrow bottlenecks)."
         )
-        if data.get("restriction_pts") is not None:
-            st.caption(
-                f"Restriction: min radius ≈ **{data.get('restriction_min_r', 0):.2f} mm** · "
-                f"hot threshold 1/r ≥ **{data.get('restriction_thr', 0):.2f}**"
+        surg = data.get("surgical") or {}
+        if surg.get("path_metrics"):
+            for pm_ in surg["path_metrics"][:2]:
+                st.caption(
+                    f"• `{pm_.get('name')}`: **{pm_.get('length_mm', 0):.1f} mm** · "
+                    f"min r **{pm_.get('min_radius_mm', 0):.2f} mm**"
+                )
+        labels = (surg.get("sinus_anatomy") or {}).get("labels") or []
+        if labels:
+            st.markdown("**Sinus labels (CT air heuristics):**")
+            for L in labels:
+                st.caption(
+                    f"• **{L.get('name')}**: {L.get('voxels')} vx · "
+                    f"center mm `{[round(x,1) for x in (L.get('center_mm') or [])]}`"
+                )
+        if not surg:
+            st.info(
+                "No surgical guidance yet. Run: "
+                "`py -3.12 scripts/compute_surgical_guidance.py --case VisibleHuman_Head`"
             )
 
     method = str(meta.get("method", "potential_flow"))
@@ -1218,9 +1391,9 @@ def main() -> None:
             f"cells=`{meta.get('n_cells', '?')}` · mapped voxels=`{meta.get('n_mapped_voxels', '?')}`"
         )
         st.markdown(
-            "**Inspiration path:** dense **pathlines colored by velocity** (|u| m/s, Turbo) "
-            "from **tip nares** through the nasal passage to the **trachea**. "
-            "Orange/red cloud = **max restriction** (narrowest lumen / high 1/r)."
+            "**Inspiration pathlines** (Turbo = |u|): **nostrils → trachea**. "
+            "**Purple** corridor = least-resistance **naris → frontal sinus** (instrument path). "
+            "**Magenta/pink** = **areas to remove** (narrow bottlenecks along frontal access)."
         )
     else:
         st.warning(
@@ -1310,6 +1483,28 @@ def main() -> None:
             mucosa_mesh = _load_mesh_decimated(data["mucosa_stl_path"], target_faces=18000)
         except Exception as exc:
             st.warning(f"Mucosa STL: {exc}")
+
+    frontal_mesh = sphenoid_mesh = max_l_mesh = max_r_mesh = None
+    if data.get("frontal_stl"):
+        try:
+            frontal_mesh = _load_mesh_decimated(data["frontal_stl"], target_faces=10000)
+        except Exception as exc:
+            st.warning(f"Frontal sinus STL: {exc}")
+    if data.get("sphenoid_stl"):
+        try:
+            sphenoid_mesh = _load_mesh_decimated(data["sphenoid_stl"], target_faces=10000)
+        except Exception as exc:
+            st.warning(f"Sphenoid STL: {exc}")
+    if data.get("maxillary_left_stl"):
+        try:
+            max_l_mesh = _load_mesh_decimated(data["maxillary_left_stl"], target_faces=8000)
+        except Exception as exc:
+            st.warning(f"Maxillary L STL: {exc}")
+    if data.get("maxillary_right_stl"):
+        try:
+            max_r_mesh = _load_mesh_decimated(data["maxillary_right_stl"], target_faces=8000)
+        except Exception as exc:
+            st.warning(f"Maxillary R STL: {exc}")
 
     ct_nasal = data.get("ct_nasal") or {}
     if ct_nasal:
@@ -1408,13 +1603,36 @@ def main() -> None:
         show_restriction=show_restriction,
         animate_pathlines=animate_pathlines and show_streamlines,
         n_anim_frames=28,
+        frontal_path_mm=(
+            ((data.get("surgical") or {}).get("paths_mm") or {}).get(
+                "primary_naris_to_frontal"
+            )
+            or ((data.get("surgical") or {}).get("paths_mm") or {}).get(
+                "naris_left_to_frontal"
+            )
+            or ((data.get("surgical") or {}).get("paths_mm") or {}).get(
+                "naris_right_to_frontal"
+            )
+        ),
+        show_frontal_path=show_frontal_path,
+        removal_pts=data.get("removal_pts"),
+        show_removal=show_removal,
+        frontal_mesh=frontal_mesh,
+        sphenoid_mesh=sphenoid_mesh,
+        max_l_mesh=max_l_mesh,
+        max_r_mesh=max_r_mesh,
+        show_frontal_sinus=show_frontal_sinus and frontal_mesh is not None,
+        show_sphenoid=show_sphenoid and sphenoid_mesh is not None,
+        show_maxillary=show_maxillary,
+        sinus_opacity=sinus_opacity,
     )
     st.plotly_chart(fig3d, use_container_width=True)
     st.caption(
-        "Pathlines: **Turbo color = local speed** (|u| m/s). "
-        "Orange/red points = **max restriction**. "
-        "Enable **Animate particles** + Play for motion along paths. "
-        "Lower skin opacity / cavity opacity if the flow is hard to see."
+        "Pathlines (Turbo = |u|): **nostrils → trachea**. "
+        "**Purple** = least-resistance **instrument path naris → frontal sinus** "
+        "(dark air + centered in lumen). "
+        "**Magenta/pink** = **areas to remove** (narrow bottlenecks). "
+        "Toggle surgical layers in the sidebar."
     )
 
     # ---- BC summary ----
