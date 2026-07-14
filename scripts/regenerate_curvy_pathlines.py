@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Regenerate dense *curvy* pathlines seeded throughout nasal + sinus air.
+Regenerate dense *curvy* pathlines: **nostrils → trachea**.
 
-Unlike inlet-only seeds, volume seeds fill turbinates / sinuses / pharynx.
-Trilinear velocity sampling + small steps make lines bend around corners
-instead of straight staircase vectors. Optional light swirl for a
-turbulent *look* (demo viz, not LES).
+Every path starts at a naris and ends at the trachea. Seeds near both
+nostrils (plus optional mid-passage seeds that are reoriented naris→trachea).
+Trilinear velocity sampling + small steps bend lines around corners.
+Optional light swirl for a turbulent *look* (demo viz, not LES).
 
 Example:
   py -3.12 scripts/regenerate_curvy_pathlines.py --case VisibleHuman_Head
-  py -3.12 scripts/regenerate_curvy_pathlines.py --case VisibleHuman_Head --swirl 0.12 --volume-seeds 280
+  py -3.12 scripts/regenerate_curvy_pathlines.py --case VisibleHuman_Head --swirl 0.12 --naris-seeds 120
 """
 
 from __future__ import annotations
@@ -91,6 +91,10 @@ def main() -> int:
                 if port.get("role") == "inlet" and port.get("center_mm"):
                     naris.append([float(v) for v in port["center_mm"]])
 
+    if not naris:
+        print("Need naris centers in nares.json or BC ports (role=inlet).")
+        return 1
+
     outlet = None
     bc_path = out / f"{case_id}_boundary_conditions.json"
     if bc_path.is_file():
@@ -98,6 +102,32 @@ def main() -> int:
         for port in bc.get("ports", []):
             if port.get("role") == "outlet" and port.get("center_mm"):
                 outlet = [float(v) for v in port["center_mm"]]
+    if outlet is None:
+        print("Need trachea/outlet center in BC ports.")
+        return 1
+
+    centerline_mm = None
+    for cl_name in (
+        f"{case_id}_passage.json",
+        f"{case_id}_open_paths.json",
+    ):
+        cl_path = out / cl_name
+        if not cl_path.is_file():
+            continue
+        pj = json.loads(cl_path.read_text(encoding="utf-8"))
+        for key in (
+            "centerline_mm",
+            "centerline_mid_mm",
+            "centerline_left_mm",
+            "centerline_right_mm",
+        ):
+            cl = pj.get(key) or []
+            if len(cl) >= 2:
+                centerline_mm = cl
+                notes.append(f"Trachea extension via {cl_name}:{key}")
+                break
+        if centerline_mm is not None:
+            break
 
     lines = compute_curvy_volume_pathlines(
         ux,
@@ -106,7 +136,7 @@ def main() -> int:
         domain,
         spacing,
         origin,
-        naris_centers_mm=naris or None,
+        naris_centers_mm=naris,
         outlet_center_mm=outlet,
         n_volume_seeds=args.volume_seeds,
         n_naris_seeds=args.naris_seeds,
@@ -115,11 +145,17 @@ def main() -> int:
         swirl=float(args.swirl),
         max_lines=args.max_lines,
         bidirectional=not args.no_bidirectional,
+        centerline_mm=centerline_mm,
+        naris_start_max_mm=14.0,
+        trachea_end_max_mm=18.0,
     )
     notes.append(
-        f"Curvy volume pathlines: {len(lines)} "
-        f"(volume_seeds={args.volume_seeds}, naris_seeds={args.naris_seeds}, "
-        f"swirl={args.swirl}, step={args.step_mm} mm, bi={not args.no_bidirectional})"
+        f"Naris→trachea curvy pathlines: {len(lines)} "
+        f"(naris_seeds={args.naris_seeds}, volume_seeds={args.volume_seeds}, "
+        f"swirl={args.swirl}, step={args.step_mm} mm)"
+    )
+    notes.append(
+        f"Inlets L/R={naris}; outlet trachea={outlet}"
     )
 
     ox, oy, oz = origin
@@ -143,7 +179,7 @@ def main() -> int:
         json.dump(
             {
                 "case_id": case_id,
-                "source": "curvy_volume_pathlines",
+                "source": "naris_to_trachea_curvy",
                 "n_lines": len(lines_xyz),
                 "lines": lines_xyz,
                 "speeds_m_s": speeds_out,
@@ -155,6 +191,7 @@ def main() -> int:
                     "step_mm": args.step_mm,
                     "bidirectional": not args.no_bidirectional,
                     "max_lines": args.max_lines,
+                    "flow": "naris → trachea",
                 },
             },
             f,

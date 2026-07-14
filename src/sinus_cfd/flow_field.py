@@ -695,6 +695,47 @@ def compute_inhale_streamlines(
     return kept[:n_keep]
 
 
+def _nearest_naris_mm(
+    point: np.ndarray, naris_list: list[np.ndarray]
+) -> tuple[np.ndarray, float]:
+    best = naris_list[0]
+    best_d = float(np.linalg.norm(point - best))
+    for n in naris_list[1:]:
+        d = float(np.linalg.norm(point - n))
+        if d < best_d:
+            best, best_d = n, d
+    return best, best_d
+
+
+def _orient_naris_to_trachea(
+    line: np.ndarray,
+    naris_list: list[np.ndarray],
+    trachea: np.ndarray | None,
+) -> np.ndarray | None:
+    """
+    Flip polyline so it runs naris → trachea (inspiration direction).
+    Returns None if the line does not approach a naris at either end.
+    """
+    line = np.asarray(line, dtype=float)
+    if len(line) < 6:
+        return None
+    d0_n = min(float(np.linalg.norm(line[0] - n)) for n in naris_list)
+    d1_n = min(float(np.linalg.norm(line[-1] - n)) for n in naris_list)
+    # Prefer the end closer to a naris as the start
+    if d1_n + 2.0 < d0_n:
+        line = line[::-1].copy()
+        d0_n, d1_n = d1_n, d0_n
+    # Must start reasonably near a naris (or we'll prepend later)
+    if trachea is not None:
+        d0_t = float(np.linalg.norm(line[0] - trachea))
+        d1_t = float(np.linalg.norm(line[-1] - trachea))
+        # If still pointing wrong (start closer to trachea than end), flip
+        if d0_t + 5.0 < d1_t and d1_n < d0_n + 8.0:
+            # start is nearer trachea — reverse so we leave nares
+            line = line[::-1].copy()
+    return line
+
+
 def compute_curvy_volume_pathlines(
     ux: np.ndarray,
     uy: np.ndarray,
@@ -712,50 +753,65 @@ def compute_curvy_volume_pathlines(
     max_lines: int = 320,
     bidirectional: bool = True,
     rng_seed: int = 19,
+    naris_start_max_mm: float = 14.0,
+    trachea_end_max_mm: float = 18.0,
+    centerline_mm: np.ndarray | list | None = None,
 ) -> list[np.ndarray]:
     """
-    Dense curvy pathlines seeded throughout the air domain + nares.
+    Curvy pathlines that **enter the nostrils and exit the trachea**.
 
-    - Volume seeds fill sinuses / turbinates / pharynx (not only inlets).
-    - Bidirectional integration from each seed → full passage traces.
-    - Trilinear U + small step → paths bend around corners.
-    - Optional swirl for a gentle turbulent look (demo viz).
+    Seeds near nares (primary) plus volume seeds in the air domain; every
+    kept path is oriented naris→trachea, starts at a naris, and is extended
+    to the trachea when the CFD field fades caudally.
+
+    - Trilinear U + small step → curves around corners
+    - Optional swirl for a gentle turbulent look (demo viz)
     """
     rng = np.random.default_rng(rng_seed)
     speed = np.sqrt(ux * ux + uy * uy + uz * uz)
-    seeds_list: list[np.ndarray] = []
 
-    vol = seeds_throughout_volume(
+    if not naris_centers_mm:
+        return []
+    naris_list = [np.asarray(n, dtype=float) for n in naris_centers_mm]
+    trachea = (
+        np.asarray(outlet_center_mm, dtype=float)
+        if outlet_center_mm is not None
+        else None
+    )
+
+    seeds_list: list[np.ndarray] = []
+    # Primary: dense seeds at both nostrils (~50/50)
+    port = seeds_near_ports(
         airway,
         spacing_xyz_mm,
         origin_xyz_mm,
-        n_seeds=n_volume_seeds,
+        naris_centers_mm,
+        n_per_port=max(16, n_naris_seeds // max(1, len(naris_centers_mm))),
+        radius_mm=11.0,
         speed=speed,
-        prefer_speed=True,
-        rng=rng,
     )
-    if len(vol):
-        seeds_list.append(vol)
+    if len(port):
+        seeds_list.append(port)
 
-    if naris_centers_mm:
-        port = seeds_near_ports(
+    # Secondary: volume seeds (turbinates / deeper passage) — still forced
+    # to connect naris→trachea by reverse-to-naris + forward-to-trachea
+    if n_volume_seeds > 0:
+        vol = seeds_throughout_volume(
             airway,
             spacing_xyz_mm,
             origin_xyz_mm,
-            naris_centers_mm,
-            n_per_port=max(8, n_naris_seeds // max(1, len(naris_centers_mm))),
-            radius_mm=10.0,
+            n_seeds=n_volume_seeds,
             speed=speed,
+            prefer_speed=True,
+            rng=rng,
         )
-        if len(port):
-            seeds_list.append(port)
+        if len(vol):
+            seeds_list.append(vol)
 
     if not seeds_list:
         return []
     seeds = np.vstack(seeds_list)
 
-    # Per-seed integration so bidirectional stitch stays aligned
-    lines: list[np.ndarray] = []
     base_kw = dict(
         ux=ux,
         uy=uy,
@@ -769,47 +825,129 @@ def compute_curvy_volume_pathlines(
         swirl=swirl,
         rng=rng,
     )
+
+    raw_lines: list[np.ndarray] = []
     for seed in seeds:
         s = seed.reshape(1, 3)
         fwd = compute_streamlines(**base_kw, seed_points_mm=s, reverse=False)
         f = fwd[0] if fwd else None
-        if bidirectional:
-            rev = compute_streamlines(**base_kw, seed_points_mm=s, reverse=True)
-            r = rev[0] if rev else None
-            if r is not None and f is not None and len(r) >= 2 and len(f) >= 2:
-                up = r[::-1]
-                if float(np.linalg.norm(up[-1] - f[0])) < 0.75:
-                    joined = np.vstack([up[:-1], f])
-                else:
-                    joined = np.vstack([up, f])
-                if len(joined) >= 8:
-                    lines.append(joined)
-                    continue
-            if r is not None and len(r) >= 8:
-                lines.append(r[::-1])
-                continue
-        if f is not None and len(f) >= 8:
-            lines.append(f)
+        rev = (
+            compute_streamlines(**base_kw, seed_points_mm=s, reverse=True)
+            if bidirectional
+            else []
+        )
+        r = rev[0] if rev else None
 
-    # Prefer longer, more curved paths (higher arc length / chord)
-    scored: list[tuple[float, np.ndarray]] = []
-    for line in lines:
+        # Stitch reverse+forward at seed, then orient naris→trachea
+        candidates: list[np.ndarray] = []
+        if r is not None and f is not None and len(r) >= 2 and len(f) >= 2:
+            up = r[::-1]
+            if float(np.linalg.norm(up[-1] - f[0])) < 0.75:
+                candidates.append(np.vstack([up[:-1], f]))
+            else:
+                candidates.append(np.vstack([up, f]))
+        if f is not None and len(f) >= 6:
+            candidates.append(f)
+        if r is not None and len(r) >= 6:
+            candidates.append(r[::-1])
+
+        for cand in candidates:
+            oriented = _orient_naris_to_trachea(cand, naris_list, trachea)
+            if oriented is not None:
+                raw_lines.append(oriented)
+
+    # Force naris start + trachea finish
+    finished: list[np.ndarray] = []
+    for line in raw_lines:
         line = np.asarray(line, dtype=float)
-        if len(line) < 8:
+        if len(line) < 6:
             continue
-        seg = np.linalg.norm(np.diff(line, axis=0), axis=1)
-        arc = float(seg.sum())
-        chord = float(np.linalg.norm(line[-1] - line[0]))
-        curve = arc / max(chord, 1e-3)
-        score = arc + 8.0 * max(0.0, curve - 1.0)
-        if outlet_center_mm is not None:
-            out = np.asarray(outlet_center_mm, dtype=float)
-            d0 = float(np.linalg.norm(line[0] - out))
-            d1 = float(np.linalg.norm(line[-1] - out))
-            score += max(0.0, d0 - d1) * 1.5
-        scored.append((score, line))
+        naris, d_n = _nearest_naris_mm(line[0], naris_list)
+        # Prepend explicit naris entry so paths start at the nostrils
+        if d_n > 0.5:
+            if d_n > naris_start_max_mm * 2.5:
+                # Too far from either naris — skip (volume dead-ends)
+                continue
+            # Walk stub naris → first point of streamline
+            stub = np.linspace(naris, line[0], num=max(3, int(d_n / max(step_mm, 0.15))))
+            line = np.vstack([stub[:-1], line])
+        else:
+            line = np.vstack([naris.reshape(1, 3), line])
+
+        # Ensure end approaches trachea
+        if trachea is not None:
+            d_end = float(np.linalg.norm(line[-1] - trachea))
+            if d_end > trachea_end_max_mm:
+                if centerline_mm is not None and len(np.asarray(centerline_mm)) >= 2:
+                    line = extend_paths_to_outlet_via_centerline(
+                        [line],
+                        np.asarray(centerline_mm, dtype=float),
+                        trachea,
+                        max_end_dist_mm=trachea_end_max_mm,
+                    )[0]
+                else:
+                    # Direct soft finish: append a few points toward trachea
+                    # only if we're already in the caudal half of the path
+                    d_start = float(np.linalg.norm(line[0] - trachea))
+                    if d_end < d_start - 8.0:
+                        n_extra = max(4, int(d_end / max(step_mm, 0.2)))
+                        tail = np.linspace(line[-1], trachea, num=n_extra + 1)[1:]
+                        line = np.vstack([line, tail])
+            # Snap last point onto trachea for clean exit marker
+            if float(np.linalg.norm(line[-1] - trachea)) < trachea_end_max_mm * 1.5:
+                line = np.vstack([line, trachea.reshape(1, 3)])
+
+        # Final gate: start near naris, end near trachea, meaningful travel
+        d0 = min(float(np.linalg.norm(line[0] - n)) for n in naris_list)
+        travel = float(np.linalg.norm(line[-1] - line[0]))
+        if d0 > naris_start_max_mm:
+            continue
+        if trachea is not None:
+            d1 = float(np.linalg.norm(line[-1] - trachea))
+            if d1 > trachea_end_max_mm * 1.8:
+                continue
+            # Must get closer to trachea overall
+            if d1 > float(np.linalg.norm(line[0] - trachea)) - 10.0:
+                continue
+        if travel < 20.0:
+            continue
+        finished.append(line)
+
+    # Score: reach trachea, length, slight curve bonus; balance L/R nares
+    scored: list[tuple[float, int, np.ndarray]] = []
+    for line in finished:
+        arc = float(np.linalg.norm(np.diff(line, axis=0), axis=1).sum())
+        naris, _ = _nearest_naris_mm(line[0], naris_list)
+        side = 0 if float(naris[0]) >= float(np.mean([n[0] for n in naris_list])) else 1
+        score = arc
+        if trachea is not None:
+            d1 = float(np.linalg.norm(line[-1] - trachea))
+            score += max(0.0, 40.0 - d1) * 3.0
+        scored.append((score, side, line))
     scored.sort(key=lambda t: t[0], reverse=True)
-    return [ln for _, ln in scored[: max(1, int(max_lines))]]
+
+    # Keep ~50/50 left/right naris entries
+    n_keep = max(1, int(max_lines))
+    per_side = max(1, n_keep // 2)
+    kept: list[np.ndarray] = []
+    counts = [0, 0]
+    for score, side, line in scored:
+        if counts[side] >= per_side and len(kept) >= n_keep:
+            continue
+        if counts[side] < per_side or len(kept) < n_keep:
+            kept.append(line)
+            counts[side] += 1
+        if len(kept) >= n_keep:
+            break
+    # Fill remainder if one side short
+    if len(kept) < n_keep:
+        for score, side, line in scored:
+            if any(np.allclose(line[0], k[0]) and len(line) == len(k) for k in kept):
+                continue
+            kept.append(line)
+            if len(kept) >= n_keep:
+                break
+    return kept
 
 
 def extend_paths_to_outlet_via_centerline(

@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.10.0-curvy-volume-pathlines"
+APP_VERSION = "0.10.1-naris-to-trachea"
 APP_VERSION_LABEL = (
-    "curvy trilinear pathlines · volume seeds through sinuses/airways · mild swirl"
+    "curvy pathlines enter nostrils → exit trachea · mild swirl"
 )
 
 DEFAULT_CASE = "P001"
