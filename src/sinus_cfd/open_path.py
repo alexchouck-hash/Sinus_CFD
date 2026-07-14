@@ -250,6 +250,133 @@ def straighten_path_in_air(
     return np.asarray(out, dtype=float)
 
 
+def _local_air_snap(
+    p_mm: np.ndarray,
+    air: np.ndarray,
+    spacing_xyz: tuple[float, float, float],
+    origin_xyz: tuple[float, float, float],
+    rad: int = 4,
+) -> np.ndarray:
+    """Snap to nearest air within a small ball (preserve designed path shape)."""
+    z0, y0, x0 = _mm_to_zyx(p_mm, spacing_xyz, origin_xyz, air.shape)
+    if air[z0, y0, x0]:
+        return np.asarray(p_mm, dtype=float)
+    nz, ny, nx = air.shape
+    best = None
+    best_d = 1e18
+    for dz in range(-rad, rad + 1):
+        for dy in range(-rad, rad + 1):
+            for dx in range(-rad, rad + 1):
+                q = (z0 + dz, y0 + dy, x0 + dx)
+                if not (0 <= q[0] < nz and 0 <= q[1] < ny and 0 <= q[2] < nx):
+                    continue
+                if not air[q]:
+                    continue
+                d = float(dz * dz + dy * dy + dx * dx)
+                if d < best_d:
+                    best_d = d
+                    best = q
+    if best is None:
+        best = nearest_air_index(air, (z0, y0, x0))
+    return _zyx_to_mm(best, spacing_xyz, origin_xyz)
+
+
+def build_lateral_diverge_frontal_path(
+    start_mm: np.ndarray | list[float],
+    end_mm: np.ndarray | list[float],
+    air: np.ndarray,
+    spacing_xyz: tuple[float, float, float],
+    origin_xyz: tuple[float, float, float],
+    side: str,
+    n: int = 56,
+    lateral_flare: float = 1.15,
+) -> np.ndarray:
+    """
+    Instrument path naris → frontal:
+
+    - **Sagittal (y–z):** nearly straight (linear y(t), z(t)).
+    - **Coronal (x–z):** diverges laterally (L → +x, R → −x on this CT).
+
+    x is prescribed for lateral flare; only y/z are adjusted to stay in air.
+    """
+    a = np.asarray(start_mm, dtype=float).copy()
+    b = np.asarray(end_mm, dtype=float).copy()
+    # Designed end: superior, slightly deeper, clearly lateral
+    lateral_mm = 12.0 * float(lateral_flare)
+    if side == "left":
+        x_end = a[0] + lateral_mm
+    else:
+        x_end = a[0] - lateral_mm
+    y_end = float(np.clip(b[1], a[1] + 10.0, a[1] + 32.0))
+    z_end = float(max(b[2], a[2] + 28.0))
+
+    t = np.linspace(0.0, 1.0, n)
+    ease = t * t * (3.0 - 2.0 * t)  # smoothstep
+    lat = ease ** 0.85
+    # Prescribed geometry
+    xs = (1.0 - lat) * a[0] + lat * x_end
+    ys = (1.0 - t) * a[1] + t * y_end
+    zs = (1.0 - t) * a[2] + t * z_end
+
+    sx, sy, sz = spacing_xyz
+    ox, oy, oz = origin_xyz
+    nz, ny, nx = air.shape
+    out = []
+    for i in range(n):
+        p = np.array([xs[i], ys[i], zs[i]], dtype=float)
+        # Search air near (y,z) allowing small x drift but prefer designed x
+        z0 = int(np.clip(round((p[2] - oz) / sz), 0, nz - 1))
+        y0 = int(np.clip(round((p[1] - oy) / sy), 0, ny - 1))
+        x0 = int(np.clip(round((p[0] - ox) / sx), 0, nx - 1))
+        best = None
+        best_score = 1e18
+        for dy in range(-3, 4):
+            for dz in range(-3, 4):
+                for dx in range(-2, 3):
+                    q = (z0 + dz, y0 + dy, x0 + dx)
+                    if not (0 <= q[0] < nz and 0 <= q[1] < ny and 0 <= q[2] < nx):
+                        continue
+                    if not air[q]:
+                        continue
+                    # Prefer designed x strongly; mild y/z preference
+                    score = (
+                        4.0 * abs(dx)
+                        + 1.2 * abs(dy)
+                        + 1.2 * abs(dz)
+                    )
+                    if score < best_score:
+                        best_score = score
+                        best = q
+        if best is None:
+            # fall back local snap
+            p2 = _local_air_snap(p, air, spacing_xyz, origin_xyz, rad=5)
+            # still enforce lateral x trend
+            if side == "left":
+                p2[0] = max(p2[0], xs[i] - 1.5)
+            else:
+                p2[0] = min(p2[0], xs[i] + 1.5)
+            out.append(p2)
+        else:
+            out.append(_zyx_to_mm(best, spacing_xyz, origin_xyz))
+    arr = np.asarray(out, dtype=float)
+    arr[0] = a
+    # Enforce monotonic lateral after search
+    if side == "left":
+        for i in range(1, len(arr)):
+            arr[i, 0] = max(arr[i, 0], arr[i - 1, 0])
+            arr[i, 0] = max(arr[i, 0], xs[i] - 2.0)
+    else:
+        for i in range(1, len(arr)):
+            arr[i, 0] = min(arr[i, 0], arr[i - 1, 0])
+            arr[i, 0] = min(arr[i, 0], xs[i] + 2.0)
+    # Soft-blend y,z back to linear sagittal (instrument straight in sagittal)
+    for i in range(len(arr)):
+        arr[i, 1] = 0.35 * arr[i, 1] + 0.65 * ys[i]
+        arr[i, 2] = 0.35 * arr[i, 2] + 0.65 * zs[i]
+    arr[0] = a
+    return arr
+
+
 def smooth_instrument_path(
     path_mm: np.ndarray,
     air: np.ndarray,

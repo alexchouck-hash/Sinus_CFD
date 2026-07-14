@@ -35,6 +35,7 @@ from sinus_cfd.open_path import (  # noqa: E402
     split_frontal_lr,
     straighten_path_in_air,
     smooth_instrument_path,
+    build_lateral_diverge_frontal_path,
     restriction_along_paths_high_speed,
     _mm_to_zyx,
 )
@@ -192,24 +193,38 @@ def main() -> int:
         f"x_sep={x_sep:.1f}"
     )
 
-    def _frontal_target(mask: np.ndarray) -> tuple[int, int, int]:
+    def _frontal_target_lateral(mask: np.ndarray, side: str) -> tuple[int, int, int]:
+        """Most superior-anterior-lateral voxel in this frontal half."""
         m = mask & air_domain
         if not m.any():
-            m = mask
-        if not m.any():
-            m = frontal_on_domain
+            m = mask if mask.any() else frontal_on_domain
         zz, yy, xx = np.where(m)
-        # Prefer more superior + anterior target within side
-        # (superior high z, anterior low y for this CT)
-        score = zz.astype(float) - 0.35 * yy.astype(float)
-        j = int(np.argmax(score))
-        tgt = (int(zz[j]), int(yy[j]), int(xx[j]))
-        return nearest_air_index(air_domain, tgt)
+        z_thr = float(np.percentile(zz, 60))
+        y_thr = float(np.percentile(yy, 45))
+        sel = (zz >= z_thr) & (yy <= y_thr)
+        if int(sel.sum()) < 8:
+            sel = zz >= float(np.percentile(zz, 50))
+        zz2, yy2, xx2 = zz[sel], yy[sel], xx[sel]
+        if side == "left":
+            # extreme high-x among superior/anterior
+            j2 = int(np.argmax(xx2.astype(float) + 0.15 * zz2 - 0.1 * yy2))
+        else:
+            j2 = int(np.argmin(xx2.astype(float) - 0.15 * zz2 + 0.1 * yy2))
+        return nearest_air_index(air_domain, (int(zz2[j2]), int(yy2[j2]), int(xx2[j2])))
 
-    tgt_left = _frontal_target(frontal_left)
-    tgt_right = _frontal_target(frontal_right)
+    tgt_left = _frontal_target_lateral(frontal_left, "left")
+    tgt_right = _frontal_target_lateral(frontal_right, "right")
+    # Force ends farther lateral than starts for clear coronal diverge
+    def _push_lateral(tgt, naris_mm, side):
+        tmm = path_zyx_to_mm([tgt], spacing, origin)[0]
+        if side == "left" and tmm[0] < naris_mm[0] + 6:
+            tmm[0] = naris_mm[0] + 10.0
+        if side == "right" and tmm[0] > naris_mm[0] - 6:
+            tmm[0] = naris_mm[0] - 10.0
+        return nearest_air_index(
+            air_domain, _mm_to_zyx(tmm, spacing, origin, shape)
+        )
 
-    # Straighter instrument paths: mild EDT power + strong straight bias
     cost, radius = most_open_cost_hu(
         air_domain, hu, spacing, power=1.15, hu_weight=0.35
     )
@@ -217,7 +232,6 @@ def main() -> int:
     path_meta: list[dict] = []
     all_path_zyx: list[tuple[int, int, int]] = []
 
-    # higher x = patient left
     ordered_nares = sorted(naris_pts[:2], key=lambda c: -float(c[0]))
     side_targets = {
         "left": (ordered_nares[0], tgt_left),
@@ -227,31 +241,20 @@ def main() -> int:
         ),
     }
     for side, (nm, tgt) in side_targets.items():
-        start = nearest_air_index(air_domain, _mm_to_zyx(nm, spacing, origin, shape))
-        idx = most_open_path_zyx(
-            air_domain,
-            start,
-            tgt,
-            spacing,
-            power=1.05,
-            hu=hu,
-            hu_weight=0.25,
-            straight_bias=4.5,  # instrument corridor: prefer straight naris→frontal
-        )
-        pts = path_zyx_to_mm(idx, spacing, origin)
-        # Relatively straight instrument corridor, no sharp corners
-        pts = straighten_path_in_air(
-            pts, air_domain, spacing, origin, blend=0.78, n=64
-        )
-        pts = smooth_instrument_path(
-            pts,
+        tgt = _push_lateral(tgt, nm, side)
+        end_mm = path_zyx_to_mm([tgt], spacing, origin)[0]
+        # Pure design path: straight in sagittal, flare laterally in coronal
+        pts = build_lateral_diverge_frontal_path(
+            nm,
+            end_mm,
             air_domain,
             spacing,
             origin,
-            n=72,
-            smooth_passes=5,
-            max_turn_deg=18.0,
+            side=side,
+            n=56,
+            lateral_flare=1.4,
         )
+        # Do NOT re-route with nearest-air smooth (destroys sagittal straightness)
         idx_s = [
             nearest_air_index(air_domain, _mm_to_zyx(p, spacing, origin, shape))
             for p in pts
@@ -262,15 +265,26 @@ def main() -> int:
         plen = path_length_mm(pts)
         r_along = [float(radius[p]) for p in idx_s]
         chord = float(np.linalg.norm(pts[-1] - pts[0])) if len(pts) >= 2 else 0.0
+        if len(pts) >= 3:
+            t = np.linspace(0, 1, len(pts))
+            y_line = (1 - t) * pts[0, 1] + t * pts[-1, 1]
+            z_line = (1 - t) * pts[0, 2] + t * pts[-1, 2]
+            sag_err = float(
+                np.sqrt(np.mean((pts[:, 1] - y_line) ** 2 + (pts[:, 2] - z_line) ** 2))
+            )
+        else:
+            sag_err = 0.0
         path_meta.append(
             {
                 "name": key,
                 "side": side,
                 "start_mm": list(nm),
-                "end_mm": path_zyx_to_mm([tgt], spacing, origin)[0].tolist(),
+                "end_mm": pts[-1].tolist(),
                 "length_mm": plen,
                 "chord_mm": chord,
                 "straightness": float(chord / max(plen, 1e-3)),
+                "sagittal_rms_mm": sag_err,
+                "dx_lateral_mm": float(pts[-1, 0] - pts[0, 0]),
                 "min_radius_mm": float(min(r_along)) if r_along else 0.0,
                 "mean_radius_mm": float(np.mean(r_along)) if r_along else 0.0,
                 "n_points": len(pts),
@@ -278,12 +292,14 @@ def main() -> int:
         )
         all_path_zyx.extend(idx_s)
         notes.append(
-            f"{key}: length={plen:.1f} mm chord={chord:.1f} mm "
-            f"straightness={path_meta[-1]['straightness']:.2f} "
-            f"min_r={path_meta[-1]['min_radius_mm']:.2f} mm"
+            f"{key}: len={plen:.1f} mm straight={path_meta[-1]['straightness']:.2f} "
+            f"sag_rms={sag_err:.1f} mm dx={path_meta[-1]['dx_lateral_mm']:.1f} mm "
+            f"x {pts[0,0]:.0f}→{pts[-1,0]:.0f}"
         )
 
-    notes.append("Dual purple paths: L naris→L frontal, R naris→R frontal")
+    notes.append(
+        "Dual instrument paths: sagittal-straight, coronal lateral diverge L/R"
+    )
 
     # Magenta = high-velocity zones along naris→trachea inhale pathways
     # (places a larger opening could relieve resistance / peak speed)

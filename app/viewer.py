@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.12.1-curvy-inhale-smooth-frontal"
+APP_VERSION = "0.13.0-wispy-lateral-frontal"
 APP_VERSION_LABEL = (
-    "curvy naris→trachea pathlines · high-|u| magenta on inhale path · smooth dual frontal"
+    "wispy volume-seeded pathlines · sagittal-straight / coronal-diverge frontal paths"
 )
 
 DEFAULT_CASE = "P001"
@@ -645,11 +645,10 @@ def _fig_3d(
                 edge_color="#0277bd",
             )
 
-    # --- Dense pathlines colored by local flow speed (Turbo) ---
+    # --- Wispy pathlines: Turbo color = speed; fade/thin with distance from seed ---
     path_arrays: list[np.ndarray] = []
     path_speeds: list[np.ndarray] = []
     if show_streamlines and streamlines:
-        # subsample if too many for interactive Plotly
         n_avail = len(streamlines)
         n_show = min(int(max_pathlines), n_avail)
         if n_show < n_avail:
@@ -658,6 +657,9 @@ def _fig_3d(
             idx = np.arange(n_avail)
         speed_lists = streamline_speeds or []
         cmax_u = max(float(max_vector_speed), 1e-6)
+        base_op = float(np.clip(streamline_opacity, 0.12, 1.0))
+        n_fade_seg = 6  # segments per line for wispy fade
+        legend_done = False
         for k, li in enumerate(idx):
             full = np.asarray(streamlines[li], dtype=float)
             if full.ndim != 2 or full.shape[0] < 2 or full.shape[1] < 3:
@@ -668,9 +670,8 @@ def _fig_3d(
                     sp_full = _sample_speed_along_line(full, speed, spacing, origin)
             else:
                 sp_full = _sample_speed_along_line(full, speed, spacing, origin)
-            # light decimation for long traces (keeps plot responsive)
-            if len(full) > 280:
-                step = max(1, len(full) // 220)
+            if len(full) > 300:
+                step = max(1, len(full) // 240)
                 arr = full[::step]
                 sp = sp_full[::step]
             else:
@@ -679,28 +680,54 @@ def _fig_3d(
             if len(sp) != len(arr):
                 n = min(len(sp), len(arr))
                 arr, sp = arr[:n], sp[:n]
+            if len(arr) < 4:
+                continue
             path_arrays.append(arr)
             path_speeds.append(sp)
-            fig.add_trace(
-                go.Scatter3d(
-                    x=arr[:, 0],
-                    y=arr[:, 1],
-                    z=arr[:, 2],
-                    mode="lines",
-                    line=dict(
-                        width=stream_width,
-                        color=sp,
-                        colorscale="Turbo",
-                        cmin=0.0,
-                        cmax=cmax_u,
-                        colorbar=dict(title="|u| m/s", x=1.02) if k == 0 else None,
-                    ),
-                    name="Pathlines (velocity)" if k == 0 else f"pathline {k}",
-                    showlegend=(k == 0),
-                    hoverinfo="skip",
-                    opacity=float(np.clip(streamline_opacity, 0.12, 1.0)),
+            # Higher mean speed → keep slightly thicker base
+            mean_sp = float(np.mean(sp)) if len(sp) else 0.0
+            w_scale = 0.75 + 0.55 * min(1.5, mean_sp / max(cmax_u * 0.35, 1e-3))
+            # Break into segments: near seed opaque/thick → far thin/transparent
+            n_pts = len(arr)
+            n_seg = min(n_fade_seg, max(2, n_pts // 8))
+            edges = np.linspace(0, n_pts - 1, n_seg + 1, dtype=int)
+            for si in range(n_seg):
+                i0, i1 = int(edges[si]), int(edges[si + 1])
+                if i1 <= i0:
+                    continue
+                # include overlap of 1 point for continuity
+                i0s = max(0, i0 - (1 if si > 0 else 0))
+                seg = arr[i0s : i1 + 1]
+                seg_sp = sp[i0s : i1 + 1]
+                t_mid = (si + 0.5) / n_seg  # 0 near seed → 1 at tail
+                # opacity & width decay (wispy farther from seed)
+                op = base_op * (1.0 - 0.82 * (t_mid ** 1.15))
+                op = float(np.clip(op, 0.06, 1.0))
+                w = stream_width * w_scale * (1.0 - 0.72 * (t_mid ** 0.95))
+                w = float(np.clip(w, 0.6, stream_width * 1.6))
+                show_cb = (not legend_done) and si == 0
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=seg[:, 0],
+                        y=seg[:, 1],
+                        z=seg[:, 2],
+                        mode="lines",
+                        line=dict(
+                            width=w,
+                            color=seg_sp,
+                            colorscale="Turbo",
+                            cmin=0.0,
+                            cmax=cmax_u,
+                            colorbar=dict(title="|u| m/s", x=1.02) if show_cb else None,
+                        ),
+                        name="Pathlines (wispy |u|)" if show_cb else None,
+                        showlegend=show_cb,
+                        hoverinfo="skip",
+                        opacity=op,
+                    )
                 )
-            )
+                if show_cb:
+                    legend_done = True
 
     # --- Max-restriction cloud (narrow lumen / high 1/r) ---
     if show_restriction and restriction_pts is not None and len(restriction_pts) > 0:
