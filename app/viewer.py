@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.5.0-nasal-passage"
+APP_VERSION = "0.5.1-openfoam-geometry"
 APP_VERSION_LABEL = (
-    "nasal-passage walls · centerline · path-aware flow · dense vectors"
+    "solid air body · open-port STLs · nasal-passage · dense vectors"
 )
 
 DEFAULT_CASE = "P001"
