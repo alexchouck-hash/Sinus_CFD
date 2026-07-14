@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.14.0-clean-turbulent-wisps"
+APP_VERSION = "0.15.0-surgical-zone-toggles"
 APP_VERSION_LABEL = (
-    "turbulent wispy flow · medial-then-lateral frontal paths · clean 3D (no controls)"
+    "zone removal toggles (IT / MT / septum) · frontal paths · treatment recommendations"
 )
 
 DEFAULT_CASE = "P001"
@@ -155,8 +155,24 @@ def load_case(case_id: str, data_fingerprint: str) -> dict:
     if rem_npz.is_file():
         rd = np.load(rem_npz)
         out["removal_pts"] = rd["points_xyz_r_mm"].astype(np.float32)
+        out["removal_inferior_turbinate"] = (
+            rd["inferior_turbinate"].astype(np.float32)
+            if "inferior_turbinate" in rd.files
+            else None
+        )
+        out["removal_middle_turbinate"] = (
+            rd["middle_turbinate"].astype(np.float32)
+            if "middle_turbinate" in rd.files
+            else None
+        )
+        out["removal_septum"] = (
+            rd["septum"].astype(np.float32) if "septum" in rd.files else None
+        )
     else:
         out["removal_pts"] = None
+        out["removal_inferior_turbinate"] = None
+        out["removal_middle_turbinate"] = None
+        out["removal_septum"] = None
 
     for key, fname in (
         ("frontal_stl", f"{case_id}_sinus_frontal.stl"),
@@ -489,6 +505,12 @@ def _fig_3d(
     show_frontal_path: bool = False,
     removal_pts: np.ndarray | None = None,
     show_removal: bool = False,
+    removal_inferior: np.ndarray | None = None,
+    removal_middle: np.ndarray | None = None,
+    removal_septum: np.ndarray | None = None,
+    show_removal_inferior: bool = True,
+    show_removal_middle: bool = True,
+    show_removal_septum: bool = True,
     frontal_mesh=None,
     sphenoid_mesh=None,
     max_l_mesh=None,
@@ -719,9 +741,11 @@ def _fig_3d(
                 if show_leg:
                     legend_done = True
 
-    # --- Magenta / pink constriction (semi-transparent) ---
-    if show_removal and removal_pts is not None and len(removal_pts) > 0:
-        rp = np.asarray(removal_pts, dtype=float)
+    # --- Pink constriction zones (semi-transparent), anatomically toggled ---
+    def _add_pink_zone(pts, name: str, color: str) -> None:
+        if pts is None or len(pts) == 0:
+            return
+        rp = np.asarray(pts, dtype=float)
         fig.add_trace(
             go.Scatter3d(
                 x=rp[:, 0],
@@ -730,34 +754,53 @@ def _fig_3d(
                 mode="markers",
                 marker=dict(
                     size=5.0,
-                    color="rgba(255, 64, 160, 0.35)",  # semi-transparent pink
-                    opacity=0.38,
+                    color=color,
+                    opacity=0.36,
                     line=dict(width=0),
                     symbol="circle",
                 ),
-                name="Constriction (high |u|)",
+                name=name,
                 hoverinfo="skip",
             )
         )
-    elif show_restriction and restriction_pts is not None and len(restriction_pts) > 0:
-        # Fallback if removal cloud missing
-        rp = np.asarray(restriction_pts, dtype=float)
-        fig.add_trace(
-            go.Scatter3d(
-                x=rp[:, 0],
-                y=rp[:, 1],
-                z=rp[:, 2],
-                mode="markers",
-                marker=dict(
-                    size=3.5,
-                    color="rgba(255, 64, 160, 0.32)",
-                    opacity=0.35,
-                    line=dict(width=0),
-                ),
-                name="Constriction",
-                hoverinfo="skip",
-            )
+
+    any_zone = False
+    if show_removal_inferior and removal_inferior is not None and len(removal_inferior) > 0:
+        _add_pink_zone(
+            removal_inferior,
+            "Areas to remove: inferior turbinate",
+            "rgba(255, 80, 160, 0.40)",
         )
+        any_zone = True
+    if show_removal_middle and removal_middle is not None and len(removal_middle) > 0:
+        _add_pink_zone(
+            removal_middle,
+            "Areas to remove: middle turbinate",
+            "rgba(255, 105, 180, 0.38)",
+        )
+        any_zone = True
+    if show_removal_septum and removal_septum is not None and len(removal_septum) > 0:
+        _add_pink_zone(
+            removal_septum,
+            "Areas to remove: septum (distal–medial)",
+            "rgba(236, 64, 122, 0.38)",
+        )
+        any_zone = True
+    # Fallback combined cloud if zone split missing
+    if (
+        show_removal
+        and not any_zone
+        and removal_pts is not None
+        and len(removal_pts) > 0
+    ):
+        _add_pink_zone(removal_pts, "Areas to remove (high |u|)", "rgba(255, 64, 160, 0.35)")
+    elif (
+        show_restriction
+        and not any_zone
+        and restriction_pts is not None
+        and len(restriction_pts) > 0
+    ):
+        _add_pink_zone(restriction_pts, "Constriction", "rgba(255, 64, 160, 0.32)")
 
     # --- Purple: dual instrument paths L/R naris → ipsilateral frontal ---
     if show_frontal_path:
@@ -1067,7 +1110,7 @@ def main() -> None:
         page_title="Sinus_CFD Viewer",
         page_icon="🫁",
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="expanded",
     )
 
     st.title("Sinus_CFD — Airflow Viewer")
@@ -1081,10 +1124,9 @@ def main() -> None:
         )
         return
 
-    # Prefer whole-head case when present (no sidebar selectbox)
     case_id = "VisibleHuman_Head" if "VisibleHuman_Head" in cases else cases[0]
 
-    # Fixed demo defaults — no left-panel sliders / checkboxes / radios
+    # Fixed display defaults
     show_skin = True
     skin_opacity = 0.32
     show_head = False
@@ -1108,8 +1150,6 @@ def main() -> None:
     animate_pathlines = False
     show_restriction = False
     show_centerlines = False
-    show_frontal_path = True
-    show_removal = True
     show_frontal_sinus = True
     show_sphenoid = False
     show_maxillary = False
@@ -1118,6 +1158,37 @@ def main() -> None:
     vector_stride = 4
     max_vectors = 2000
     bg_mode = "light"
+
+    with st.sidebar:
+        st.markdown(f"**`{APP_VERSION}`**")
+        st.caption("Surgical view toggles")
+        show_frontal_path = st.checkbox(
+            "Paths to frontal sinuses (purple)",
+            value=True,
+            help="L/R naris → ipsilateral frontal instrument corridors.",
+        )
+        st.markdown("**Areas to remove (pink)**")
+        show_removal_inferior = st.checkbox(
+            "Inferior turbinates (lateral / maxillary)",
+            value=True,
+            help="High-|u| along inferior turbinate / lateral nasal corridor.",
+        )
+        show_removal_middle = st.checkbox(
+            "Middle turbinates (split nasal airflow)",
+            value=True,
+            help="High-|u| at middle turbinate level that partitions flow.",
+        )
+        show_removal_septum = st.checkbox(
+            "Septum (distal & medial)",
+            value=True,
+            help="High-|u| along distal–medial septum.",
+        )
+        show_removal = (
+            show_removal_inferior or show_removal_middle or show_removal_septum
+        )
+        if st.button("Reload data"):
+            st.cache_data.clear()
+            st.rerun()
 
     fp = case_data_fingerprint(case_id)
     data = load_case(case_id, fp)
@@ -1132,8 +1203,8 @@ def main() -> None:
     bc = data.get("bc", {})
     stats = data.get("stats", {})
 
-    # Data version panel — proves which on-disk outputs are loaded
-    with st.expander("Loaded data version (verify nares / skin)", expanded=True):
+    # Data version panel (collapsed)
+    with st.expander("Loaded data version", expanded=False):
         st.markdown(
             f"- **App:** `{APP_VERSION}`\n"
             f"- **Case:** `{case_id}`\n"
@@ -1481,6 +1552,12 @@ def main() -> None:
         show_frontal_path=show_frontal_path,
         removal_pts=data.get("removal_pts"),
         show_removal=show_removal,
+        removal_inferior=data.get("removal_inferior_turbinate"),
+        removal_middle=data.get("removal_middle_turbinate"),
+        removal_septum=data.get("removal_septum"),
+        show_removal_inferior=show_removal_inferior,
+        show_removal_middle=show_removal_middle,
+        show_removal_septum=show_removal_septum,
         frontal_mesh=frontal_mesh,
         sphenoid_mesh=sphenoid_mesh,
         max_l_mesh=max_l_mesh,
@@ -1492,10 +1569,77 @@ def main() -> None:
     )
     st.plotly_chart(fig3d, use_container_width=True)
     st.caption(
-        "Curvy pathlines (Turbo = |u|): **nostrils → trachea** (inhale). "
-        "**Purple** = dual **L/R naris → ipsilateral frontal** instrument corridors "
-        "(straighter, open dark air). "
-        "**Magenta/pink** = **areas to remove**. Toggle layers in the sidebar."
+        "Wispy turbulent pathlines (seeded through airspace, toward trachea). "
+        "**Purple** = naris → frontal instrument paths. "
+        "**Pink** = high-|u| tissue to consider removing (IT / MT / septum). "
+        "Use the left panel to toggle layers."
+    )
+
+    # ---- Identified removal zones + treatment recommendations ----
+    surg = data.get("surgical") or {}
+    rz = surg.get("removal_zones") or {}
+    zones = rz.get("zones") or []
+    treatments = rz.get("treatments") or []
+
+    st.subheader("Identified areas to remove")
+    if zones:
+        cols = st.columns(3)
+        for i, z in enumerate(zones):
+            with cols[i % 3]:
+                sev = z.get("severity", "none")
+                st.markdown(f"**{z.get('label', z.get('name'))}**")
+                st.caption(
+                    f"Severity: **{sev}** · voxels `{z.get('voxels', 0)}` · "
+                    f"mean |u| **{z.get('mean_speed_m_s', 0):.2f}** m/s · "
+                    f"max **{z.get('max_speed_m_s', 0):.2f}** m/s"
+                )
+                cmm = z.get("center_mm") or []
+                if cmm:
+                    st.caption(f"Center ≈ `[{cmm[0]:.0f}, {cmm[1]:.0f}, {cmm[2]:.0f}]` mm")
+                st.caption(z.get("notes") or "")
+    else:
+        st.info(
+            "No zone map yet. Run: "
+            "`py -3.12 scripts/compute_surgical_guidance.py --case VisibleHuman_Head`"
+        )
+
+    st.subheader("Recommended treatment options")
+    st.markdown(
+        "Prioritized to **increase airflow** with **minimal intervention** first; "
+        "sinus-drainage options for CRS when indicated."
+    )
+    if treatments:
+        recs = [t for t in treatments if t.get("recommended")]
+        others = [t for t in treatments if not t.get("recommended")]
+        if recs:
+            st.markdown("#### Prefer first")
+            for t in recs:
+                st.markdown(
+                    f"- **{t.get('name')}**  \n"
+                    f"  _{t.get('description')}_  \n"
+                    f"  Why: {t.get('reason') or '—'} · "
+                    f"invasiveness {t.get('invasiveness')}/5 · "
+                    f"`{t.get('category')}`"
+                )
+        if others:
+            with st.expander("Additional options (context)", expanded=False):
+                for t in others:
+                    st.markdown(
+                        f"- **{t.get('name')}** — {t.get('description')} "
+                        f"(invasiveness {t.get('invasiveness')}/5)"
+                    )
+    else:
+        st.caption("Treatment recommendations appear after surgical guidance is computed.")
+
+    st.markdown(
+        """
+**Airflow toolbox (reference)**  
+Inferior / middle turbinate reduction (RF or microdebrider) · septoplasty (caudal or posterior) ·
+nasal valve support  
+
+**CRS / drainage toolbox (reference)**  
+Balloon sinus dilation · maxillary antrostomy · frontal drillout (when less invasive paths fail)
+"""
     )
 
     # ---- BC summary ----

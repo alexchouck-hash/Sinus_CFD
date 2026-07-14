@@ -41,6 +41,12 @@ from sinus_cfd.open_path import (  # noqa: E402
 )
 from sinus_cfd.pipeline import _mask_to_mesh  # noqa: E402
 from sinus_cfd.sinus_anatomy import detect_paranasal_sinuses  # noqa: E402
+from sinus_cfd.surgical_zones import (  # noqa: E402
+    classify_removal_zones,
+    points_from_mask,
+    recommend_treatments,
+    zones_to_meta,
+)
 
 
 def _write_mask(mask, path: Path, spacing, origin) -> None:
@@ -360,17 +366,38 @@ def main() -> int:
         narrow_percentile=22.0,
         ball_radius=1,
     )
-    # Flow high-speed is primary magenta; instrument bottlenecks add a little
     highlight = highlight | (fb_mask & airway_flow)
     notes.append(
         f"Removal (high |u| on naris→trachea): {int(highlight.sum())} vx; "
         f"frontal bottlenecks={len(bottlenecks)}"
     )
 
+    # Classify into inferior turbinate / middle turbinate / septum
+    nasal_for_zone = nasal if nasal.any() else airway_flow
+    zone_masks, zone_stats, znotes = classify_removal_zones(
+        highlight,
+        speed,
+        spacing,
+        origin,
+        naris_mm=naris_pts,
+        nasal_mask=nasal_for_zone,
+    )
+    notes.extend(znotes)
+    treatments = recommend_treatments(zone_stats)
+    zone_meta = zones_to_meta(zone_stats, treatments, znotes)
+
     _write_mask(highlight, out / f"{case_id}_removal_highlight.nrrd", spacing, origin)
     _export_stl(highlight, out / f"{case_id}_removal_highlight.stl", spacing, origin, faces=8000)
 
-    # Re-sample points from final mask with speed for viewer color/hover
+    # Combined + per-zone point clouds for viewer toggles
+    zone_pts = {}
+    for zkey, zmask in zone_masks.items():
+        _write_mask(zmask, out / f"{case_id}_removal_{zkey}.nrrd", spacing, origin)
+        zone_pts[zkey] = points_from_mask(
+            zmask, speed, spacing, origin, max_points=3500, seed=hash(zkey) % 997
+        )
+        notes.append(f"Zone {zkey}: {int(zmask.sum())} vx → {len(zone_pts[zkey])} pts")
+
     zz, yy, xx = np.where(highlight)
     if len(zz) > 6000:
         rng = np.random.default_rng(5)
@@ -386,9 +413,12 @@ def main() -> int:
     ).astype(np.float32)
     np.savez_compressed(
         out / f"{case_id}_removal_highlight.npz",
-        points_xyz_r_mm=rem_pts,  # col3 = speed m/s (legacy key name)
+        points_xyz_r_mm=rem_pts,
         n_points=np.int32(len(zz)),
         metric="speed_m_s_along_naris_trachea",
+        inferior_turbinate=zone_pts["inferior_turbinate"],
+        middle_turbinate=zone_pts["middle_turbinate"],
+        septum=zone_pts["septum"],
     )
 
     guidance = {
@@ -399,11 +429,17 @@ def main() -> int:
         "path_metrics": path_meta,
         "bottlenecks": bottlenecks,
         "dual_frontal_paths": True,
+        "removal_zones": zone_meta,
         "notes": notes,
         "viewer": {
             "frontal_path_color": "purple",
             "show_both_frontal_paths": True,
             "removal_color": "magenta",
+            "zone_keys": [
+                "inferior_turbinate",
+                "middle_turbinate",
+                "septum",
+            ],
             "sinus_colors": {
                 "frontal": "#ffcc80",
                 "sphenoid": "#80cbc4",
@@ -418,6 +454,9 @@ def main() -> int:
     (out / f"{case_id}_sinus_anatomy.json").write_text(
         json.dumps(anatomy.to_meta(), indent=2), encoding="utf-8"
     )
+    (out / f"{case_id}_treatment_recommendations.json").write_text(
+        json.dumps(zone_meta, indent=2), encoding="utf-8"
+    )
 
     print(f"OK surgical guidance case={case_id}")
     print(f"  frontal={int(anatomy.frontal.sum())} sphenoid={int(anatomy.sphenoid.sum())}")
@@ -426,8 +465,17 @@ def main() -> int:
         f"{int(anatomy.maxillary_right.sum())}"
     )
     print(f"  paths={list(paths.keys())}")
-    print(f"  removal voxels={int(highlight.sum())} bottlenecks={len(bottlenecks)}")
-    for n in notes[-8:]:
+    print(f"  removal voxels={int(highlight.sum())}")
+    for z in zone_stats:
+        print(
+            f"  zone {z.name}: n={z.voxels} severity={z.severity} "
+            f"mean|u|={z.mean_speed_m_s:.2f}"
+        )
+    print("  Recommended treatments:")
+    for t in treatments:
+        if t.recommended:
+            print(f"    * {t.name} ({t.reason})")
+    for n in notes[-6:]:
         print(f"  note: {n}")
     return 0
 
