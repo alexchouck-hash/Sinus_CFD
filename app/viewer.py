@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -25,8 +26,35 @@ from plotly.subplots import make_subplots
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+# Bump when viewer behavior or expected data layout changes (shown in UI).
+APP_VERSION = "0.4.1-edge-nares-skin"
+APP_VERSION_LABEL = (
+    "edge-seg · nares@nose-tip · head-only skin · dense vectors · cache-bust"
+)
+
 DEFAULT_CASE = "P001"
 OUTPUTS = REPO_ROOT / "outputs"
+
+
+def _file_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def case_data_fingerprint(case_id: str) -> str:
+    """Stamp from key output mtimes so cache invalidates after reprocess."""
+    case_dir = OUTPUTS / case_id
+    keys = [
+        f"{case_id}_flow.npz",
+        f"{case_id}_boundary_conditions.json",
+        f"{case_id}_stats.json",
+        f"{case_id}_skin.stl",
+        f"{case_id}_airway.stl",
+        f"{case_id}_nares.json",
+    ]
+    return "|".join(f"{n}:{int(_file_mtime(case_dir / n))}" for n in keys)
 
 
 # ---------------------------------------------------------------------------
@@ -34,15 +62,22 @@ OUTPUTS = REPO_ROOT / "outputs"
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner="Loading flow field…")
-def load_case(case_id: str) -> dict:
+def load_case(case_id: str, data_fingerprint: str) -> dict:
+    """data_fingerprint must change when on-disk outputs are reprocessed."""
     case_dir = OUTPUTS / case_id
     npz_path = case_dir / f"{case_id}_flow.npz"
     if not npz_path.is_file():
-        return {"error": f"Missing {npz_path}. Run: py -3.12 scripts/compute_flow.py --case {case_id}"}
+        return {
+            "error": (
+                f"Missing {npz_path}. Run: "
+                f"py -3.12 scripts/process_whole_head.py --case {case_id}"
+            )
+        }
 
     data = np.load(npz_path)
     out = {
         "case_id": case_id,
+        "data_fingerprint": data_fingerprint,
         "airway": data["airway"].astype(bool),
         "speed": data["speed"].astype(np.float32),
         "ux": data["ux"].astype(np.float32),
@@ -82,15 +117,28 @@ def load_case(case_id: str) -> dict:
     if bc_path.is_file():
         with bc_path.open(encoding="utf-8") as f:
             out["bc"] = json.load(f)
+        out["bc_mtime"] = datetime.fromtimestamp(
+            _file_mtime(bc_path), tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
     else:
         out["bc"] = {}
+        out["bc_mtime"] = None
 
     stats_path = case_dir / f"{case_id}_stats.json"
     if stats_path.is_file():
         with stats_path.open(encoding="utf-8") as f:
             out["stats"] = json.load(f)
+        out["stats_mtime"] = datetime.fromtimestamp(
+            _file_mtime(stats_path), tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
     else:
         out["stats"] = {}
+        out["stats_mtime"] = None
+
+    face_qc = case_dir / f"{case_id}_preview_face_nares.png"
+    out["face_qc_path"] = str(face_qc) if face_qc.is_file() else None
+    preview_path = case_dir / f"{case_id}_preview.png"
+    out["preview_path"] = str(preview_path) if preview_path.is_file() else None
 
     return out
 
@@ -440,19 +488,30 @@ def _fig_3d(
             )
         )
 
-    # Port markers
+    # Port markers (larger so nares are unambiguous in 3D)
     for port in ports:
         c = port.get("center_mm", [0, 0, 0])
-        color = "#3dff9a" if port.get("role") == "inlet" else "#ff5c7a"
+        is_inlet = port.get("role") == "inlet"
+        color = "#00ff66" if is_inlet else "#ff5c7a"
+        label = port.get("name", "port")
+        method = port.get("method") or ""
+        if method:
+            label = f"{label}\n[{method}]"
         fig.add_trace(
             go.Scatter3d(
                 x=[c[0]],
                 y=[c[1]],
                 z=[c[2]],
                 mode="markers+text",
-                marker=dict(size=7, color=color, line=dict(width=1, color="white")),
-                text=[port.get("name", "")],
+                marker=dict(
+                    size=14 if is_inlet else 10,
+                    color=color,
+                    symbol="diamond" if is_inlet else "circle",
+                    line=dict(width=2, color="white"),
+                ),
+                text=[label],
                 textposition="top center",
+                textfont=dict(size=11, color=color),
                 name=port.get("name", "port"),
             )
         )
@@ -496,17 +555,31 @@ def main() -> None:
         "Potential-flow preview (not full Navier–Stokes CFD yet)"
     )
 
+    # Always-visible version banner (confirm you are not on a stale app/session)
+    st.info(
+        f"**App version `{APP_VERSION}`** — {APP_VERSION_LABEL}\n\n"
+        "If this string does not match, stop the Streamlit process and relaunch "
+        "`py -3.12 -m streamlit run app/viewer.py`."
+    )
+
     cases = list_cases()
     with st.sidebar:
+        st.header("Version")
+        st.markdown(f"**`{APP_VERSION}`**")
+        st.caption(APP_VERSION_LABEL)
+        if st.button("Clear cache & reload data", type="primary"):
+            st.cache_data.clear()
+            st.rerun()
+
         st.header("Case")
         if not cases:
             st.error(
                 "No flow fields found under `outputs/`. "
-                "Run `process_case.py` then `compute_flow.py`."
+                "Run process_whole_head / process_case then compute_flow."
             )
             st.code(
-                "py -3.12 scripts/process_case.py --case P001\n"
-                "py -3.12 scripts/compute_flow.py --case P001",
+                "py -3.12 scripts/process_whole_head.py --case VisibleHuman_Head\n"
+                "py -3.12 scripts/compute_flow.py --case VisibleHuman_Head",
                 language="powershell",
             )
             return
@@ -586,7 +659,8 @@ def main() -> None:
             """
         )
 
-    data = load_case(case_id)
+    fp = case_data_fingerprint(case_id)
+    data = load_case(case_id, fp)
     if "error" in data:
         st.error(data["error"])
         return
@@ -596,13 +670,67 @@ def main() -> None:
     nz, ny, nx = speed.shape
     meta = data.get("meta", {})
     bc = data.get("bc", {})
+    stats = data.get("stats", {})
+
+    # Data version panel — proves which on-disk outputs are loaded
+    with st.expander("Loaded data version (verify nares / skin)", expanded=True):
+        st.markdown(
+            f"- **App:** `{APP_VERSION}`\n"
+            f"- **Case:** `{case_id}`\n"
+            f"- **BC file time:** `{data.get('bc_mtime')}`\n"
+            f"- **Stats file time:** `{data.get('stats_mtime')}`\n"
+            f"- **Fingerprint:** `{fp[-80:]}`"
+        )
+        # Expected for current pipeline
+        expected_methods = []
+        for p in bc.get("ports", []):
+            if p.get("role") == "inlet":
+                expected_methods.append(
+                    f"**{p.get('name')}** · method=`{p.get('method')}` · "
+                    f"xyz_mm=`{[round(x,1) for x in p.get('center_mm', [])]}`"
+                )
+        if expected_methods:
+            st.markdown("**Inlet ports currently loaded:**")
+            for line in expected_methods:
+                st.markdown(f"- {line}")
+        else:
+            st.warning("No inlet ports in loaded BC JSON.")
+
+        # Guardrail: latest pipeline uses edge_nose_tip_skin_naris
+        methods = [p.get("method") for p in bc.get("ports", []) if p.get("role") == "inlet"]
+        if methods and all(m == "edge_nose_tip_skin_naris" for m in methods):
+            st.success(
+                "Nares method is `edge_nose_tip_skin_naris` (nose tip / external openings)."
+            )
+        elif methods:
+            st.error(
+                "Loaded BC methods are not the latest nose-tip detector "
+                f"({methods}). Click **Clear cache & reload data**, or re-run "
+                "`process_whole_head.py`."
+            )
+
+        notes = stats.get("notes") or []
+        if notes:
+            st.markdown("**Pipeline notes (from stats):**")
+            for n in notes[:8]:
+                st.caption(f"• {n}")
+
+        qc1, qc2 = st.columns(2)
+        if data.get("face_qc_path"):
+            with qc1:
+                st.markdown("**Face QC (nares should be at nose tip, not orbits)**")
+                st.image(data["face_qc_path"], use_container_width=True)
+        if data.get("preview_path"):
+            with qc2:
+                st.markdown("**Tri-planar QC**")
+                st.image(data["preview_path"], use_container_width=True)
 
     # Metrics
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Max |u|", f"{meta.get('max_speed_m_s', float(speed[airway].max())):.3f} m/s")
     c2.metric("Mean |u|", f"{meta.get('mean_speed_m_s', float(speed[airway].mean())):.3f} m/s")
     c3.metric("Target Q", f"{meta.get('target_flow_L_per_min', 18):.1f} L/min")
-    c4.metric("Method", meta.get("method", "potential_flow")[:22])
+    c4.metric("App ver", APP_VERSION.split("-")[0])
 
     if meta.get("notes"):
         with st.expander("Method notes / caveats", expanded=False):
@@ -662,6 +790,7 @@ def main() -> None:
             "name": p.get("name"),
             "role": p.get("role"),
             "center_mm": p.get("center_mm"),
+            "method": p.get("method"),
         }
         for p in ports
     ]
