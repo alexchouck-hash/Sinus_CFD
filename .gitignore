@@ -1,0 +1,39 @@
+# Local medical imaging (do not commit PHI or large volumes)
+data/
+*.dcm
+*.DCM
+*.nii
+*.nii.gz
+*.nrrd
+*.mha
+*.mhd
+*.vti
+*.vtp
+*.stl
+*.obj
+*.vtk
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# CFD / mesh intermediates
+*.msh
+*.foam
+constant/polyMesh/
+processor*/
+log.*
+postProcessing/
