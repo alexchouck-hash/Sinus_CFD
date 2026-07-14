@@ -6,83 +6,135 @@ This project aims to take a CT scan of a human head, reconstruct the nasal cavit
 
 ## Goals
 
-1. **Ingest** head / sinus CT volumes (DICOM or NIfTI)
-2. **Segment** airways and sinuses (air, bone, soft tissue; optional labeled nasal structures)
+1. **Ingest** head / sinus CT volumes (DICOM, NRRD, or NIfTI)
+2. **Segment** airways and sinuses (expert labels and/or HU air threshold)
 3. **Build** 3D surface / volume meshes suitable for CFD
 4. **Simulate** inspiratory/expiratory airflow and simple drainage / clearance proxies
 5. **Compare** baseline vs. surgically (or virtually) altered anatomy
 
-## Intended pipeline (high level)
+## Current status
+
+| Step | Status |
+|------|--------|
+| Public CT data (NasalSeg) | Working — download into `data/` |
+| Airway mask from labels / HU | Working (`scripts/process_case.py`) |
+| Surface export (STL) | Working |
+| Volume mesh + OpenFOAM CFD | Not yet |
+| Virtual surgery variants | Not yet |
+
+### First case result (NasalSeg `P001`)
+
+- **Mask:** expert labels 1–3 (L/R nasal cavity + nasopharynx), cleaned to largest component  
+- **Airway volume:** ~28.5 mL  
+- **Surface:** ~30k vertices / ~60k faces (open tube → not watertight; expected for CFD inlets/outlets)  
+- **Outputs (local):** `outputs/P001/P001_airway.stl`, `P001_airway_mask.nrrd`, `P001_preview.png`, `P001_stats.json`
+
+## Quick start
+
+### 1. Install dependencies
+
+```powershell
+cd C:\Users\houck\Documents\Sinus_CFD
+py -3.12 -m pip install -r requirements.txt
+```
+
+### 2. Download NasalSeg (once)
+
+```powershell
+cd data
+# If not already downloaded:
+# Invoke-WebRequest -Uri "https://zenodo.org/records/13893419/files/NasalSeg.zip?download=1" -OutFile "NasalSeg.zip"
+# Expand-Archive NasalSeg.zip -DestinationPath NasalSeg
+```
+
+Layout after unzip:
+
+```text
+data/NasalSeg/
+  images/P001_img.nrrd … P130_img.nrrd
+  labels/P001_seg.nrrd … P130_seg.nrrd
+```
+
+### 3. Process one case → mask + STL
+
+```powershell
+cd C:\Users\houck\Documents\Sinus_CFD
+py -3.12 scripts\process_case.py --case P001
+```
+
+Useful flags:
+
+| Flag | Meaning |
+|------|---------|
+| `--mask-source labels` | Expert labels (default; recommended) |
+| `--mask-source hu` | HU air threshold only |
+| `--mask-source labels_and_hu` | Intersection of both |
+| `--include-sinuses` | Also include maxillary sinuses (labels 4–5) |
+| `--case P010` | Another subject |
+
+### 4. Inspect results
+
+- **Preview PNG:** open `outputs/P001/P001_preview.png`  
+- **STL:** open in [3D Slicer](https://www.slicer.org/), MeshLab, or Blender  
+- **Stats JSON:** voxel counts, spacing, mesh size  
+
+## Pipeline (high level)
 
 ```
-CT scan (DICOM/NIfTI)
-    → preprocessing (windowing, resampling)
-    → segmentation (airway / sinus masks)
-    → surface extraction + mesh quality cleanup
-    → CFD setup (inlet/outlet BCs, fluid properties)
-    → solve (OpenFOAM / similar)
-    → post-process (ΔP, flow rates, wall shear, stagnation zones)
-    → virtual surgery variants → re-run → compare
+CT (NRRD/DICOM/NIfTI)
+    → load + spacing/origin
+    → airway mask (labels and/or HU ≈ −1024…−400)
+    → morphological clean + largest component
+    → marching cubes surface (STL)
+    → [next] volume mesh + CFD (OpenFOAM / similar)
+    → [next] virtual anatomy edits → re-run → compare
 ```
+
+NasalSeg label map:
+
+| ID | Structure |
+|----|-----------|
+| 1 | Left nasal cavity |
+| 2 | Right nasal cavity |
+| 3 | Nasopharynx |
+| 4 | Left maxillary sinus |
+| 5 | Right maxillary sinus |
+
+Default CFD airway uses **1–3** (continuous nasal path). Use `--include-sinuses` for drainage-oriented studies.
 
 ## Sample CT data (public)
 
-Large medical volumes are **not** stored in this repository. Download sample data separately into `data/` (gitignored).
+Large medical volumes are **not** stored in this repository. Keep them under `data/` (gitignored).
 
-### Best fit for this project: NasalSeg
+### Best fit: NasalSeg
 
 | | |
 |---|---|
-| **What** | 130 CT scans of nasal cavity & paranasal sinuses with labels (L/R nasal cavity, nasopharynx, L/R maxillary sinus) |
-| **Why** | Directly targets the anatomy this project needs |
+| **What** | 130 CT scans with nasal/paranasal labels |
 | **Size** | ~224 MB |
-| **Download** | [Zenodo – NasalSeg](https://zenodo.org/records/13893419) |
-| **Also** | [GitHub – NasalSeg](https://github.com/YichiZhang98/NasalSeg) |
+| **Download** | [Zenodo](https://zenodo.org/records/13893419) · [GitHub](https://github.com/YichiZhang98/NasalSeg) |
 
-```text
-# Example (from project root)
-mkdir -p data
-# Then download NasalSeg.zip from Zenodo into data/ and unzip
-```
+### Other sources
 
-### Full head CT: Visible Human Project
-
-| | |
-|---|---|
-| **What** | Classic full-body / head CT from the NLM Visible Human Project |
-| **Why** | Complete head geometry if you want skull-to-airway context |
-| **Download** | [Iowa MRRF – Visible Human CT](https://mri.medicine.uiowa.edu/equipment-information/scanner-images/visible-human-project-ct-datasets) (files on Harvard Dataverse) |
-
-### Other head / neck CT archives
-
-- **[TCIA Head-Neck-PET-CT](https://www.cancerimagingarchive.net/collection/head-neck-pet-ct/)** – 298 patients, planning CT + PET (large; needs TCIA Data Retriever)
-- **[TCIA HNSCC](https://www.cancerimagingarchive.net/collection/hnscc/)** – head & neck squamous cell carcinoma CTs
-- **[Stanford AIMI SinoCT](https://aimi.stanford.edu/data)** – large head CT collection (research use; registration may be required)
-- **[CT-SCOPE](https://pmc.ncbi.nlm.nih.gov/articles/PMC12398895/)** – paranasal sinus CT with osseous structure annotations
-
-### Quick single-study DICOM samples
-
-For pipeline smoke tests (not always sinus-focused):
-
-- [Saga IT free DICOM samples](https://saga-it.com/dicom/samples) (CC-BY)
-- [NCI Imaging Data Commons](https://portal.imaging.datacommons.cancer.gov/) – public cloud access, no egress fees for many collections
-
-## Recommended starter path
-
-1. Download **NasalSeg** (small, sinus-labeled).
-2. Load one volume with [3D Slicer](https://www.slicer.org/) or Python (`nibabel` / `pydicom` + `SimpleITK`).
-3. Extract the air mask (threshold Hounsfield units ≈ −1000 to −500 for air, then refine).
-4. Export STL/OBJ of the airway lumen for meshing.
-5. Run a simple laminar/incompressible flow case in OpenFOAM or equivalent.
+- [Visible Human Project CT](https://mri.medicine.uiowa.edu/equipment-information/scanner-images/visible-human-project-ct-datasets) — full head  
+- [TCIA Head-Neck-PET-CT](https://www.cancerimagingarchive.net/collection/head-neck-pet-ct/)  
+- [TCIA HNSCC](https://www.cancerimagingarchive.net/collection/hnscc/)  
+- [Stanford AIMI SinoCT](https://aimi.stanford.edu/data)  
+- See `docs/data-sources.md` for more detail  
 
 ## Repository layout
 
 ```text
 Sinus_CFD/
 ├── README.md
+├── requirements.txt
 ├── data/                 # local CT downloads (not committed)
-├── docs/                 # design notes, citations
-└── src/                  # processing & simulation scripts (to be added)
+├── docs/                 # design notes, data sources
+├── outputs/              # masks, STL, previews (not committed)
+├── scripts/
+│   └── process_case.py   # CLI entry point
+└── src/sinus_cfd/
+    └── pipeline.py       # load → mask → surface
 ```
 
 ## License & ethics
@@ -91,10 +143,19 @@ Sinus_CFD/
 - Respect each dataset’s license and citation requirements.
 - This software is for research and educational exploration; it is **not** a medical device and must not be used for clinical decision-making without appropriate validation and regulatory clearance.
 
-## Citation tips
+## Citation
 
-If you use NasalSeg, cite the NasalSeg paper / Zenodo record. For TCIA collections, cite the collection DOI listed on each TCIA collection page.
+If you use NasalSeg:
 
-## Status
-
-Project scaffold — data pointers and goals only. Segmentation, meshing, and CFD tooling still to be added.
+```bibtex
+@article{zhang2024nasalseg,
+  title={NasalSeg: A Dataset for Automatic Segmentation of Nasal Cavity and Paranasal Sinuses from 3D CT Images},
+  author={Zhang, Yichi and Wang, Jing and Pan, Tan and Jiang, Quanling and Ge, Jingjie and Guo, Xin and Jiang, Chen and Lu, Jie and Zhang, Jianning and Liu, Xueling and others},
+  journal={Scientific Data},
+  volume={11},
+  number={1},
+  pages={1--5},
+  year={2024},
+  publisher={Nature Publishing Group}
+}
+```

@@ -2,9 +2,7 @@
 
 Place downloaded CT volumes here. This folder’s contents (except this README) are gitignored.
 
-## Recommended first download
-
-**NasalSeg** — nasal cavity & paranasal sinus CTs with labels:
+## NasalSeg (recommended)
 
 - https://zenodo.org/records/13893419  
 - Direct zip: https://zenodo.org/records/13893419/files/NasalSeg.zip?download=1  
@@ -15,4 +13,18 @@ Invoke-WebRequest -Uri "https://zenodo.org/records/13893419/files/NasalSeg.zip?d
 Expand-Archive -Path "NasalSeg.zip" -DestinationPath "NasalSeg"
 ```
 
-See the project root `README.md` for other public head CT sources (Visible Human, TCIA, etc.).
+Expected layout:
+
+```text
+NasalSeg/
+  images/P001_img.nrrd … P130_img.nrrd
+  labels/P001_seg.nrrd … P130_seg.nrrd
+```
+
+Then from the repo root:
+
+```powershell
+py -3.12 scripts\process_case.py --case P001
+```
+
+See the project root `README.md` and `docs/data-sources.md` for other public head CT sources.

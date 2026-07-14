@@ -1,0 +1,6 @@
+numpy>=1.26
+scipy>=1.11
+SimpleITK>=2.3
+scikit-image>=0.22
+trimesh>=4.0
+matplotlib>=3.8

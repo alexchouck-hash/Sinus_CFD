@@ -1,5 +1,8 @@
 # Local medical imaging (do not commit PHI or large volumes)
-data/
+data/**
+!data/README.md
+outputs/**
+!outputs/.gitkeep
 *.dcm
 *.DCM
 *.nii
