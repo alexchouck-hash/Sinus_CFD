@@ -42,3 +42,12 @@ constant/polyMesh/
 processor*/
 log.*
 postProcessing/
+
+# OpenFOAM runtime (keep case templates tracked)
+foam/**/processor*
+foam/**/[1-9]*
+foam/**/0.*
+foam/**/constant/polyMesh/
+foam/**/log.*
+foam/**/postProcessing/
+

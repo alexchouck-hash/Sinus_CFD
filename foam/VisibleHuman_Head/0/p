@@ -1,0 +1,44 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    object      p;
+}
+
+dimensions      [0 2 -2 0 0 0 0];
+
+internalField   uniform 0;
+
+boundaryField
+{
+    left_nostril
+    {
+        type            zeroGradient;
+    }
+    right_nostril
+    {
+        type            zeroGradient;
+    }
+    trachea
+    {
+        type            fixedValue;
+        value           uniform 0;
+    }
+    wall
+    {
+        type            zeroGradient;
+    }
+    box
+    {
+        type            zeroGradient;
+    }
+    defaultFaces
+    {
+        type            zeroGradient;
+    }
+    solid_air_body
+    {
+        type            zeroGradient;
+    }
+}

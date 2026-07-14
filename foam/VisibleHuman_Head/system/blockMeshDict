@@ -1,0 +1,52 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+
+// Background box in metres (anatomy STL also in metres)
+convertToMeters 1;
+
+vertices
+(
+    (0.185500 0.134500 1.497500)
+    (0.317500 0.134500 1.497500)
+    (0.317500 0.267500 1.497500)
+    (0.185500 0.267500 1.497500)
+    (0.185500 0.134500 1.662500)
+    (0.317500 0.134500 1.662500)
+    (0.317500 0.267500 1.662500)
+    (0.185500 0.267500 1.662500)
+);
+
+blocks
+(
+    hex (0 1 2 3 4 5 6 7) (40 40 40) simpleGrading (1 1 1)
+);
+
+edges
+(
+);
+
+boundary
+(
+    box
+    {
+        type patch;
+        faces
+        (
+            (0 3 2 1)
+            (4 5 6 7)
+            (0 1 5 4)
+            (2 3 7 6)
+            (1 2 6 5)
+            (0 4 7 3)
+        );
+    }
+);
+
+mergePatchPairs
+(
+);

@@ -1,0 +1,26 @@
+{
+  "case_id": "VisibleHuman_Head",
+  "foam_dir": "C:\\Users\\houck\\Documents\\Sinus_CFD\\foam\\VisibleHuman_Head",
+  "units": "SI_metres",
+  "q_left_m3_s": 0.00015000000000000001,
+  "q_right_m3_s": 0.00015000000000000001,
+  "q_total_m3_s": 0.00030000000000000003,
+  "bounds_m": {
+    "min": [
+      0.2105,
+      0.1595,
+      1.5225
+    ],
+    "max": [
+      0.2925,
+      0.2425,
+      1.6375
+    ]
+  },
+  "locationInMesh_m": [
+    0.2515,
+    0.201,
+    1.58
+  ],
+  "stl_scaled_from_mm": true
+}

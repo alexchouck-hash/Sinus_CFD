@@ -1,0 +1,6 @@
+#!/bin/bash
+cd "${0%/*}" || exit 1
+rm -rf 0.* [1-9]* processor* constant/polyMesh postProcessing
+rm -f log.*
+# keep 0/ templates
+echo "Cleaned mesh and time directories (kept 0/ field templates)."

@@ -1,0 +1,50 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volVectorField;
+    object      U;
+}
+
+dimensions      [0 1 -1 0 0 0 0];
+
+internalField   uniform (0 0 0);
+
+boundaryField
+{
+    left_nostril
+    {
+        type            flowRateInletVelocity;
+        volumetricFlowRate constant 1.50000000e-04;
+        value           uniform (0 0 0);
+    }
+    right_nostril
+    {
+        type            flowRateInletVelocity;
+        volumetricFlowRate constant 1.50000000e-04;
+        value           uniform (0 0 0);
+    }
+    trachea
+    {
+        type            pressureInletOutletVelocity;
+        value           uniform (0 0 0);
+    }
+    wall
+    {
+        type            noSlip;
+    }
+    // residual background-box faces after snap (if any)
+    box
+    {
+        type            slip;
+    }
+    defaultFaces
+    {
+        type            slip;
+    }
+    solid_air_body
+    {
+        // if surface kept as single patch before region split
+        type            noSlip;
+    }
+}

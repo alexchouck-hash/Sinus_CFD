@@ -225,6 +225,17 @@ Sinus_CFD/
     └── flow_field.py
 ```
 
+### OpenFOAM case (next step after geometry)
+
+```powershell
+py -3.12 scripts\export_openfoam_geometry.py --case VisibleHuman_Head
+py -3.12 scripts\scaffold_openfoam_case.py --case VisibleHuman_Head
+# then in WSL/Linux with OpenFOAM:
+#   cd foam/VisibleHuman_Head && ./Allrun
+```
+
+See [`docs/openfoam.md`](docs/openfoam.md) and `foam/VisibleHuman_Head/README.md`.
+
 ### Product direction
 
 Long-term: surgeons/patients **upload CT** → auto analysis for **CRS**, **NAO**, **NVC**, polyps → interactive airflow/drainage viewer → virtual surgery comparison.  

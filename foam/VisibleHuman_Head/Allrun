@@ -1,0 +1,34 @@
+#!/bin/bash
+set -e
+cd "${0%/*}" || exit 1
+
+# Source OpenFOAM (adjust to your install)
+if [ -f /usr/lib/openfoam/openfoam2312/etc/bashrc ]; then
+  # shellcheck disable=SC1091
+  source /usr/lib/openfoam/openfoam2312/etc/bashrc
+elif [ -f "$HOME/OpenFOAM/OpenFOAM-11/etc/bashrc" ]; then
+  # shellcheck disable=SC1091
+  source "$HOME/OpenFOAM/OpenFOAM-11/etc/bashrc"
+elif [ -n "$WM_PROJECT_DIR" ]; then
+  echo "Using existing OpenFOAM env: $WM_PROJECT_DIR"
+else
+  echo "ERROR: OpenFOAM bashrc not found. Install OpenFOAM and source it first."
+  exit 1
+fi
+
+echo "== blockMesh =="
+blockMesh | tee log.blockMesh
+
+echo "== surfaceFeatureExtract =="
+surfaceFeatureExtract 2>/dev/null | tee log.surfaceFeatureExtract || true
+
+echo "== snappyHexMesh =="
+snappyHexMesh -overwrite | tee log.snappyHexMesh
+
+echo "== checkMesh =="
+checkMesh | tee log.checkMesh
+
+echo "== simpleFoam =="
+simpleFoam | tee log.simpleFoam
+
+echo "Done. View with: paraFoam  or  paraFoam -builtin"
