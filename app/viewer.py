@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.4.1-edge-nares-skin"
+APP_VERSION = "0.5.0-nasal-passage"
 APP_VERSION_LABEL = (
-    "edge-seg · nares@nose-tip · head-only skin · dense vectors · cache-bust"
+    "nasal-passage walls · centerline · path-aware flow · dense vectors"
 )
 
 DEFAULT_CASE = "P001"
@@ -53,6 +53,7 @@ def case_data_fingerprint(case_id: str) -> str:
         f"{case_id}_skin.stl",
         f"{case_id}_airway.stl",
         f"{case_id}_nares.json",
+        f"{case_id}_passage.json",
     ]
     return "|".join(f"{n}:{int(_file_mtime(case_dir / n))}" for n in keys)
 
@@ -139,6 +140,13 @@ def load_case(case_id: str, data_fingerprint: str) -> dict:
     out["face_qc_path"] = str(face_qc) if face_qc.is_file() else None
     preview_path = case_dir / f"{case_id}_preview.png"
     out["preview_path"] = str(preview_path) if preview_path.is_file() else None
+
+    passage_path = case_dir / f"{case_id}_passage.json"
+    if passage_path.is_file():
+        with passage_path.open(encoding="utf-8") as f:
+            out["passage"] = json.load(f)
+    else:
+        out["passage"] = {}
 
     return out
 
@@ -345,6 +353,7 @@ def _fig_3d(
     ports: list[dict],
     bg_mode: str = "dark",
     max_vectors: int = 6000,
+    centerline_mm: list | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     dark = bg_mode == "dark"
@@ -485,6 +494,21 @@ def _fig_3d(
                 colorbar=dict(title="|u| m/s"),
                 showscale=True,
                 opacity=0.85,
+            )
+        )
+
+    # Nasal-passage centerline (nares → trachea)
+    if centerline_mm is not None and len(centerline_mm) >= 2:
+        cl = np.asarray(centerline_mm, dtype=float)
+        fig.add_trace(
+            go.Scatter3d(
+                x=cl[:, 0],
+                y=cl[:, 1],
+                z=cl[:, 2],
+                mode="lines",
+                line=dict(color="#ff00aa", width=8),
+                name="Passage centerline",
+                hoverinfo="skip",
             )
         )
 
@@ -725,6 +749,26 @@ def main() -> None:
                 st.markdown("**Tri-planar QC**")
                 st.image(data["preview_path"], use_container_width=True)
 
+        passage = data.get("passage") or {}
+        pm = passage.get("metrics") or {}
+        if pm:
+            st.markdown("**Nasal passage domain (walls + open ports + centerline)**")
+            st.markdown(
+                f"- Lumen volume: **{pm.get('lumen_volume_ml', 0):.1f} mL**\n"
+                f"- Centerline length: **{pm.get('centerline_length_mm', 0):.1f} mm**\n"
+                f"- Cross-section min/mean/max: "
+                f"**{pm.get('min_cross_section_mm2', 0):.1f} / "
+                f"{pm.get('mean_cross_section_mm2', 0):.1f} / "
+                f"{pm.get('max_cross_section_mm2', 0):.1f} mm²**\n"
+                f"- Wall voxels: `{pm.get('wall_voxels')}` · "
+                f"inlet open: `{pm.get('inlet_open_voxels')}` · "
+                f"outlet open: `{pm.get('outlet_open_voxels')}`"
+            )
+            st.caption(
+                "Magenta line in 3D = passage centerline (nares → trachea). "
+                "Walls = mucosa (no-slip); open ports = flow BCs."
+            )
+
     # Metrics
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Max |u|", f"{meta.get('max_speed_m_s', float(speed[airway].max())):.3f} m/s")
@@ -825,6 +869,7 @@ def main() -> None:
         ports=ports_lite,
         bg_mode=bg_mode,
         max_vectors=max_vectors,
+        centerline_mm=(data.get("passage") or {}).get("centerline_mm"),
     )
     st.plotly_chart(fig3d, use_container_width=True)
     st.caption(

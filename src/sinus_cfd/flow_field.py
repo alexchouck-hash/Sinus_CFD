@@ -373,30 +373,61 @@ def compute_flow_field(
         inlet_area_mm2=inlet_area if inlet_area > 0 else None,
     )
 
-    # Streamline seeds from actual inlet airway voxels (physical mm)
+    # Streamline seeds: inlet face + optional centerline jitter (passage JSON)
     sx, sy, sz = spacing
     ox, oy, oz = origin
     seeds: list[np.ndarray] = []
+    rng = np.random.default_rng(42)
     zz, yy, xx = np.where(inlet_mask & airway)
     if len(zz) > 0:
-        rng = np.random.default_rng(42)
-        n_take = min(n_streamline_seeds, len(zz))
-        pick = rng.choice(len(zz), size=n_take, replace=False)
+        n_in = min(max(n_streamline_seeds // 2, 20), len(zz))
+        pick = rng.choice(len(zz), size=n_in, replace=False)
         for i in pick:
             seeds.append(
                 np.array(
-                    [
-                        ox + xx[i] * sx,
-                        oy + yy[i] * sy,
-                        oz + zz[i] * sz,
-                    ],
+                    [ox + xx[i] * sx, oy + yy[i] * sy, oz + zz[i] * sz],
                     dtype=float,
                 )
             )
-    # Slight inward offset along pressure gradient (toward outlet)
+
+    passage_path = output_dir / f"{case_id}_passage.json"
+    if passage_path.is_file():
+        try:
+            with passage_path.open(encoding="utf-8") as f:
+                passage = json.load(f)
+            cl = passage.get("centerline_mm") or []
+            # Seed along first third of centerline (near nares) with radial jitter
+            n_cl = min(max(n_streamline_seeds // 2, 20), max(len(cl) // 2, 1))
+            if cl:
+                step = max(len(cl) // (n_cl + 1), 1)
+                for i in range(0, min(len(cl) // 2 + 1, len(cl)), step):
+                    base = np.array(cl[i], dtype=float)
+                    for _ in range(2):
+                        jitter = rng.normal(0, 1.2, size=3)
+                        seeds.append(base + jitter)
+            notes.append(
+                "Streamlines seeded from inlet ports and nasal-passage centerline."
+            )
+        except Exception as exc:
+            notes.append(f"Centerline seed skip: {exc}")
+
+    if not seeds:
+        # Fallback: random lumen seeds near high pressure
+        zz, yy, xx = np.where(airway)
+        if len(zz):
+            n_take = min(n_streamline_seeds, len(zz))
+            pick = rng.choice(len(zz), size=n_take, replace=False)
+            for i in pick:
+                seeds.append(
+                    np.array(
+                        [ox + xx[i] * sx, oy + yy[i] * sy, oz + zz[i] * sz],
+                        dtype=float,
+                    )
+                )
+
     seed_arr = np.array(seeds, dtype=float) if seeds else np.zeros((0, 3))
     streamlines = compute_streamlines(
-        ux, uy, uz, airway, spacing, origin, seed_arr, max_steps=600, step_mm=0.45
+        ux, uy, uz, airway, spacing, origin, seed_arr, max_steps=800, step_mm=0.4
     )
 
     # Save compact NPZ for the viewer
