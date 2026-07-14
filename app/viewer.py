@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.15.0-surgical-zone-toggles"
+APP_VERSION = "0.15.1-pink-fix-small-ports"
 APP_VERSION_LABEL = (
-    "zone removal toggles (IT / MT / septum) · frontal paths · treatment recommendations"
+    "reddish translucent removal zones · smaller naris/trachea markers"
 )
 
 DEFAULT_CASE = "P001"
@@ -741,8 +741,8 @@ def _fig_3d(
                 if show_leg:
                     legend_done = True
 
-    # --- Pink constriction zones (semi-transparent), anatomically toggled ---
-    def _add_pink_zone(pts, name: str, color: str) -> None:
+    # --- Reddish-pink constriction (hex + opacity; rgba strings can wash to white) ---
+    def _add_pink_zone(pts, name: str, color: str = "#e53935") -> None:
         if pts is None or len(pts) == 0:
             return
         rp = np.asarray(pts, dtype=float)
@@ -753,9 +753,9 @@ def _fig_3d(
                 z=rp[:, 2],
                 mode="markers",
                 marker=dict(
-                    size=5.0,
-                    color=color,
-                    opacity=0.36,
+                    size=4.0,
+                    color=color,  # solid hex — Plotly 3D often ignores rgba fill
+                    opacity=0.28,  # more transparent
                     line=dict(width=0),
                     symbol="circle",
                 ),
@@ -769,38 +769,37 @@ def _fig_3d(
         _add_pink_zone(
             removal_inferior,
             "Areas to remove: inferior turbinate",
-            "rgba(255, 80, 160, 0.40)",
+            "#ef5350",  # light red
         )
         any_zone = True
     if show_removal_middle and removal_middle is not None and len(removal_middle) > 0:
         _add_pink_zone(
             removal_middle,
             "Areas to remove: middle turbinate",
-            "rgba(255, 105, 180, 0.38)",
+            "#e91e63",  # pink-red
         )
         any_zone = True
     if show_removal_septum and removal_septum is not None and len(removal_septum) > 0:
         _add_pink_zone(
             removal_septum,
             "Areas to remove: septum (distal–medial)",
-            "rgba(236, 64, 122, 0.38)",
+            "#c62828",  # deeper red
         )
         any_zone = True
-    # Fallback combined cloud if zone split missing
     if (
         show_removal
         and not any_zone
         and removal_pts is not None
         and len(removal_pts) > 0
     ):
-        _add_pink_zone(removal_pts, "Areas to remove (high |u|)", "rgba(255, 64, 160, 0.35)")
+        _add_pink_zone(removal_pts, "Areas to remove (high |u|)", "#e53935")
     elif (
         show_restriction
         and not any_zone
         and restriction_pts is not None
         and len(restriction_pts) > 0
     ):
-        _add_pink_zone(restriction_pts, "Constriction", "rgba(255, 64, 160, 0.32)")
+        _add_pink_zone(restriction_pts, "Constriction", "#e53935")
 
     # --- Purple: dual instrument paths L/R naris → ipsilateral frontal ---
     if show_frontal_path:
@@ -834,17 +833,17 @@ def _fig_3d(
                     z=[fp[0, 2], fp[-1, 2]],
                     mode="markers+text",
                     marker=dict(
-                        size=[8, 9],
+                        size=[4, 5],
                         color=["#ce93d8", "#6a1b9a"],
                         symbol=["circle", "diamond"],
-                        line=dict(width=1, color="white"),
+                        line=dict(width=0.5, color="#333333"),
                     ),
                     text=[
                         f"{side_tag} naris" if side_tag else "Naris",
                         f"{side_tag} frontal" if side_tag else "Frontal",
                     ],
                     textposition="top center",
-                    textfont=dict(size=10, color="#6a1b9a"),
+                    textfont=dict(size=9, color="#6a1b9a"),
                     name=f"{name} ends",
                     showlegend=False,
                 )
@@ -952,12 +951,12 @@ def _fig_3d(
                 "R naris" if "right" in name.lower() else "Naris"
             )
             label = short
-            size = 10
+            size = 5
             symbol = "circle"
         else:
             color = "#ff1744"
             label = "Trachea"
-            size = 11
+            size = 6
             symbol = "diamond"
         fig.add_trace(
             go.Scatter3d(
@@ -969,12 +968,12 @@ def _fig_3d(
                     size=size,
                     color=color,
                     symbol=symbol,
-                    line=dict(width=1.5, color="white"),
-                    opacity=0.95,
+                    line=dict(width=0.5, color="#333333"),
+                    opacity=0.9,
                 ),
                 text=[label],
                 textposition="top center",
-                textfont=dict(size=11, color=color, family="Arial"),
+                textfont=dict(size=9, color=color, family="Arial"),
                 name=name,
             )
         )
