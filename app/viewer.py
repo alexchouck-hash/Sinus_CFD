@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.11.0-surgical-frontal-path"
+APP_VERSION = "0.12.0-dual-frontal-curvy-main"
 APP_VERSION_LABEL = (
-    "sinus labels · purple naris→frontal instrument path · magenta removal zones"
+    "dual purple L/R naris→frontal · curvy inhale pathlines → trachea · magenta removal"
 )
 
 DEFAULT_CASE = "P001"
@@ -484,6 +484,8 @@ def _fig_3d(
     animate_pathlines: bool = False,
     n_anim_frames: int = 24,
     frontal_path_mm: list | None = None,
+    frontal_path_left_mm: list | None = None,
+    frontal_path_right_mm: list | None = None,
     show_frontal_path: bool = False,
     removal_pts: np.ndarray | None = None,
     show_removal: bool = False,
@@ -759,41 +761,53 @@ def _fig_3d(
             )
         )
 
-    # --- Purple: least-resistance instrument path naris → frontal sinus ---
-    if show_frontal_path and frontal_path_mm is not None and len(frontal_path_mm) >= 2:
-        fp = np.asarray(frontal_path_mm, dtype=float)
-        fig.add_trace(
-            go.Scatter3d(
-                x=fp[:, 0],
-                y=fp[:, 1],
-                z=fp[:, 2],
-                mode="lines",
-                line=dict(color="#9c27b0", width=10),  # purple
-                name="Instrument path: naris → frontal (least resistance)",
-                hoverinfo="skip",
-                opacity=0.95,
+    # --- Purple: dual instrument paths L/R naris → ipsilateral frontal ---
+    if show_frontal_path:
+        dual_paths = []
+        if frontal_path_left_mm is not None and len(frontal_path_left_mm) >= 2:
+            dual_paths.append(("L naris → L frontal", frontal_path_left_mm, "#ab47bc"))
+        if frontal_path_right_mm is not None and len(frontal_path_right_mm) >= 2:
+            dual_paths.append(("R naris → R frontal", frontal_path_right_mm, "#8e24aa"))
+        # Fallback single path
+        if not dual_paths and frontal_path_mm is not None and len(frontal_path_mm) >= 2:
+            dual_paths.append(("Naris → frontal", frontal_path_mm, "#9c27b0"))
+        for pi, (name, path, color) in enumerate(dual_paths):
+            fp = np.asarray(path, dtype=float)
+            fig.add_trace(
+                go.Scatter3d(
+                    x=fp[:, 0],
+                    y=fp[:, 1],
+                    z=fp[:, 2],
+                    mode="lines",
+                    line=dict(color=color, width=9),
+                    name=name,
+                    hoverinfo="skip",
+                    opacity=0.95,
+                )
             )
-        )
-        # Start (naris) / end (frontal) markers
-        fig.add_trace(
-            go.Scatter3d(
-                x=[fp[0, 0], fp[-1, 0]],
-                y=[fp[0, 1], fp[-1, 1]],
-                z=[fp[0, 2], fp[-1, 2]],
-                mode="markers+text",
-                marker=dict(
-                    size=[9, 10],
-                    color=["#ce93d8", "#7b1fa2"],
-                    symbol=["circle", "diamond"],
-                    line=dict(width=1, color="white"),
-                ),
-                text=["Naris entry", "Frontal sinus"],
-                textposition="top center",
-                textfont=dict(size=11, color="#6a1b9a"),
-                name="Frontal path ends",
-                showlegend=False,
+            side_tag = "L" if "L naris" in name else ("R" if "R naris" in name else "")
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[fp[0, 0], fp[-1, 0]],
+                    y=[fp[0, 1], fp[-1, 1]],
+                    z=[fp[0, 2], fp[-1, 2]],
+                    mode="markers+text",
+                    marker=dict(
+                        size=[8, 9],
+                        color=["#ce93d8", "#6a1b9a"],
+                        symbol=["circle", "diamond"],
+                        line=dict(width=1, color="white"),
+                    ),
+                    text=[
+                        f"{side_tag} naris" if side_tag else "Naris",
+                        f"{side_tag} frontal" if side_tag else "Frontal",
+                    ],
+                    textposition="top center",
+                    textfont=dict(size=10, color="#6a1b9a"),
+                    name=f"{name} ends",
+                    showlegend=False,
+                )
             )
-        )
 
     # --- Velocity cones (optional, denser cones) ---
     if show_vectors:
@@ -1174,9 +1188,9 @@ def main() -> None:
         )
         st.subheader("Surgical guidance")
         show_frontal_path = st.checkbox(
-            "Purple path: naris → frontal sinus (least resistance)",
+            "Purple paths: L/R naris → L/R frontal (straighter)",
             value=True,
-            help="Most-open instrument corridor: dark air + centered between bone (EDT).",
+            help="Dual ipsilateral instrument corridors (straightish, open dark air).",
         )
         show_removal = st.checkbox(
             "Magenta / pink: areas to remove",
@@ -1605,12 +1619,16 @@ def main() -> None:
         n_anim_frames=28,
         frontal_path_mm=(
             ((data.get("surgical") or {}).get("paths_mm") or {}).get(
-                "primary_naris_to_frontal"
-            )
-            or ((data.get("surgical") or {}).get("paths_mm") or {}).get(
                 "naris_left_to_frontal"
             )
-            or ((data.get("surgical") or {}).get("paths_mm") or {}).get(
+        ),
+        frontal_path_left_mm=(
+            ((data.get("surgical") or {}).get("paths_mm") or {}).get(
+                "naris_left_to_frontal"
+            )
+        ),
+        frontal_path_right_mm=(
+            ((data.get("surgical") or {}).get("paths_mm") or {}).get(
                 "naris_right_to_frontal"
             )
         ),
@@ -1628,11 +1646,10 @@ def main() -> None:
     )
     st.plotly_chart(fig3d, use_container_width=True)
     st.caption(
-        "Pathlines (Turbo = |u|): **nostrils → trachea**. "
-        "**Purple** = least-resistance **instrument path naris → frontal sinus** "
-        "(dark air + centered in lumen). "
-        "**Magenta/pink** = **areas to remove** (narrow bottlenecks). "
-        "Toggle surgical layers in the sidebar."
+        "Curvy pathlines (Turbo = |u|): **nostrils → trachea** (inhale). "
+        "**Purple** = dual **L/R naris → ipsilateral frontal** instrument corridors "
+        "(straighter, open dark air). "
+        "**Magenta/pink** = **areas to remove**. Toggle layers in the sidebar."
     )
 
     # ---- BC summary ----

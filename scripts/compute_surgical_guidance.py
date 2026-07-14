@@ -32,6 +32,8 @@ from sinus_cfd.open_path import (  # noqa: E402
     path_restriction_highlights,
     path_zyx_to_mm,
     nearest_air_index,
+    split_frontal_lr,
+    straighten_path_in_air,
     _mm_to_zyx,
 )
 from sinus_cfd.pipeline import _mask_to_mesh  # noqa: E402
@@ -178,62 +180,100 @@ def main() -> int:
         air_domain = keep
     notes.append(f"Instrument domain air voxels={int(air_domain.sum())}")
 
-    # Frontal target: centroid of frontal mask on domain
-    fz, fy, fx = np.where(anatomy.frontal & air_domain)
-    if len(fz) == 0:
-        fz, fy, fx = np.where(anatomy.frontal)
-    frontal_zyx = (int(np.median(fz)), int(np.median(fy)), int(np.median(fx)))
-    frontal_zyx = nearest_air_index(air_domain, frontal_zyx)
+    # Split frontal into L/R targets (ipsilateral instrument paths)
+    frontal_on_domain = anatomy.frontal & air_domain
+    if not frontal_on_domain.any():
+        frontal_on_domain = anatomy.frontal
+    frontal_left, frontal_right, x_sep = split_frontal_lr(frontal_on_domain)
+    notes.append(
+        f"Frontal split L={int(frontal_left.sum())} R={int(frontal_right.sum())} "
+        f"x_sep={x_sep:.1f}"
+    )
 
-    # Paths from each naris (and best overall)
-    cost, radius = most_open_cost_hu(air_domain, hu, spacing, power=2.2, hu_weight=0.6)
+    def _frontal_target(mask: np.ndarray) -> tuple[int, int, int]:
+        m = mask & air_domain
+        if not m.any():
+            m = mask
+        if not m.any():
+            m = frontal_on_domain
+        zz, yy, xx = np.where(m)
+        # Prefer more superior + anterior target within side
+        # (superior high z, anterior low y for this CT)
+        score = zz.astype(float) - 0.35 * yy.astype(float)
+        j = int(np.argmax(score))
+        tgt = (int(zz[j]), int(yy[j]), int(xx[j]))
+        return nearest_air_index(air_domain, tgt)
+
+    tgt_left = _frontal_target(frontal_left)
+    tgt_right = _frontal_target(frontal_right)
+
+    # Straighter instrument paths: mild EDT power + strong straight bias
+    cost, radius = most_open_cost_hu(
+        air_domain, hu, spacing, power=1.15, hu_weight=0.35
+    )
     paths: dict[str, list] = {}
     path_meta: list[dict] = []
     all_path_zyx: list[tuple[int, int, int]] = []
 
-    # higher x = patient left in this CT
+    # higher x = patient left
     ordered_nares = sorted(naris_pts[:2], key=lambda c: -float(c[0]))
-    for i, nm in enumerate(ordered_nares):
-        side = "left" if i == 0 else "right"
+    side_targets = {
+        "left": (ordered_nares[0], tgt_left),
+        "right": (
+            ordered_nares[1] if len(ordered_nares) > 1 else ordered_nares[0],
+            tgt_right,
+        ),
+    }
+    for side, (nm, tgt) in side_targets.items():
         start = nearest_air_index(air_domain, _mm_to_zyx(nm, spacing, origin, shape))
         idx = most_open_path_zyx(
             air_domain,
             start,
-            frontal_zyx,
+            tgt,
             spacing,
-            power=2.2,
+            power=1.05,
             hu=hu,
-            hu_weight=0.6,
+            hu_weight=0.25,
+            straight_bias=4.5,  # instrument corridor: prefer straight naris→frontal
         )
         pts = path_zyx_to_mm(idx, spacing, origin)
-        key = f"naris_{side}_to_frontal"
+        # Pull toward straight chord for instrument corridor look
+        pts = straighten_path_in_air(
+            pts, air_domain, spacing, origin, blend=0.72, n=56
+        )
+        # re-map straightened path to zyx for restriction sampling
+        idx_s = [
+            nearest_air_index(air_domain, _mm_to_zyx(p, spacing, origin, shape))
+            for p in pts
+        ]
+        key = f"naris_{side}_to_frontal_{side}"
         paths[key] = pts.tolist()
+        paths[f"naris_{side}_to_frontal"] = pts.tolist()
         plen = path_length_mm(pts)
-        r_along = [float(radius[p]) for p in idx]
+        r_along = [float(radius[p]) for p in idx_s]
+        chord = float(np.linalg.norm(pts[-1] - pts[0])) if len(pts) >= 2 else 0.0
         path_meta.append(
             {
                 "name": key,
+                "side": side,
                 "start_mm": list(nm),
-                "end_mm": path_zyx_to_mm([frontal_zyx], spacing, origin)[0].tolist(),
+                "end_mm": path_zyx_to_mm([tgt], spacing, origin)[0].tolist(),
                 "length_mm": plen,
+                "chord_mm": chord,
+                "straightness": float(chord / max(plen, 1e-3)),
                 "min_radius_mm": float(min(r_along)) if r_along else 0.0,
                 "mean_radius_mm": float(np.mean(r_along)) if r_along else 0.0,
-                "n_points": len(idx),
+                "n_points": len(pts),
             }
         )
-        all_path_zyx.extend(idx)
+        all_path_zyx.extend(idx_s)
         notes.append(
-            f"{key}: length={plen:.1f} mm min_r={path_meta[-1]['min_radius_mm']:.2f} mm"
+            f"{key}: length={plen:.1f} mm chord={chord:.1f} mm "
+            f"straightness={path_meta[-1]['straightness']:.2f} "
+            f"min_r={path_meta[-1]['min_radius_mm']:.2f} mm"
         )
 
-    # Prefer dual if both exist; also store primary = shorter min-radius-aware score
-    if path_meta:
-        best = min(
-            path_meta,
-            key=lambda m: m["length_mm"] / max(m["mean_radius_mm"], 0.5),
-        )
-        paths["primary_naris_to_frontal"] = paths[best["name"]]
-        notes.append(f"Primary instrument path: {best['name']}")
+    notes.append("Dual purple paths: L naris→L frontal, R naris→R frontal")
 
     # Magenta removal zones: bottlenecks on all frontal access paths
     highlight, bottlenecks = path_restriction_highlights(
@@ -280,14 +320,16 @@ def main() -> int:
 
     guidance = {
         "case_id": case_id,
-        "method": "most_open_hu_edt_naris_to_frontal",
+        "method": "straight_most_open_dual_naris_to_ipsilateral_frontal",
         "sinus_anatomy": anatomy.to_meta(),
         "paths_mm": paths,
         "path_metrics": path_meta,
         "bottlenecks": bottlenecks,
+        "dual_frontal_paths": True,
         "notes": notes,
         "viewer": {
             "frontal_path_color": "purple",
+            "show_both_frontal_paths": True,
             "removal_color": "magenta",
             "sinus_colors": {
                 "frontal": "#ffcc80",

@@ -913,16 +913,21 @@ def compute_curvy_volume_pathlines(
             continue
         finished.append(line)
 
-    # Score: reach trachea, length, slight curve bonus; balance L/R nares
+    # Score: strongly prefer paths that finish at trachea (inhale / low-P outlet)
     scored: list[tuple[float, int, np.ndarray]] = []
     for line in finished:
         arc = float(np.linalg.norm(np.diff(line, axis=0), axis=1).sum())
         naris, _ = _nearest_naris_mm(line[0], naris_list)
         side = 0 if float(naris[0]) >= float(np.mean([n[0] for n in naris_list])) else 1
-        score = arc
+        score = arc * 0.35
         if trachea is not None:
+            d0 = float(np.linalg.norm(line[0] - trachea))
             d1 = float(np.linalg.norm(line[-1] - trachea))
-            score += max(0.0, 40.0 - d1) * 3.0
+            score += max(0.0, d0 - d1) * 4.0  # progress toward trachea
+            score += max(0.0, 50.0 - d1) * 5.0  # end near trachea
+            mid = line[len(line) // 2]
+            d_mid = float(np.linalg.norm(mid - trachea))
+            score += max(0.0, d0 - d_mid) * 1.5
         scored.append((score, side, line))
     scored.sort(key=lambda t: t[0], reverse=True)
 

@@ -156,8 +156,14 @@ def most_open_path_zyx(
     power: float = 2.0,
     hu: np.ndarray | None = None,
     hu_weight: float = 0.55,
+    straight_bias: float = 0.0,
 ) -> list[tuple[int, int, int]]:
-    """Discrete most-open path indices (z,y,x). Optional HU preference."""
+    """
+    Discrete most-open path indices (z,y,x).
+
+    straight_bias > 0 penalizes deviation from the straight start→end chord
+    so instrument corridors stay straighter (still stay in open dark air).
+    """
     start = nearest_air_index(air, start_zyx)
     end = nearest_air_index(air, end_zyx)
     if hu is not None:
@@ -166,6 +172,23 @@ def most_open_path_zyx(
         )
     else:
         cost, _ = most_open_cost(air, spacing_xyz, power=power)
+
+    if straight_bias > 0:
+        # Distance (voxels) from the start–end line segment
+        a = np.array(start, dtype=float)
+        b = np.array(end, dtype=float)
+        ab = b - a
+        ab2 = float(np.dot(ab, ab)) + 1e-9
+        zz, yy, xx = np.where(air)
+        pts = np.column_stack([zz, yy, xx]).astype(float)
+        t = np.clip(np.dot(pts - a, ab) / ab2, 0.0, 1.0)
+        proj = a + t[:, None] * ab
+        dist = np.linalg.norm(pts - proj, axis=1)
+        # Mild penalty so path prefers a straight corridor without leaving air
+        pen = 1.0 + float(straight_bias) * (dist / (dist.max() + 1e-6))
+        cost = cost.copy()
+        cost[zz, yy, xx] *= pen
+
     try:
         indices, _ = route_through_array(
             cost, start=start, end=end, fully_connected=True, geometric=True
@@ -173,6 +196,58 @@ def most_open_path_zyx(
     except Exception:
         indices = [start, end]
     return [(int(a), int(b), int(c)) for a, b, c in indices]
+
+
+def split_frontal_lr(
+    frontal: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Split frontal mask into L/R by x median (high x = patient left)."""
+    zz, yy, xx = np.where(frontal.astype(bool))
+    if len(xx) == 0:
+        z = np.zeros_like(frontal, dtype=bool)
+        return z, z, 0.0
+    x_mid = float(np.median(xx))
+    left = frontal & (np.arange(frontal.shape[2])[None, None, :] >= x_mid)
+    right = frontal & (np.arange(frontal.shape[2])[None, None, :] < x_mid)
+    # If one side empty, fall back to full frontal for both
+    if not left.any():
+        left = frontal.copy()
+    if not right.any():
+        right = frontal.copy()
+    return left.astype(bool), right.astype(bool), x_mid
+
+
+def straighten_path_in_air(
+    path_mm: np.ndarray,
+    air: np.ndarray,
+    spacing_xyz: tuple[float, float, float],
+    origin_xyz: tuple[float, float, float],
+    blend: float = 0.65,
+    n: int = 48,
+) -> np.ndarray:
+    """
+    Pull an instrument path toward the start→end chord while snapping to air.
+
+    Makes naris→frontal corridors look straighter for surgical planning without
+    leaving the lumen.
+    """
+    if path_mm is None or len(path_mm) < 3:
+        return path_mm
+    pts = resample_polyline(np.asarray(path_mm, dtype=float), n)
+    a, b = pts[0].copy(), pts[-1].copy()
+    out = []
+    for i, p in enumerate(pts):
+        t = i / max(n - 1, 1)
+        chord = (1.0 - t) * a + t * b
+        blended = (1.0 - blend) * p + blend * chord
+        zyx = nearest_air_index(
+            air, _mm_to_zyx(blended, spacing_xyz, origin_xyz, air.shape)
+        )
+        out.append(_zyx_to_mm(zyx, spacing_xyz, origin_xyz))
+    # ensure exact start/end anchors
+    out[0] = a
+    out[-1] = b
+    return np.asarray(out, dtype=float)
 
 
 def path_restriction_highlights(
