@@ -101,31 +101,57 @@ Typical resting set-point we already use: **~18 L/min** total, split L/R, held f
 
 ---
 
-## Export command (this repo)
+## Export + scaffold (this repo)
 
 ```powershell
 # 1) Passage walls + centerline (if not done)
 py -3.12 scripts\analyze_passage.py --case VisibleHuman_Head
 
-# 2) Solid air body + open-port STLs
+# 2) Solid air body + open-port STLs (mm medical coords)
 py -3.12 scripts\export_openfoam_geometry.py --case VisibleHuman_Head
+
+# 3) Full OpenFOAM case (STLs scaled to metres + all dictionaries)
+py -3.12 scripts\scaffold_openfoam_case.py --case VisibleHuman_Head
 ```
 
-Output folder:
+### Geometry export
 
 ```text
 outputs/VisibleHuman_Head/openfoam_geometry/
-  VisibleHuman_Head_solid_air_body.stl
-  VisibleHuman_Head_solid_air_body.nrrd
+  VisibleHuman_Head_solid_air_body.stl      # air solid (mm)
   VisibleHuman_Head_patch_wall.stl
   VisibleHuman_Head_patch_left_nostril.stl
   VisibleHuman_Head_patch_right_nostril.stl
   VisibleHuman_Head_patch_trachea.stl
-  VisibleHuman_Head_openfoam_manifest.json
-  README_OPENFOAM.txt
+  ...
 ```
 
-Use `--no-sinuses` if you want **only** the continuous naris–trachea path, without extra sinus air.
+### Ready-to-run case
+
+```text
+foam/VisibleHuman_Head/
+  0/U  0/p                          # BCs (~9 L/min each naris)
+  constant/triSurface/*.stl         # scaled to METRES
+  system/blockMeshDict
+  system/snappyHexMeshDict
+  system/controlDict, fvSchemes, fvSolution
+  Allrun / Allclean / run_in_wsl.ps1
+  README.md
+```
+
+### Run in WSL / Linux (OpenFOAM installed)
+
+```powershell
+cd C:\Users\houck\Documents\Sinus_CFD\foam\VisibleHuman_Head
+.\run_in_wsl.ps1
+```
+
+Or inside WSL:
+
+```bash
+cd /mnt/c/Users/houck/Documents/Sinus_CFD/foam/VisibleHuman_Head
+chmod +x Allrun && ./Allrun
+```
 
 ---
 
@@ -133,20 +159,11 @@ Use `--no-sinuses` if you want **only** the continuous naris–trachea path, wit
 
 | Requirement | How we enforce it |
 |-------------|-------------------|
-| Inlets at real nostrils | Port centers + open inlet masks at external nares |
-| Path to trachea | Connected lumen + caudal outlet open mask |
+| Inlets at real nostrils | Port centers + open inlet masks + inlet STLs |
+| Path to trachea | Connected lumen + caudal outlet open mask + trachea STL |
 | Solid air for CFD | `solid_air_body` = that lumen (+ optional sinuses) |
 | Walls vs openings | Separate STL patches for wall / nares / trachea |
 
 If free air is incomplete on a cadaver CT, a thin conduit may fill gaps so the domain stays continuous; that is documented in case notes.
 
----
-
-## Next after STLs
-
-1. Install OpenFOAM (WSL on Windows is common).
-2. Build a foam case that points `snappyHexMeshDict` at these STLs.
-3. Match our physiology flow rates in `0/U`.
-4. Compare OpenFOAM results to the in-app potential-flow preview.
-
-The geometry and patch *names* stay the same either way.
+After meshing, use ParaView (`paraFoam`) to confirm velocity streams from nares to trachea.
