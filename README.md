@@ -157,17 +157,27 @@ Default CFD airway uses **1–3** (continuous nasal path). Use `--include-sinuse
 
 Large medical volumes are **not** stored in this repository. Keep them under `data/` (gitignored).
 
-### Best fit: NasalSeg
+### NasalSeg (labeled nasal FOV — current pipeline)
 
 | | |
 |---|---|
 | **What** | 130 CT scans with nasal/paranasal labels |
+| **FOV** | Sinonasal region only (not whole head) |
 | **Size** | ~224 MB |
-| **Download** | [Zenodo](https://zenodo.org/records/13893419) · [GitHub](https://github.com/YichiZhang98/NasalSeg) |
+| **Download** | [Zenodo](https://zenodo.org/records/13893419) |
+
+### Visible Human Female head (whole-head CT)
+
+| | |
+|---|---|
+| **What** | Full head CT, 1 mm slices (~234) |
+| **FOV** | Entire head (skull, sinuses, soft tissue) |
+| **Labels** | None (use HU / future auto-seg) |
+| **Download** | `py -3.12 scripts\download_visible_human_head.py` |
+| **Source** | [Harvard Dataverse doi:10.7910/DVN/3JDZCT](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/3JDZCT) |
 
 ### Other sources
 
-- [Visible Human Project CT](https://mri.medicine.uiowa.edu/equipment-information/scanner-images/visible-human-project-ct-datasets) — full head  
 - [TCIA Head-Neck-PET-CT](https://www.cancerimagingarchive.net/collection/head-neck-pet-ct/)  
 - [TCIA HNSCC](https://www.cancerimagingarchive.net/collection/hnscc/)  
 - [Stanford AIMI SinoCT](https://aimi.stanford.edu/data)  

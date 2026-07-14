@@ -16,10 +16,17 @@ Ideal for this project: **130** 3D CT volumes with pixel-wise labels for:
 
 These labels can seed airway segmentation and virtual-surgery experiments without starting from raw unlabeled CT alone.
 
-## Full head: Visible Human Project CT
+## Full head: Visible Human Project CT (recommended whole-head)
 
-- University of Iowa overview: https://mri.medicine.uiowa.edu/equipment-information/scanner-images/visible-human-project-ct-datasets  
-- Useful when you need complete craniofacial context beyond the sinonasal region.
+| | |
+|---|---|
+| **What** | NLM Visible Human Female 1 mm head CT (~234 slices) |
+| **Why** | Whole head: skull, sinuses, nasal airway, soft tissue, path toward trachea |
+| **Harvard Dataverse** | https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/3JDZCT |
+| **Iowa notes** | https://mri.medicine.uiowa.edu/equipment-information/scanner-images/visible-human-project-ct-datasets |
+| **Local download** | `py -3.12 scripts/download_visible_human_head.py` → `data/VisibleHuman_Head/` |
+
+NasalSeg is a **cropped nasal/sinus FOV with labels**. Visible Human is a **full head without nasal labels** — complementary.
 
 ## Large research archives
 

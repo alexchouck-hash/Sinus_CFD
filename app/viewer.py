@@ -165,7 +165,7 @@ def _slice_fig(
     return fig
 
 
-def _load_mesh_decimated(stl_path: str, target_faces: int = 8000):
+def _load_mesh_decimated(stl_path: str, target_faces: int = 14000):
     import trimesh
 
     mesh = trimesh.load(stl_path, force="mesh")
@@ -175,10 +175,39 @@ def _load_mesh_decimated(stl_path: str, target_faces: int = 8000):
         try:
             mesh = mesh.simplify_quadric_decimation(target_faces)
         except Exception:
-            # Fallback: random face subset
             idx = np.linspace(0, len(mesh.faces) - 1, target_faces, dtype=int)
             mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces[idx], process=False)
     return mesh
+
+
+def _mesh_wireframe_trace(mesh, max_edges: int = 8000, color: str = "#d8e6f0") -> go.Scatter3d | None:
+    """Dark-on-light edge overlay so the cavity silhouette reads clearly."""
+    try:
+        edges = mesh.edges_unique
+    except Exception:
+        return None
+    if edges is None or len(edges) == 0:
+        return None
+    if len(edges) > max_edges:
+        idx = np.linspace(0, len(edges) - 1, max_edges, dtype=int)
+        edges = edges[idx]
+    v = mesh.vertices
+    # NaN breaks create separate segments
+    xs, ys, zs = [], [], []
+    for a, b in edges:
+        xs += [v[a, 0], v[b, 0], None]
+        ys += [v[a, 1], v[b, 1], None]
+        zs += [v[a, 2], v[b, 2], None]
+    return go.Scatter3d(
+        x=xs,
+        y=ys,
+        z=zs,
+        mode="lines",
+        line=dict(color=color, width=1.5),
+        name="Cavity edges",
+        hoverinfo="skip",
+        opacity=0.55,
+    )
 
 
 def _fig_3d(
@@ -191,15 +220,28 @@ def _fig_3d(
     airway: np.ndarray,
     spacing: np.ndarray,
     origin: np.ndarray,
+    show_mesh: bool,
+    mesh_opacity: float,
+    show_wireframe: bool,
+    show_streamlines: bool,
+    streamline_width: float,
     show_vectors: bool,
     vector_stride: int,
     max_vector_speed: float,
     ports: list[dict],
+    bg_mode: str = "dark",
 ) -> go.Figure:
     fig = go.Figure()
+    dark = bg_mode == "dark"
+    scene_bg = "#1a1f2b" if dark else "#f4f6f8"
+    paper_bg = "#0e1117" if dark else "#ffffff"
+    font_c = "#fafafa" if dark else "#111111"
+    mesh_color = "#7eb6d9"  # readable blue-gray
+    edge_color = "#e8f1f8" if dark else "#1a3a52"
+    stream_width = float(streamline_width)
 
-    # Semi-transparent cavity
-    if mesh is not None:
+    # --- Cavity surface first (drawn under flow overlays) ---
+    if show_mesh and mesh is not None:
         v = mesh.vertices
         f = mesh.faces
         fig.add_trace(
@@ -210,47 +252,58 @@ def _fig_3d(
                 i=f[:, 0],
                 j=f[:, 1],
                 k=f[:, 2],
-                color="lightblue",
-                opacity=0.18,
+                color=mesh_color,
+                opacity=float(np.clip(mesh_opacity, 0.05, 1.0)),
                 name="Airway cavity",
-                flatshading=True,
-                hoverinfo="skip",
-            )
-        )
-
-    # Curving streamlines colored by local speed (approx by segment index)
-    for li, line in enumerate(streamlines):
-        arr = np.asarray(line, dtype=float)
-        if arr.shape[0] < 2:
-            continue
-        # Color by normalized arc length as stand-in for progression
-        fig.add_trace(
-            go.Scatter3d(
-                x=arr[:, 0],
-                y=arr[:, 1],
-                z=arr[:, 2],
-                mode="lines",
-                line=dict(
-                    width=4,
-                    color=np.linspace(0, 1, len(arr)),
-                    colorscale="Turbo",
+                flatshading=False,
+                lighting=dict(
+                    ambient=0.55,
+                    diffuse=0.85,
+                    specular=0.35,
+                    roughness=0.45,
+                    fresnel=0.15,
                 ),
-                name="Streamline" if li == 0 else None,
-                showlegend=(li == 0),
+                lightposition=dict(x=80, y=120, z=200),
                 hoverinfo="skip",
+                showlegend=True,
             )
         )
+        if show_wireframe:
+            wf = _mesh_wireframe_trace(mesh, color=edge_color)
+            if wf is not None:
+                fig.add_trace(wf)
 
-    # Optional quiver (subsampled airway)
+    # --- Streamlines (thinner by default so mesh stays primary) ---
+    if show_streamlines:
+        for li, line in enumerate(streamlines):
+            arr = np.asarray(line, dtype=float)
+            if arr.shape[0] < 2:
+                continue
+            fig.add_trace(
+                go.Scatter3d(
+                    x=arr[:, 0],
+                    y=arr[:, 1],
+                    z=arr[:, 2],
+                    mode="lines",
+                    line=dict(
+                        width=stream_width,
+                        color=np.linspace(0, 1, len(arr)),
+                        colorscale="Turbo",
+                    ),
+                    name="Streamlines" if li == 0 else None,
+                    showlegend=(li == 0),
+                    hoverinfo="skip",
+                    opacity=0.9,
+                )
+            )
+
+    # --- Optional velocity cones (off by default) ---
     if show_vectors:
         zz, yy, xx = np.where(airway)
-        # subsample
         step = max(int(vector_stride), 1)
-        sel = slice(None, None, step)
-        zz, yy, xx = zz[sel], yy[sel], xx[sel]
-        # further cap
-        if len(zz) > 2500:
-            idx = np.linspace(0, len(zz) - 1, 2500, dtype=int)
+        zz, yy, xx = zz[::step], yy[::step], xx[::step]
+        if len(zz) > 1200:
+            idx = np.linspace(0, len(zz) - 1, 1200, dtype=int)
             zz, yy, xx = zz[idx], yy[idx], xx[idx]
 
         sx, sy, sz = spacing
@@ -261,9 +314,7 @@ def _fig_3d(
         vx = ux[zz, yy, xx]
         vy = uy[zz, yy, xx]
         vz = uz[zz, yy, xx]
-        sp = speed[zz, yy, xx]
-        # Scale arrow length in mm for visibility
-        scale = 4.0 / max(max_vector_speed, 1e-9)
+        scale = 3.0 / max(max_vector_speed, 1e-9)
         fig.add_trace(
             go.Cone(
                 x=px,
@@ -276,25 +327,26 @@ def _fig_3d(
                 cmin=0,
                 cmax=max_vector_speed,
                 sizemode="absolute",
-                sizeref=scale * 2.0,
+                sizeref=scale * 1.5,
                 anchor="tail",
                 name="Velocity",
                 colorbar=dict(title="|u| m/s"),
                 showscale=True,
+                opacity=0.75,
             )
         )
 
     # Port markers
     for port in ports:
         c = port.get("center_mm", [0, 0, 0])
-        color = "#00ff88" if port.get("role") == "inlet" else "#ff4466"
+        color = "#3dff9a" if port.get("role") == "inlet" else "#ff5c7a"
         fig.add_trace(
             go.Scatter3d(
                 x=[c[0]],
                 y=[c[1]],
                 z=[c[2]],
                 mode="markers+text",
-                marker=dict(size=6, color=color),
+                marker=dict(size=7, color=color, line=dict(width=1, color="white")),
                 text=[port.get("name", "")],
                 textposition="top center",
                 name=port.get("name", "port"),
@@ -302,21 +354,22 @@ def _fig_3d(
         )
 
     fig.update_layout(
-        height=640,
+        height=700,
         margin=dict(l=0, r=0, t=30, b=0),
         scene=dict(
             xaxis_title="X mm",
             yaxis_title="Y mm",
             zaxis_title="Z mm",
             aspectmode="data",
-            bgcolor="#0e1117",
-            xaxis=dict(backgroundcolor="#0e1117", gridcolor="#333"),
-            yaxis=dict(backgroundcolor="#0e1117", gridcolor="#333"),
-            zaxis=dict(backgroundcolor="#0e1117", gridcolor="#333"),
+            bgcolor=scene_bg,
+            xaxis=dict(backgroundcolor=scene_bg, gridcolor="#444" if dark else "#ccc", showbackground=True),
+            yaxis=dict(backgroundcolor=scene_bg, gridcolor="#444" if dark else "#ccc", showbackground=True),
+            zaxis=dict(backgroundcolor=scene_bg, gridcolor="#444" if dark else "#ccc", showbackground=True),
+            camera=dict(eye=dict(x=1.6, y=1.4, z=0.9)),
         ),
-        paper_bgcolor="#0e1117",
-        font_color="#fafafa",
-        legend=dict(bgcolor="rgba(0,0,0,0)"),
+        paper_bgcolor=paper_bg,
+        font_color=font_c,
+        legend=dict(bgcolor="rgba(0,0,0,0.3)" if dark else "rgba(255,255,255,0.7)"),
     )
     return fig
 
@@ -355,18 +408,45 @@ def main() -> None:
             return
 
         case_id = st.selectbox("Case ID", cases, index=0)
-        st.header("Display")
-        show_vectors = st.checkbox("Velocity cones (3D)", value=False)
-        vector_stride = st.slider("Vector stride (higher = fewer)", 2, 12, 5)
-        show_streamlines = st.checkbox("Streamlines (curved)", value=True)
+        st.header("3D display")
+        preset = st.radio(
+            "Preset",
+            ["Cavity first", "Flow overlay", "Cavity only"],
+            index=0,
+            help="Cavity first emphasizes the semi-transparent model.",
+        )
+        show_mesh = st.checkbox("Show cavity mesh", value=True)
+        mesh_opacity = st.slider("Cavity opacity", 0.15, 1.0, 0.62, 0.01)
+        show_wireframe = st.checkbox("Cavity wireframe edges", value=True)
+        show_streamlines = st.checkbox(
+            "Streamlines (curved)",
+            value=(preset != "Cavity only"),
+        )
+        streamline_width = st.slider("Streamline width", 1.0, 8.0, 2.5, 0.5)
+        show_vectors = st.checkbox(
+            "Velocity cones",
+            value=(preset == "Flow overlay"),
+        )
+        vector_stride = st.slider("Vector stride (higher = fewer)", 3, 16, 8)
+        bg_mode = st.selectbox("Background", ["dark", "light"], index=0)
+
+        if preset == "Cavity only":
+            show_streamlines = False
+            show_vectors = False
+            mesh_opacity = max(mesh_opacity, 0.7)
+        elif preset == "Cavity first":
+            # Keep mesh readable; flow is secondary
+            mesh_opacity = max(mesh_opacity, 0.55)
+            streamline_width = min(streamline_width, 3.0)
+
         st.header("Roadmap (future)")
         st.markdown(
             """
+- Whole-head CT (Visible Human)  
 - Shortest path: naris → ostium → sinus  
 - Mucus clearance / widened ostium  
 - CRS · NAO · NVC diagnosis  
-- Polyp detection  
-- Patient CT upload  
+- Polyp detection · patient CT upload  
             """
         )
 
@@ -433,7 +513,7 @@ def main() -> None:
 
     fig3d = _fig_3d(
         mesh=mesh,
-        streamlines=streamlines,
+        streamlines=streamlines if show_streamlines else [],
         ux=data["ux"],
         uy=data["uy"],
         uz=data["uz"],
@@ -441,12 +521,22 @@ def main() -> None:
         airway=airway,
         spacing=data["spacing"],
         origin=data["origin"],
+        show_mesh=show_mesh,
+        mesh_opacity=mesh_opacity,
+        show_wireframe=show_wireframe,
+        show_streamlines=show_streamlines,
+        streamline_width=streamline_width,
         show_vectors=show_vectors,
         vector_stride=vector_stride,
         max_vector_speed=vmax,
         ports=ports_lite,
+        bg_mode=bg_mode,
     )
     st.plotly_chart(fig3d, use_container_width=True)
+    st.caption(
+        "Tip: use preset **Cavity first** or raise **Cavity opacity**. "
+        "Wireframe edges outline the airway. Turn off velocity cones if they dominate."
+    )
 
     # ---- BC summary ----
     with st.expander("Boundary conditions & breathing"):
