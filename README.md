@@ -20,7 +20,10 @@ This project aims to take a CT scan of a human head, reconstruct the nasal cavit
 | Airway mask from labels / HU | Working (`scripts/process_case.py`) |
 | Surface export (STL) | Working |
 | BCs: nostrils in / trachea out / mouth closed | Working (physiology + port detection) |
+| Approximate airflow velocity field | Working (potential-flow preview) |
+| **Interactive viewer** (tri-planar + 3D streamlines) | Working (`app/viewer.py`) |
 | Volume mesh + OpenFOAM CFD | Not yet |
+| Ostium pathways / mucus / CRS·NAO·NVC | Roadmap (`docs/product_roadmap.md`) |
 | Virtual surgery variants | Not yet |
 
 ### Boundary conditions (intent)
@@ -94,11 +97,35 @@ Useful flags:
 | `--weight-kg 70` | Scale \(V_T \approx 7\) mL/kg (patient matching) |
 | `--left-flow-fraction 0.5` | L/R nostril flow split |
 
-### 4. Inspect results
+### 4. Compute airflow velocity (preview field)
 
-- **Preview PNG:** open `outputs/P001/P001_preview.png`  
-- **STL:** open in [3D Slicer](https://www.slicer.org/), MeshLab, or Blender  
-- **Stats JSON:** voxel counts, spacing, mesh size  
+```powershell
+py -3.12 scripts\compute_flow.py --case P001
+```
+
+Produces `outputs/P001/P001_flow.npz` (speed + velocity components), streamlines, and `P001_speed.nrrd`.
+
+This is a **potential-flow / Darcy approximation** scaled to ~18 L/min inspiratory flow — good for visualization and early metrics. Full Navier–Stokes CFD comes later.
+
+### 5. Launch the interactive viewer
+
+```powershell
+py -3.12 -m streamlit run app\viewer.py
+```
+
+Features:
+
+- **Tri-planar** speed maps with axial / coronal / sagittal sliders  
+- **3D** semi-transparent cavity + **curved streamlines**  
+- Optional velocity cones  
+- BC / breathing summary  
+
+### 6. Inspect files
+
+- **Velocity preview:** `outputs/P001/P001_velocity_preview.png`  
+- **Mask overlay:** `outputs/P001/P001_preview.png`  
+- **STL:** MeshLab / 3D Slicer / Blender  
+- **BCs:** `P001_boundary_conditions.json`  
 
 ## Pipeline (high level)
 
@@ -152,14 +179,25 @@ Large medical volumes are **not** stored in this repository. Keep them under `da
 Sinus_CFD/
 ├── README.md
 ├── requirements.txt
+├── app/
+│   └── viewer.py         # Streamlit tri-planar + 3D airflow viewer
 ├── data/                 # local CT downloads (not committed)
-├── docs/                 # design notes, data sources
-├── outputs/              # masks, STL, previews (not committed)
+├── docs/                 # BCs, product roadmap, data sources
+├── outputs/              # masks, STL, flow fields (not committed)
 ├── scripts/
-│   └── process_case.py   # CLI entry point
+│   ├── process_case.py   # CT → mask + STL + BCs
+│   └── compute_flow.py   # mask + BCs → velocity field
 └── src/sinus_cfd/
-    └── pipeline.py       # load → mask → surface
+    ├── pipeline.py
+    ├── physiology.py
+    ├── boundary_conditions.py
+    └── flow_field.py
 ```
+
+### Product direction
+
+Long-term: surgeons/patients **upload CT** → auto analysis for **CRS**, **NAO**, **NVC**, polyps → interactive airflow/drainage viewer → virtual surgery comparison.  
+See [`docs/product_roadmap.md`](docs/product_roadmap.md).
 
 ## License & ethics
 

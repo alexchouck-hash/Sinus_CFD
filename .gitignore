@@ -3,6 +3,8 @@ data/**
 !data/README.md
 outputs/**
 !outputs/.gitkeep
+*.npz
+.streamlit/secrets.toml
 *.dcm
 *.DCM
 *.nii
