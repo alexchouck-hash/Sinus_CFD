@@ -27,9 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.13.0-wispy-lateral-frontal"
+APP_VERSION = "0.14.0-clean-turbulent-wisps"
 APP_VERSION_LABEL = (
-    "wispy volume-seeded pathlines · sagittal-straight / coronal-diverge frontal paths"
+    "turbulent wispy flow · medial-then-lateral frontal paths · clean 3D (no controls)"
 )
 
 DEFAULT_CASE = "P001"
@@ -645,7 +645,7 @@ def _fig_3d(
                 edge_color="#0277bd",
             )
 
-    # --- Wispy pathlines: Turbo color = speed; fade/thin with distance from seed ---
+    # --- Wispy turbulent pathlines (no velocity colorbar on 3D) ---
     path_arrays: list[np.ndarray] = []
     path_speeds: list[np.ndarray] = []
     if show_streamlines and streamlines:
@@ -658,7 +658,9 @@ def _fig_3d(
         speed_lists = streamline_speeds or []
         cmax_u = max(float(max_vector_speed), 1e-6)
         base_op = float(np.clip(streamline_opacity, 0.12, 1.0))
-        n_fade_seg = 6  # segments per line for wispy fade
+        n_fade_seg = 7
+        # Soft cyan/white wisps (no blue→red scale)
+        wisp_color = "#7ecbff" if dark else "#1565c0"
         legend_done = False
         for k, li in enumerate(idx):
             full = np.asarray(streamlines[li], dtype=float)
@@ -684,10 +686,8 @@ def _fig_3d(
                 continue
             path_arrays.append(arr)
             path_speeds.append(sp)
-            # Higher mean speed → keep slightly thicker base
             mean_sp = float(np.mean(sp)) if len(sp) else 0.0
             w_scale = 0.75 + 0.55 * min(1.5, mean_sp / max(cmax_u * 0.35, 1e-3))
-            # Break into segments: near seed opaque/thick → far thin/transparent
             n_pts = len(arr)
             n_seg = min(n_fade_seg, max(2, n_pts // 8))
             edges = np.linspace(0, n_pts - 1, n_seg + 1, dtype=int)
@@ -695,74 +695,31 @@ def _fig_3d(
                 i0, i1 = int(edges[si]), int(edges[si + 1])
                 if i1 <= i0:
                     continue
-                # include overlap of 1 point for continuity
                 i0s = max(0, i0 - (1 if si > 0 else 0))
                 seg = arr[i0s : i1 + 1]
-                seg_sp = sp[i0s : i1 + 1]
-                t_mid = (si + 0.5) / n_seg  # 0 near seed → 1 at tail
-                # opacity & width decay (wispy farther from seed)
-                op = base_op * (1.0 - 0.82 * (t_mid ** 1.15))
-                op = float(np.clip(op, 0.06, 1.0))
-                w = stream_width * w_scale * (1.0 - 0.72 * (t_mid ** 0.95))
-                w = float(np.clip(w, 0.6, stream_width * 1.6))
-                show_cb = (not legend_done) and si == 0
+                t_mid = (si + 0.5) / n_seg
+                op = base_op * (1.0 - 0.88 * (t_mid ** 1.05))
+                op = float(np.clip(op, 0.04, 1.0))
+                w = stream_width * w_scale * (1.0 - 0.78 * (t_mid ** 0.9))
+                w = float(np.clip(w, 0.5, stream_width * 1.5))
+                show_leg = (not legend_done) and si == 0
                 fig.add_trace(
                     go.Scatter3d(
                         x=seg[:, 0],
                         y=seg[:, 1],
                         z=seg[:, 2],
                         mode="lines",
-                        line=dict(
-                            width=w,
-                            color=seg_sp,
-                            colorscale="Turbo",
-                            cmin=0.0,
-                            cmax=cmax_u,
-                            colorbar=dict(title="|u| m/s", x=1.02) if show_cb else None,
-                        ),
-                        name="Pathlines (wispy |u|)" if show_cb else None,
-                        showlegend=show_cb,
+                        line=dict(width=w, color=wisp_color),
+                        name="Turbulent pathlines" if show_leg else None,
+                        showlegend=show_leg,
                         hoverinfo="skip",
                         opacity=op,
                     )
                 )
-                if show_cb:
+                if show_leg:
                     legend_done = True
 
-    # --- Max-restriction cloud (narrow lumen / high 1/r) ---
-    if show_restriction and restriction_pts is not None and len(restriction_pts) > 0:
-        rp = np.asarray(restriction_pts, dtype=float)
-        # columns: x,y,z, score(1/r), r_mm
-        fig.add_trace(
-            go.Scatter3d(
-                x=rp[:, 0],
-                y=rp[:, 1],
-                z=rp[:, 2],
-                mode="markers",
-                marker=dict(
-                    size=3.5,
-                    color=rp[:, 3] if rp.shape[1] > 3 else "orangered",
-                    colorscale=[
-                        [0.0, "rgba(255,200,80,0.15)"],
-                        [0.45, "rgba(255,120,40,0.55)"],
-                        [1.0, "rgba(180,0,40,0.95)"],
-                    ],
-                    opacity=0.55,
-                    line=dict(width=0),
-                    colorbar=dict(title="1/r (1/mm)", x=1.12) if not show_streamlines else None,
-                    showscale=not show_streamlines,
-                ),
-                name="Max restriction (narrow lumen)",
-                hovertemplate=(
-                    "restriction 1/r=%{marker.color:.2f}<br>"
-                    + ("r≈%{customdata:.2f} mm" if rp.shape[1] > 4 else "")
-                    + "<extra></extra>"
-                ),
-                customdata=rp[:, 4] if rp.shape[1] > 4 else None,
-            )
-        )
-
-    # --- Magenta / pink: surgical areas to remove (path bottlenecks) ---
+    # --- Magenta / pink constriction (semi-transparent) ---
     if show_removal and removal_pts is not None and len(removal_pts) > 0:
         rp = np.asarray(removal_pts, dtype=float)
         fig.add_trace(
@@ -772,19 +729,33 @@ def _fig_3d(
                 z=rp[:, 2],
                 mode="markers",
                 marker=dict(
-                    size=4.5,
-                    color="#ff2d95",  # magenta/pink
-                    opacity=0.75,
+                    size=5.0,
+                    color="rgba(255, 64, 160, 0.35)",  # semi-transparent pink
+                    opacity=0.38,
                     line=dict(width=0),
                     symbol="circle",
                 ),
-                name="High |u| to relieve (naris→trachea)",
-                hovertemplate=(
-                    "high velocity / restriction"
-                    + (" · |u|≈%{customdata:.2f} m/s" if rp.shape[1] > 3 else "")
-                    + "<extra></extra>"
+                name="Constriction (high |u|)",
+                hoverinfo="skip",
+            )
+        )
+    elif show_restriction and restriction_pts is not None and len(restriction_pts) > 0:
+        # Fallback if removal cloud missing
+        rp = np.asarray(restriction_pts, dtype=float)
+        fig.add_trace(
+            go.Scatter3d(
+                x=rp[:, 0],
+                y=rp[:, 1],
+                z=rp[:, 2],
+                mode="markers",
+                marker=dict(
+                    size=3.5,
+                    color="rgba(255, 64, 160, 0.32)",
+                    opacity=0.35,
+                    line=dict(width=0),
                 ),
-                customdata=rp[:, 3] if rp.shape[1] > 3 else None,
+                name="Constriction",
+                hoverinfo="skip",
             )
         )
 
@@ -887,8 +858,7 @@ def _fig_3d(
                 sizeref=max(scale * 1.1, 0.15),
                 anchor="tail",
                 name=f"Velocity ({len(px)} cones)",
-                colorbar=dict(title="|u| m/s"),
-                showscale=True,
+                showscale=False,
                 opacity=0.85,
             )
         )
@@ -1097,208 +1067,57 @@ def main() -> None:
         page_title="Sinus_CFD Viewer",
         page_icon="🫁",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="collapsed",
     )
 
     st.title("Sinus_CFD — Airflow Viewer")
-    st.caption(
-        "Tri-planar velocity · 3D cavity · streamlines  ·  "
-        "OpenFOAM simpleFoam when imported (else potential-flow preview)"
-    )
-
-    # Always-visible version banner (confirm you are not on a stale app/session)
-    st.info(
-        f"**App version `{APP_VERSION}`** — {APP_VERSION_LABEL}\n\n"
-        "If this string does not match, stop the Streamlit process and relaunch "
-        "`py -3.12 -m streamlit run app/viewer.py`."
-    )
+    st.caption(f"`{APP_VERSION}` · {APP_VERSION_LABEL}")
 
     cases = list_cases()
-    with st.sidebar:
-        st.header("Version")
-        st.markdown(f"**`{APP_VERSION}`**")
-        st.caption(APP_VERSION_LABEL)
-        if st.button("Clear cache & reload data", type="primary"):
-            st.cache_data.clear()
-            st.rerun()
+    if not cases:
+        st.error(
+            "No flow fields found under `outputs/`. "
+            "Run process_whole_head / compute_flow / regenerate_curvy_pathlines."
+        )
+        return
 
-        st.header("Case")
-        if not cases:
-            st.error(
-                "No flow fields found under `outputs/`. "
-                "Run process_whole_head / process_case then compute_flow."
-            )
-            st.code(
-                "py -3.12 scripts/process_whole_head.py --case VisibleHuman_Head\n"
-                "py -3.12 scripts/compute_flow.py --case VisibleHuman_Head",
-                language="powershell",
-            )
-            return
+    # Prefer whole-head case when present (no sidebar selectbox)
+    case_id = "VisibleHuman_Head" if "VisibleHuman_Head" in cases else cases[0]
 
-        # Prefer whole-head case when present
-        default_idx = 0
-        if "VisibleHuman_Head" in cases:
-            default_idx = cases.index("VisibleHuman_Head")
-        case_id = st.selectbox("Case ID", cases, index=default_idx)
-        st.header("3D display")
-        preset = st.radio(
-            "Preset",
-            [
-                "Inhale: nares → trachea",
-                "Head + airway",
-                "Cavity first",
-                "Flow overlay",
-                "Cavity only",
-            ],
-            index=0,
-            help="Inhale: streamlines seeded at nostrils flowing toward trachea.",
-        )
-        show_skin = st.checkbox("Show skin surface", value=True)
-        skin_opacity = st.slider(
-            "Skin opacity",
-            0.05,
-            0.95,
-            0.38,
-            0.01,
-            help="Filled outer skin mesh from CT body mask (not a point cloud).",
-        )
-        show_head = st.checkbox("Show soft-tissue solid (if no skin)", value=False)
-        head_opacity = st.slider("Soft-tissue opacity", 0.05, 0.85, 0.25, 0.01)
-        show_bone = st.checkbox("Show bone", value=False)
-        bone_opacity = st.slider("Bone opacity", 0.05, 1.0, 0.45, 0.01)
-        show_mesh = st.checkbox("Show combined air space", value=False)
-        mesh_opacity = st.slider("Air space opacity", 0.15, 1.0, 0.40, 0.01)
-        show_left = st.checkbox("Left nasal cavity (CT)", value=True)
-        show_right = st.checkbox("Right nasal cavity (CT)", value=True)
-        show_septum = st.checkbox(
-            "Nasal septum (off by default)",
-            value=False,
-            help="CT tissue between L/R cavities; usually leave off for air/path view.",
-        )
-        show_mucosa = st.checkbox("Mucosa / passage walls", value=False)
-        left_opacity = st.slider("Left cavity opacity", 0.05, 1.0, 0.40, 0.01)
-        right_opacity = st.slider("Right cavity opacity", 0.05, 1.0, 0.40, 0.01)
-        septum_opacity = st.slider("Septum opacity", 0.1, 1.0, 0.55, 0.01)
-        show_wireframe = st.checkbox(
-            "Skin wireframe edges",
-            value=True,
-            help="On by default so head extent reads clearly over translucent skin.",
-        )
-        show_streamlines = st.checkbox(
-            "Flow pathlines (velocity-colored)",
-            value=(preset not in ("Cavity only",)),
-        )
-        streamline_width = st.slider("Pathline width", 1.0, 8.0, 2.5, 0.5)
-        streamline_opacity = st.slider("Pathline opacity", 0.15, 1.0, 0.55, 0.05)
-        max_pathlines = st.slider(
-            "Max pathlines shown",
-            20,
-            500,
-            260,
-            10,
-            help="Dense curvy semi-transparent lines; lower if the plot is slow.",
-        )
-        animate_pathlines = st.checkbox(
-            "Animate particles along pathlines",
-            value=False,
-            help="Play button on the 3D plot rides particles naris→trachea.",
-        )
-        show_restriction = st.checkbox(
-            "Highlight max restriction (narrow lumen)",
-            value=True,
-            help="Hot cloud where distance-to-wall is smallest (high 1/r).",
-        )
-        show_centerlines = st.checkbox(
-            "Show anatomical centerlines (dim)",
-            value=False,
-            help="Usually off — dense pathlines carry more information.",
-        )
-        st.subheader("Surgical guidance")
-        show_frontal_path = st.checkbox(
-            "Purple paths: L/R naris → L/R frontal (straighter)",
-            value=True,
-            help="Dual ipsilateral instrument corridors (straightish, open dark air).",
-        )
-        show_removal = st.checkbox(
-            "Magenta / pink: high velocity (relieve opening)",
-            value=True,
-            help="Peak |u| along naris→trachea — sites a larger opening could decompress.",
-        )
-        show_frontal_sinus = st.checkbox("Frontal sinus", value=True)
-        show_sphenoid = st.checkbox("Sphenoid sinus", value=False)
-        show_maxillary = st.checkbox("Maxillary sinuses (L/R)", value=False)
-        sinus_opacity = st.slider("Sinus opacity", 0.05, 0.9, 0.32, 0.01)
-        show_vectors = st.checkbox(
-            "Velocity cones (glyphs)",
-            value=False,
-        )
-        vector_stride = st.slider(
-            "Vector density (1=max, higher=sparser)",
-            1,
-            8,
-            3,
-            help="Lower = many more cones. Default 3 is moderate.",
-        )
-        max_vectors = st.slider("Max velocity cones", 500, 12000, 3000, 500)
-        bg_mode = st.selectbox("Background", ["dark", "light"], index=1)
-
-        if preset == "Inhale: nares → trachea":
-            show_streamlines = True
-            show_vectors = False
-            show_restriction = True
-            show_centerlines = False
-            show_skin = True
-            show_wireframe = True
-            # Keep skin readable as a surface shell, not vanishing
-            skin_opacity = min(max(skin_opacity, 0.28), 0.42)
-            show_mesh = False
-            show_left = True
-            show_right = True
-            show_septum = False
-            streamline_width = max(streamline_width, 2.5)
-            streamline_opacity = min(streamline_opacity, 0.6)
-            max_pathlines = max(max_pathlines, 160)
-            vector_stride = max(vector_stride, 3)
-            max_vectors = min(max_vectors, 2500)
-        elif preset == "Cavity only":
-            show_streamlines = False
-            show_vectors = True
-            show_restriction = True
-            show_head = False
-            show_skin = False
-            mesh_opacity = max(mesh_opacity, 0.7)
-        elif preset == "Head + airway":
-            show_skin = True
-            skin_opacity = max(skin_opacity, 0.5)
-            mesh_opacity = min(mesh_opacity, 0.45)
-            streamline_width = min(streamline_width, 2.5)
-            show_vectors = False
-            show_streamlines = True
-            vector_stride = min(vector_stride, 2)
-        elif preset == "Flow overlay":
-            show_skin = True
-            skin_opacity = min(skin_opacity, 0.28)
-            show_vectors = False
-            show_streamlines = True
-            show_restriction = True
-            streamline_opacity = min(streamline_opacity, 0.5)
-            max_pathlines = max(max_pathlines, 200)
-        elif preset == "Cavity first":
-            show_head = False
-            show_skin = False
-            mesh_opacity = max(mesh_opacity, 0.55)
-            streamline_width = min(streamline_width, 3.0)
-
-        st.header("Roadmap (future)")
-        st.markdown(
-            """
-- Whole-head CT (Visible Human)  
-- Shortest path: naris → ostium → sinus  
-- Mucus clearance / widened ostium  
-- CRS · NAO · NVC diagnosis  
-- Polyp detection · patient CT upload  
-            """
-        )
+    # Fixed demo defaults — no left-panel sliders / checkboxes / radios
+    show_skin = True
+    skin_opacity = 0.32
+    show_head = False
+    head_opacity = 0.25
+    show_bone = False
+    bone_opacity = 0.45
+    show_mesh = False
+    mesh_opacity = 0.40
+    show_left = True
+    show_right = True
+    show_septum = False
+    show_mucosa = False
+    left_opacity = 0.38
+    right_opacity = 0.38
+    septum_opacity = 0.55
+    show_wireframe = True
+    show_streamlines = True
+    streamline_width = 2.4
+    streamline_opacity = 0.52
+    max_pathlines = 320
+    animate_pathlines = False
+    show_restriction = False
+    show_centerlines = False
+    show_frontal_path = True
+    show_removal = True
+    show_frontal_sinus = True
+    show_sphenoid = False
+    show_maxillary = False
+    sinus_opacity = 0.30
+    show_vectors = False
+    vector_stride = 4
+    max_vectors = 2000
+    bg_mode = "light"
 
     fp = case_data_fingerprint(case_id)
     data = load_case(case_id, fp)

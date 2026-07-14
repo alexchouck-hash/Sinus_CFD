@@ -31,15 +31,15 @@ from sinus_cfd.flow_field import compute_curvy_volume_pathlines  # noqa: E402
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--case", default="VisibleHuman_Head")
-    ap.add_argument("--volume-seeds", type=int, default=320)
-    ap.add_argument("--naris-seeds", type=int, default=100)
-    ap.add_argument("--max-lines", type=int, default=360)
-    ap.add_argument("--step-mm", type=float, default=0.15)
+    ap.add_argument("--volume-seeds", type=int, default=280)
+    ap.add_argument("--naris-seeds", type=int, default=180)
+    ap.add_argument("--max-lines", type=int, default=380)
+    ap.add_argument("--step-mm", type=float, default=0.14)
     ap.add_argument(
         "--swirl",
         type=float,
-        default=0.22,
-        help="0=pure streamlines; 0.15–0.28 curvy/turbulent look toward trachea",
+        default=0.26,
+        help="Base swirl; naris seeds get ~1.85x more turbulence",
     )
     ap.add_argument("--no-bidirectional", action="store_true")
     args = ap.parse_args()
@@ -61,19 +61,28 @@ def main() -> int:
     origin = tuple(float(v) for v in data["origin_xyz_mm"])
     notes: list[str] = []
 
-    # Domain: L/R cavities + passage + full airway (fills sinuses if present)
+    # Domain: cavities + passage + sinuses + interior air
     domain = airway.copy()
-    for name in ("cavity_left", "cavity_right", "passage_lumen", "all_interior_air"):
+    for name in (
+        "cavity_left",
+        "cavity_right",
+        "passage_lumen",
+        "all_interior_air",
+        "sinus_frontal",
+        "sinus_sphenoid",
+        "sinus_maxillary_left",
+        "sinus_maxillary_right",
+    ):
         p = out / f"{case_id}_{name}.nrrd"
         if p.is_file():
             m = sitk.GetArrayFromImage(sitk.ReadImage(str(p))).astype(bool)
             if m.shape == airway.shape:
-                domain |= m & airway
-    # Prefer any air with mapped speed
-    domain = domain & (speed > 1e-8)
+                domain |= m
+    # Keep fluid voxels (speed or air mask)
+    domain = domain & (airway | (speed > 1e-8))
     if not domain.any():
         domain = airway
-    notes.append(f"Curvy pathline domain: {int(domain.sum())} voxels")
+    notes.append(f"Curvy pathline domain (incl. sinuses): {int(domain.sum())} voxels")
 
     # Naris centers from nares.json / BC
     naris: list[list[float]] = []

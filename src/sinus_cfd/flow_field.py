@@ -822,7 +822,15 @@ def compute_curvy_volume_pathlines(
     )
 
     seeds_list: list[np.ndarray] = []
-    # Primary: seeds throughout airspace
+    seed_near_naris: list[bool] = []
+
+    def _mark(seeds_arr: np.ndarray, near: bool) -> None:
+        if seeds_arr is None or len(seeds_arr) == 0:
+            return
+        seeds_list.append(seeds_arr)
+        seed_near_naris.extend([near] * len(seeds_arr))
+
+    # Volume seeds throughout airspace
     if n_volume_seeds > 0:
         vol = seeds_throughout_volume(
             airway,
@@ -833,25 +841,33 @@ def compute_curvy_volume_pathlines(
             prefer_speed=True,
             rng=rng,
         )
-        if len(vol):
-            seeds_list.append(vol)
-    # Secondary: naris entry cloud
+        _mark(vol, False)
+    # Dense turbulent naris cloud
     if naris_centers_mm and n_naris_seeds > 0:
         port = seeds_near_ports(
             airway,
             spacing_xyz_mm,
             origin_xyz_mm,
             naris_centers_mm,
-            n_per_port=max(12, n_naris_seeds // max(1, len(naris_centers_mm))),
-            radius_mm=10.0,
+            n_per_port=max(20, n_naris_seeds // max(1, len(naris_centers_mm))),
+            radius_mm=12.0,
             speed=speed,
         )
-        if len(port):
-            seeds_list.append(port)
+        _mark(port, True)
 
     if not seeds_list:
         return []
     seeds = np.vstack(seeds_list)
+    near_flags = np.asarray(seed_near_naris, dtype=bool)
+    if len(near_flags) != len(seeds):
+        near_flags = np.zeros(len(seeds), dtype=bool)
+
+    # Also flag seeds geometrically near nares as high-turbulence
+    if naris_list:
+        for i, seed in enumerate(seeds):
+            dmin = min(float(np.linalg.norm(seed - n)) for n in naris_list)
+            if dmin < 14.0:
+                near_flags[i] = True
 
     # Mean speed for length scaling
     sp_vals = speed[airway & (speed > 1e-6)]
@@ -860,7 +876,7 @@ def compute_curvy_volume_pathlines(
 
     finished: list[np.ndarray] = []
     seed_speeds: list[float] = []
-    for seed in seeds:
+    for i_seed, seed in enumerate(seeds):
         # Sample seed speed for length scaling
         idx0 = _phys_to_index(
             seed.reshape(1, 3), spacing_xyz_mm, origin_xyz_mm, airway.shape
@@ -869,6 +885,9 @@ def compute_curvy_volume_pathlines(
         # Higher velocity → longer lines (more steps)
         length_scale = 0.55 + 1.1 * min(2.2, sp0 / sp_mean)
         steps = int(max(80, min(max_steps, max_steps * length_scale * 0.85)))
+        # More turbulence near nares; still curvy everywhere
+        local_swirl = float(swirl) * (1.85 if near_flags[i_seed] else 1.0)
+        local_swirl = min(0.42, local_swirl)
 
         base_kw = dict(
             ux=ux,
@@ -878,12 +897,12 @@ def compute_curvy_volume_pathlines(
             spacing_xyz_mm=spacing_xyz_mm,
             origin_xyz_mm=origin_xyz_mm,
             max_steps=steps,
-            step_mm=step_mm,
+            step_mm=step_mm * (0.92 if near_flags[i_seed] else 1.0),
             use_trilinear=True,
-            swirl=swirl,
+            swirl=local_swirl,
             rng=rng,
             attract_mm=trachea,
-            attract_strength=0.34 if trachea is not None else 0.0,
+            attract_strength=0.30 if trachea is not None else 0.0,
         )
         s = seed.reshape(1, 3)
         fwd = compute_streamlines(**base_kw, seed_points_mm=s, reverse=False)

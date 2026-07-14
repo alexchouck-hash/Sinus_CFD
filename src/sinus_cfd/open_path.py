@@ -311,9 +311,17 @@ def build_lateral_diverge_frontal_path(
     z_end = float(max(b[2], a[2] + 28.0))
 
     t = np.linspace(0.0, 1.0, n)
-    ease = t * t * (3.0 - 2.0 * t)  # smoothstep
-    lat = ease ** 0.85
-    # Prescribed geometry
+    # Stay medial early, then slight lateral diverge only in superior half
+    # (clinical: corridor tracks near septum, flares into frontal when high)
+    mid_hold = 0.55  # fraction of path that stays near start x (medial corridor)
+    lat_t = np.clip((t - mid_hold) / max(1e-6, 1.0 - mid_hold), 0.0, 1.0)
+    lat = lat_t * lat_t * (3.0 - 2.0 * lat_t)  # smoothstep after hold
+    lat = lat ** 1.15  # gentle late flare
+    # Only mild total lateral offset (not aggressive)
+    if side == "left":
+        x_end = a[0] + 6.0 * float(lateral_flare)
+    else:
+        x_end = a[0] - 6.0 * float(lateral_flare)
     xs = (1.0 - lat) * a[0] + lat * x_end
     ys = (1.0 - t) * a[1] + t * y_end
     zs = (1.0 - t) * a[2] + t * z_end
