@@ -19,15 +19,33 @@ This project aims to take a CT scan of a human head, reconstruct the nasal cavit
 | Public CT data (NasalSeg) | Working — download into `data/` |
 | Airway mask from labels / HU | Working (`scripts/process_case.py`) |
 | Surface export (STL) | Working |
+| BCs: nostrils in / trachea out / mouth closed | Working (physiology + port detection) |
 | Volume mesh + OpenFOAM CFD | Not yet |
 | Virtual surgery variants | Not yet |
+
+### Boundary conditions (intent)
+
+| Boundary | Treatment |
+|----------|-----------|
+| **Both nostrils** | **Inlets** — share total inspiratory flow (default 50/50) |
+| **Trachea** | **Outlet** — pressure reference (on NasalSeg: distal nasopharynx *proxy*) |
+| **Mouth** | **Closed** — oral cavity excluded from the fluid domain |
+
+**Typical resting breath → CFD flow**
+
+- \(V_T = 0.5\) L, RR = 12 /min, I:E ≈ 1:2 → \(T_i \approx 1.67\) s  
+- Mean inspiratory flow \(Q = V_T / T_i \approx \mathbf{18\ L/min}\), held quasi-steady for \(T_i\)  
+- Patient scaling later: `--weight-kg`, measured \(V_T\)/RR, L/R split  
+
+Details: [`docs/boundary_conditions.md`](docs/boundary_conditions.md)
 
 ### First case result (NasalSeg `P001`)
 
 - **Mask:** expert labels 1–3 (L/R nasal cavity + nasopharynx), cleaned to largest component  
 - **Airway volume:** ~28.5 mL  
-- **Surface:** ~30k vertices / ~60k faces (open tube → not watertight; expected for CFD inlets/outlets)  
-- **Outputs (local):** `outputs/P001/P001_airway.stl`, `P001_airway_mask.nrrd`, `P001_preview.png`, `P001_stats.json`
+- **Surface:** ~30k vertices / ~60k faces  
+- **Flow set-point:** ~18 L/min total (~9 L/min per nostril), \(T_i \approx 1.67\) s  
+- **Outputs (local):** mask, STL, preview, `*_boundary_conditions.json`, OpenFOAM BC sketch, port markers
 
 ## Quick start
 
@@ -71,6 +89,10 @@ Useful flags:
 | `--mask-source labels_and_hu` | Intersection of both |
 | `--include-sinuses` | Also include maxillary sinuses (labels 4–5) |
 | `--case P010` | Another subject |
+| `--tidal-volume-L 0.5` | Tidal volume (default 0.5 L) |
+| `--respiratory-rate 12` | Breaths/min |
+| `--weight-kg 70` | Scale \(V_T \approx 7\) mL/kg (patient matching) |
+| `--left-flow-fraction 0.5` | L/R nostril flow split |
 
 ### 4. Inspect results
 
@@ -83,9 +105,11 @@ Useful flags:
 ```
 CT (NRRD/DICOM/NIfTI)
     → load + spacing/origin
-    → airway mask (labels and/or HU ≈ −1024…−400)
+    → airway mask (labels 1–3; mouth excluded)
     → morphological clean + largest component
     → marching cubes surface (STL)
+    → ports: left/right nostril inlets + trachea outlet (proxy)
+    → physiology → Q (L/min) for duration Ti
     → [next] volume mesh + CFD (OpenFOAM / similar)
     → [next] virtual anatomy edits → re-run → compare
 ```

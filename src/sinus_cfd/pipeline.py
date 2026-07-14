@@ -8,9 +8,9 @@ nasopharynx, maxillary sinus L/R). Optional HU air threshold for comparison.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,6 +18,14 @@ import SimpleITK as sitk
 import trimesh
 from scipy import ndimage as ndi
 from skimage import measure, morphology
+
+from .boundary_conditions import (
+    build_boundary_setup,
+    export_port_markers_ply,
+    write_boundary_setup,
+    write_openfoam_bc_notes,
+)
+from .physiology import PatientBreathing, summary_text
 
 # NasalSeg label map (from dataset documentation / paper)
 LABEL_NAMES = {
@@ -54,6 +62,8 @@ class CaseStats:
     mesh_watertight: bool
     mesh_volume_mm3: float | None
     label_voxel_counts: dict[str, int]
+    boundary: dict[str, Any] = field(default_factory=dict)
+    breathing_summary: str = ""
 
 
 def _read_volume(path: Path) -> tuple[sitk.Image, np.ndarray]:
@@ -77,38 +87,87 @@ def _hu_air_mask(
     return (hu_zyx >= hu_min) & (hu_zyx <= hu_max)
 
 
+def _bridge_through_air(
+    seed_mask: np.ndarray,
+    hu_zyx: np.ndarray | None,
+    hu_max: float = -400.0,
+    hu_min: float = -1024.0,
+    max_gap_voxels: int = 12,
+) -> np.ndarray:
+    """
+    Re-join nearby label components through HU air without flooding exterior air.
+
+    Growth is allowed only in air voxels within ``max_gap_voxels`` of the original
+    seed (distance transform band). That bridges small choanal/meatus gaps while
+    blocking unrestricted dilation into free air outside the nose.
+    """
+    seed = seed_mask.astype(bool)
+    if hu_zyx is None:
+        return seed
+
+    air = (hu_zyx >= hu_min) & (hu_zyx <= hu_max)
+    # Band around labels: prevents growing out the nostrils into exterior FOV air
+    dist = ndi.distance_transform_edt(~seed)
+    allowed = air & (dist <= float(max_gap_voxels))
+
+    bridged = seed.copy()
+    structure = morphology.ball(1)
+    for _ in range(int(max_gap_voxels) + 2):
+        grown = morphology.dilation(bridged, footprint=structure) & allowed
+        grown |= seed  # never lose original labels
+        if np.array_equal(grown, bridged):
+            break
+        bridged = grown
+        _, n = ndi.label(bridged)
+        if n <= 1:
+            break
+    return bridged
+
+
 def _clean_mask(
     mask: np.ndarray,
     min_component_voxels: int = 200,
     closing_radius: int = 1,
+    keep_all_large_components: bool = True,
+    hu_zyx: np.ndarray | None = None,
+    hu_max: float = -400.0,
+    hu_min: float = -1024.0,
+    max_gap_voxels: int = 28,
 ) -> np.ndarray:
-    """Binary close small holes, drop tiny components, keep largest blob."""
+    """
+    Close small holes, drop tiny islands, optionally bridge through HU air.
+
+    Default keeps *all* large components (both nostrils + nasopharynx). Using
+    only the single largest blob drops the contralateral nasal cavity when
+    NasalSeg labels are not voxel-adjacent.
+    """
     cleaned = mask.astype(bool)
     if closing_radius > 0:
         structure = morphology.ball(closing_radius)
-        # skimage >=0.26: use morphology.closing on bool images
         cleaned = morphology.closing(cleaned, footprint=structure)
 
+    # Bridge label gaps through true air so L/R/NP form one flow domain
+    cleaned = _bridge_through_air(
+        cleaned,
+        hu_zyx,
+        hu_max=hu_max,
+        hu_min=hu_min,
+        max_gap_voxels=max_gap_voxels,
+    )
+
     labeled, n = ndi.label(cleaned)
     if n == 0:
         return cleaned
 
     counts = np.bincount(labeled.ravel())
     counts[0] = 0
-    # Drop tiny islands
-    for lab_id, count in enumerate(counts):
-        if lab_id == 0:
-            continue
-        if count < min_component_voxels:
-            cleaned[labeled == lab_id] = False
+    keep = np.zeros(n + 1, dtype=bool)
+    if keep_all_large_components:
+        keep[1:] = counts[1:] >= min_component_voxels
+    else:
+        keep[int(np.argmax(counts))] = True
 
-    labeled, n = ndi.label(cleaned)
-    if n == 0:
-        return cleaned
-    counts = np.bincount(labeled.ravel())
-    counts[0] = 0
-    largest = int(np.argmax(counts))
-    return labeled == largest
+    return keep[labeled]
 
 
 def _mask_to_mesh(
@@ -185,9 +244,17 @@ def process_case(
     hu_max: float = -400.0,
     hu_min: float = -1024.0,
     min_component_voxels: int = 200,
+    breathing: PatientBreathing | None = None,
+    write_bcs: bool = True,
+    face_tag_radius_mm: float = 8.0,
 ) -> CaseStats:
     """
-    Process one CT case into mask + STL surface + preview.
+    Process one CT case into mask + STL surface + preview + BC setup.
+
+    Boundary policy (project intent):
+      - Inlets: both nostrils (flow rate from physiology)
+      - Outlet: trachea (nasopharynx proxy on NasalSeg crops)
+      - Mouth: closed / blocked (excluded from fluid domain)
 
     mask_source:
       - "labels": use expert NasalSeg labels (recommended)
@@ -202,6 +269,7 @@ def process_case(
 
     output_dir = Path(output_dir or Path("outputs") / case_id)
     output_dir.mkdir(parents=True, exist_ok=True)
+    breathing = breathing or PatientBreathing.typical_resting_adult()
 
     image, hu_zyx = _read_volume(image_path)
     spacing_xyz = tuple(float(v) for v in image.GetSpacing())
@@ -232,7 +300,17 @@ def process_case(
     else:
         raise ValueError(f"Unknown mask_source: {mask_source}")
 
-    mask = _clean_mask(mask, min_component_voxels=min_component_voxels)
+    # Mouth closed: domain is nasal cavities + nasopharynx only (labels 1–3 by default).
+    # Oral cavity is never added to the mask when using label-based sources.
+    # Bridge through HU air so left/right nostrils + nasopharynx form one domain.
+    mask = _clean_mask(
+        mask,
+        min_component_voxels=min_component_voxels,
+        keep_all_large_components=True,
+        hu_zyx=hu_zyx,
+        hu_max=hu_max,
+        hu_min=hu_min,
+    )
 
     # Save mask as NRRD (same geometry as CT)
     mask_u8 = mask.astype(np.uint8)
@@ -247,6 +325,37 @@ def process_case(
 
     preview_path = output_dir / f"{case_id}_preview.png"
     _save_preview(hu_zyx, mask, preview_path, case_id)
+
+    boundary_dict: dict[str, Any] = {}
+    breath_txt = summary_text(breathing)
+    if write_bcs and label_zyx is not None:
+        setup = build_boundary_setup(
+            case_id=case_id,
+            label_zyx=label_zyx,
+            airway_mask=mask,
+            spacing_xyz=spacing_xyz,
+            origin_xyz=origin_xyz,
+            mesh=mesh,
+            breathing=breathing,
+            mesh_path=stl_path,
+            face_tag_radius_mm=face_tag_radius_mm,
+        )
+        bc_path = write_boundary_setup(setup, output_dir / f"{case_id}_boundary_conditions.json")
+        of_path = write_openfoam_bc_notes(setup, output_dir / f"{case_id}_openfoam_bc_sketch.txt")
+        try:
+            markers_path = export_port_markers_ply(
+                setup.ports, output_dir / f"{case_id}_port_markers.ply"
+            )
+        except ValueError:
+            markers_path = None
+        boundary_dict = setup.to_dict()
+        print(breath_txt)
+        print(f"[{case_id}] BCs → {bc_path.name}, {of_path.name}"
+              + (f", {markers_path.name}" if markers_path else ""))
+        for w in setup.warnings:
+            print(f"[{case_id}] warning: {w}")
+    elif write_bcs and label_zyx is None:
+        print(f"[{case_id}] skip BCs: labels required for nostril/trachea ports")
 
     voxel_volume = float(np.prod(spacing_xyz))
     mask_voxels = int(mask.sum())
@@ -276,6 +385,16 @@ def process_case(
         mesh_watertight=bool(mesh.is_watertight),
         mesh_volume_mm3=mesh_vol,
         label_voxel_counts=label_counts,
+        boundary={
+            "inlets": boundary_dict.get("inlet_names", ["left_nostril", "right_nostril"]),
+            "outlet": boundary_dict.get("outlet_name", "trachea_outlet_proxy"),
+            "mouth": "closed",
+            "mean_inspiratory_flow_L_per_min": breathing.mean_inspiratory_flow_L_per_min,
+            "inspiratory_time_s": breathing.Ti_s,
+            "outlet_is_proxy": boundary_dict.get("outlet_is_proxy", True),
+            "detail_file": f"{case_id}_boundary_conditions.json" if boundary_dict else None,
+        },
+        breathing_summary=breath_txt,
     )
 
     stats_path = output_dir / f"{case_id}_stats.json"
