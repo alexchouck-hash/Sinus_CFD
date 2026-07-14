@@ -73,6 +73,8 @@ def load_case(case_id: str) -> dict:
     out["stl_path"] = str(stl_path) if stl_path.is_file() else None
     head_stl = case_dir / f"{case_id}_head.stl"
     out["head_stl_path"] = str(head_stl) if head_stl.is_file() else None
+    skin_stl = case_dir / f"{case_id}_skin.stl"
+    out["skin_stl_path"] = str(skin_stl) if skin_stl.is_file() else None
     bone_stl = case_dir / f"{case_id}_bone.stl"
     out["bone_stl_path"] = str(bone_stl) if bone_stl.is_file() else None
 
@@ -268,6 +270,7 @@ def _add_surface_mesh(
 def _fig_3d(
     mesh,
     head_mesh,
+    skin_mesh,
     bone_mesh,
     streamlines: list,
     ux: np.ndarray,
@@ -279,6 +282,8 @@ def _fig_3d(
     origin: np.ndarray,
     show_head: bool,
     head_opacity: float,
+    show_skin: bool,
+    skin_opacity: float,
     show_bone: bool,
     bone_opacity: float,
     show_mesh: bool,
@@ -298,14 +303,25 @@ def _fig_3d(
     paper_bg = "#0e1117" if dark else "#ffffff"
     font_c = "#fafafa" if dark else "#111111"
     mesh_color = "#5ec8ff"  # airway cyan
-    head_color = "#c4a484"  # soft skin / solid head
+    head_color = "#c4a484"  # soft tissue volume
+    skin_color = "#e8b896"  # outer skin surface
     bone_color = "#f0e6d8"  # bone
     edge_color = "#e8f1f8" if dark else "#1a3a52"
     head_edge = "#8b7355" if dark else "#5c4033"
     stream_width = float(streamline_width)
 
-    # --- Head solid (outer shell) — semi-transparent ---
-    if show_head and head_mesh is not None:
+    # --- Outer skin surface (preferred visual for head shape) ---
+    if show_skin and skin_mesh is not None:
+        _add_surface_mesh(
+            fig,
+            skin_mesh,
+            name="Skin surface",
+            color=skin_color,
+            opacity=skin_opacity,
+            show_wireframe=False,
+            edge_color=head_edge,
+        )
+    elif show_head and head_mesh is not None:
         _add_surface_mesh(
             fig,
             head_mesh,
@@ -487,8 +503,10 @@ def main() -> None:
             index=0,
             help="Head + airway: semi-transparent solid head with airway inside.",
         )
-        show_head = st.checkbox("Show soft-tissue head", value=True)
-        head_opacity = st.slider("Head opacity", 0.05, 0.85, 0.28, 0.01)
+        show_skin = st.checkbox("Show skin surface", value=True)
+        skin_opacity = st.slider("Skin opacity", 0.05, 0.9, 0.35, 0.01)
+        show_head = st.checkbox("Show soft-tissue solid (if no skin)", value=False)
+        head_opacity = st.slider("Soft-tissue opacity", 0.05, 0.85, 0.25, 0.01)
         show_bone = st.checkbox("Show bone", value=False)
         bone_opacity = st.slider("Bone opacity", 0.05, 1.0, 0.45, 0.01)
         show_mesh = st.checkbox("Show air space (airway)", value=True)
@@ -510,15 +528,17 @@ def main() -> None:
             show_streamlines = False
             show_vectors = False
             show_head = False
+            show_skin = False
             mesh_opacity = max(mesh_opacity, 0.7)
         elif preset == "Head + airway":
-            show_head = True
-            head_opacity = min(max(head_opacity, 0.22), 0.40)
+            show_skin = True
+            skin_opacity = min(max(skin_opacity, 0.28), 0.45)
             mesh_opacity = max(mesh_opacity, 0.45)
             streamline_width = min(streamline_width, 3.0)
             show_vectors = False
         elif preset == "Cavity first":
             show_head = False
+            show_skin = False
             mesh_opacity = max(mesh_opacity, 0.55)
             streamline_width = min(streamline_width, 3.0)
 
@@ -577,19 +597,25 @@ def main() -> None:
     st.subheader("3D head + airway + airflow")
     mesh = None
     head_mesh = None
+    skin_mesh = None
     bone_mesh = None
     if data.get("stl_path"):
         try:
             mesh = _load_mesh_decimated(data["stl_path"], target_faces=12000)
         except Exception as exc:
             st.warning(f"Could not load airway STL: {exc}")
+    if data.get("skin_stl_path"):
+        try:
+            skin_mesh = _load_mesh_decimated(data["skin_stl_path"], target_faces=22000)
+        except Exception as exc:
+            st.warning(f"Could not load skin STL: {exc}")
     if data.get("head_stl_path"):
         try:
             head_mesh = _load_mesh_decimated(data["head_stl_path"], target_faces=18000)
         except Exception as exc:
             st.warning(f"Could not load head STL: {exc}")
-    elif show_head:
-        st.info("No head solid for this case (NasalSeg FOV). Use VisibleHuman_Head.")
+    if show_skin and skin_mesh is None and show_head is False:
+        st.info("No skin mesh for this case. Enable soft-tissue solid or run process_whole_head.")
     if data.get("bone_stl_path"):
         try:
             bone_mesh = _load_mesh_decimated(data["bone_stl_path"], target_faces=12000)
@@ -610,6 +636,7 @@ def main() -> None:
     fig3d = _fig_3d(
         mesh=mesh,
         head_mesh=head_mesh,
+        skin_mesh=skin_mesh,
         bone_mesh=bone_mesh,
         streamlines=streamlines if show_streamlines else [],
         ux=data["ux"],
@@ -621,6 +648,8 @@ def main() -> None:
         origin=data["origin"],
         show_head=show_head and head_mesh is not None,
         head_opacity=head_opacity,
+        show_skin=show_skin and skin_mesh is not None,
+        skin_opacity=skin_opacity,
         show_bone=show_bone and bone_mesh is not None,
         bone_opacity=bone_opacity,
         show_mesh=show_mesh,

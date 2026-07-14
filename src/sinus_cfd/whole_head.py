@@ -33,6 +33,11 @@ from .boundary_conditions import (
 )
 from .physiology import PatientBreathing, summary_text
 from .pipeline import _mask_to_mesh
+from .skin_and_nares import (
+    detect_external_nares,
+    extract_skin_shell,
+    mesh_skin_surface,
+)
 from .tissues import TISSUE_LABELS, segment_tissues
 
 
@@ -448,14 +453,21 @@ def _clip_superior_to_start(
 
 
 def detect_ports_whole_head(
+    hu: np.ndarray,
+    body: np.ndarray,
     airway: np.ndarray,
+    interior_air: np.ndarray,
     spacing_xyz: tuple[float, float, float],
     origin_xyz: tuple[float, float, float],
-    y_anterior_is_low: bool,
     superior_is_high_z: bool,
-) -> tuple[list[Port], list[str]]:
-    """Left/right nostril inlets + caudal trachea outlet."""
+) -> tuple[list[Port], list[str], dict[str, Any]]:
+    """
+    Ports: external nares on skin + caudal trachea.
+
+    Nostrils use skin-projected external naris positions (not deep vestibule).
+    """
     warnings: list[str] = []
+    meta: dict[str, Any] = {}
     zz, yy, xx = np.where(airway)
     if len(zz) == 0:
         raise ValueError("Empty airway")
@@ -473,55 +485,55 @@ def detect_ports_whole_head(
     if superior_is_high_z:
         z_thr = np.percentile(zz, 8)
         tip_idx = zz <= z_thr
-        trach_normal = np.array([0.0, 0.0, -1.0])  # outward caudal if +z superior
+        trach_normal = np.array([0.0, 0.0, -1.0])
     else:
         z_thr = np.percentile(zz, 92)
         tip_idx = zz >= z_thr
         trach_normal = np.array([0.0, 0.0, 1.0])
-    trach_pts = pts[tip_idx]
-    trach_center = trach_pts.mean(axis=0)
-    trach_area = float(max(tip_idx.sum(), 1) ** (2 / 3) * face)
+    trach_center = pts[tip_idx].mean(axis=0)
+    trach_area = float(max(int(tip_idx.sum()), 1) ** (2 / 3) * face)
 
-    # Nostrils = anterior-most air, split L/R by x
-    if y_anterior_is_low:
-        y_thr = np.percentile(yy, 15)
-        ant = yy <= y_thr
-    else:
-        y_thr = np.percentile(yy, 85)
-        ant = yy >= y_thr
-    # Prefer superior-mid face relative to whole airway: not the caudal tip
-    if superior_is_high_z:
-        z_face_band = zz >= np.percentile(zz, 35)
-    else:
-        z_face_band = zz <= np.percentile(zz, 65)
-    ant = ant & z_face_band
-    if ant.sum() < 20:
-        ant = (yy <= np.percentile(yy, 20)) if y_anterior_is_low else (yy >= np.percentile(yy, 80))
-
-    ant_pts = pts[ant]
-    ant_x = xx[ant]
-    x_med = float(np.median(ant_x))
-    left_m = ant_x >= x_med
-    right_m = ant_x < x_med
+    # External nares on skin
+    nares, ninfo = detect_external_nares(
+        hu,
+        body,
+        interior_air,
+        spacing_xyz,
+        origin_xyz,
+        superior_is_high_z=superior_is_high_z,
+    )
+    meta["nares"] = ninfo
+    y_ant_is_low = bool(ninfo.get("y_anterior_is_low", True))
 
     ports: list[Port] = []
-    for name, m in (("left_nostril", left_m), ("right_nostril", right_m)):
-        if not np.any(m):
-            warnings.append(f"No voxels for {name}")
-            continue
-        c = ant_pts[m].mean(axis=0)
-        area = float(max(int(m.sum()), 1) ** (2 / 3) * face)
-        nrm = np.array([0.0, 1.0 if y_anterior_is_low else -1.0, 0.0])
+    for naris in nares:
+        nrm = np.array([0.0, 1.0 if y_ant_is_low else -1.0, 0.0])
         ports.append(
             Port(
-                name=name,
+                name=naris.name,
                 role="inlet",
-                center_mm=c.tolist(),
-                area_mm2=area,
+                center_mm=naris.center_mm,
+                area_mm2=float(max(naris.n_support_voxels, 1) ** (2 / 3) * face),
                 normal_xyz=nrm.tolist(),
-                method="whole_head_anterior_midface_air",
-                notes="Inspiratory inlet at nostril (geometry).",
+                method="external_naris_on_skin",
+                notes=(
+                    f"External naris on skin surface "
+                    f"(depth_to_exterior≈{naris.depth_to_exterior_mm:.1f} mm)."
+                ),
             )
+        )
+        meta.setdefault("naris_points", []).append(
+            {
+                "name": naris.name,
+                "center_mm": naris.center_mm,
+                "skin_voxel_zyx": naris.skin_voxel_zyx,
+                "depth_mm": naris.depth_to_exterior_mm,
+            }
+        )
+
+    if len(ports) < 2:
+        warnings.append(
+            "Could not place both external nares on skin; check face air near surface."
         )
 
     ports.append(
@@ -535,7 +547,7 @@ def detect_ports_whole_head(
             notes="Caudal airway outlet (trachea / subglottis direction).",
         )
     )
-    return ports, warnings
+    return ports, warnings, meta
 
 
 def process_whole_head(
@@ -547,6 +559,7 @@ def process_whole_head(
     air_hu_max: float = -300.0,
     mesh_decimate_head: int = 25000,
     mesh_decimate_airway: int = 20000,
+    mesh_decimate_skin: int = 30000,
 ) -> WholeHeadResult:
     image_path = Path(image_path)
     output_dir = Path(output_dir or Path("outputs") / case_id)
@@ -623,11 +636,29 @@ def process_whole_head(
     _write_arr(bone.astype(np.uint8), f"{case_id}_bone_mask.nrrd")
     _write_arr((labels_crop == 2).astype(np.uint8), f"{case_id}_soft_tissue_mask.nrrd")
 
-    print(f"[{case_id}] meshing head solid + airway…")
+    print(f"[{case_id}] meshing skin surface + head solid + airway…")
+    skin_shell = extract_skin_shell(body, thickness=1)
+    _write_arr(skin_shell.astype(np.uint8), f"{case_id}_skin_shell_mask.nrrd")
+
+    try:
+        skin_mesh = mesh_skin_surface(
+            body, spacing, origin_crop, smooth_sigma=0.9, level=0.5
+        )
+        skin_mesh = _decimate(skin_mesh, mesh_decimate_skin)
+        skin_stl = output_dir / f"{case_id}_skin.stl"
+        skin_mesh.export(skin_stl)
+        notes.append(
+            f"Skin surface mesh: {len(skin_mesh.faces):,} faces (outer filled-body isosurface)."
+        )
+        print(f"[{case_id}] skin mesh faces={len(skin_mesh.faces):,}")
+    except Exception as exc:
+        skin_stl = None
+        notes.append(f"Skin mesh failed: {exc}")
+        print(f"[{case_id}] skin mesh failed: {exc}")
+
     head_mesh = _decimate(_mask_to_mesh(body, spacing, origin_crop), mesh_decimate_head)
     airway_mesh_full = _mask_to_mesh(airway, spacing, origin_crop)
     airway_mesh = _decimate(airway_mesh_full, mesh_decimate_airway)
-    # Optional bone mesh (lighter decimation)
     if bone.any():
         try:
             bone_mesh = _decimate(_mask_to_mesh(bone, spacing, origin_crop), 15000)
@@ -641,18 +672,25 @@ def process_whole_head(
     airway_mesh.export(airway_stl)
     airway_mesh_full.export(output_dir / f"{case_id}_airway_full.stl")
 
-    ports, port_warnings = detect_ports_whole_head(
-        airway,
-        spacing,
-        origin_crop,
-        y_anterior_is_low=bool(path_info.get("y_anterior_is_low", True)),
+    ports, port_warnings, port_meta = detect_ports_whole_head(
+        hu=hu,
+        body=body,
+        airway=airway,
+        interior_air=air_all,
+        spacing_xyz=spacing,
+        origin_xyz=origin_crop,
         superior_is_high_z=superior_is_high_z,
     )
     notes.extend(port_warnings)
-    ports = tag_mesh_faces_near_ports(airway_mesh, ports, radius_mm=14.0)
+    for p in ports:
+        if p.role == "inlet":
+            notes.append(
+                f"Inlet {p.name} at skin: {[round(c,1) for c in p.center_mm]} ({p.method})"
+            )
+    ports = tag_mesh_faces_near_ports(airway_mesh, ports, radius_mm=16.0)
     for p in ports:
         if p.role == "outlet" and p.n_faces == 0:
-            ports = tag_mesh_faces_near_ports(airway_mesh, ports, radius_mm=24.0)
+            ports = tag_mesh_faces_near_ports(airway_mesh, ports, radius_mm=26.0)
             break
 
     flow = assign_flow(ports, breathing)
@@ -677,6 +715,8 @@ def process_whole_head(
         export_port_markers_ply(ports, output_dir / f"{case_id}_port_markers.ply")
     except ValueError:
         pass
+    with (output_dir / f"{case_id}_nares.json").open("w", encoding="utf-8") as f:
+        json.dump(port_meta, f, indent=2)
 
     _save_whole_head_preview(
         hu,
@@ -686,6 +726,8 @@ def process_whole_head(
         output_dir / f"{case_id}_preview.png",
         case_id,
         superior_is_high_z=superior_is_high_z,
+        naris_points=port_meta.get("naris_points"),
+        skin_shell=skin_shell,
     )
 
     # Direction QC: airway z should extend more caudally than cranially from centroid
@@ -776,36 +818,88 @@ def _save_whole_head_preview(
     path: Path,
     case_id: str,
     superior_is_high_z: bool,
+    naris_points: list[dict] | None = None,
+    skin_shell: np.ndarray | None = None,
 ) -> None:
     z, y, x = hu.shape
-    # Pick a sagittal slice through airway centroid
-    if airway.any():
+    # Prefer axial through naris z if available
+    if naris_points:
+        zs = [p["skin_voxel_zyx"][0] for p in naris_points]
+        ys = [p["skin_voxel_zyx"][1] for p in naris_points]
+        xs = [p["skin_voxel_zyx"][2] for p in naris_points]
+        mid = (int(np.mean(zs)), int(np.mean(ys)), int(np.mean(xs)))
+    elif airway.any():
         az, ay, ax = np.where(airway)
         mid = (int(np.median(az)), int(np.median(ay)), int(np.median(ax)))
     else:
         mid = (z // 2, y // 2, x // 2)
 
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
     views = [
-        ("axial (through airway)", hu[mid[0]], body[mid[0]], airway[mid[0]], bone[mid[0]]),
-        ("coronal", hu[:, mid[1], :], body[:, mid[1], :], airway[:, mid[1], :], bone[:, mid[1], :]),
-        ("sagittal", hu[:, :, mid[2]], body[:, :, mid[2]], airway[:, :, mid[2]], bone[:, :, mid[2]]),
+        ("axial @ nares", 0, hu[mid[0]], body[mid[0]], airway[mid[0]], bone[mid[0]],
+         skin_shell[mid[0]] if skin_shell is not None else None),
+        ("coronal", 1, hu[:, mid[1], :], body[:, mid[1], :], airway[:, mid[1], :], bone[:, mid[1], :],
+         skin_shell[:, mid[1], :] if skin_shell is not None else None),
+        ("sagittal", 2, hu[:, :, mid[2]], body[:, :, mid[2]], airway[:, :, mid[2]], bone[:, :, mid[2]],
+         skin_shell[:, :, mid[2]] if skin_shell is not None else None),
     ]
-    for ax, (title, img, b, a, bn) in zip(axes, views):
+    for ax, (title, axis, img, b, a, bn, sk) in zip(axes, views):
         disp = np.clip(img, -200, 600)
         ax.imshow(disp, cmap="gray", origin="lower")
-        ax.contour(b.astype(float), levels=[0.5], colors=["#4fc3f7"], linewidths=0.7)
-        if bn.any():
-            ax.contour(bn.astype(float), levels=[0.5], colors=["#eeeeee"], linewidths=0.4, alpha=0.7)
+        if sk is not None and sk.any():
+            ax.contour(sk.astype(float), levels=[0.5], colors=["#00e5ff"], linewidths=1.0)
+        else:
+            ax.contour(b.astype(float), levels=[0.5], colors=["#4fc3f7"], linewidths=0.7)
+        if bn is not None and bn.any():
+            ax.contour(bn.astype(float), levels=[0.5], colors=["#f5f5f5"], linewidths=0.35, alpha=0.6)
         ov = np.ma.masked_where(~a, a.astype(float))
-        ax.imshow(ov, cmap="autumn", alpha=0.5, origin="lower")
+        ax.imshow(ov, cmap="autumn", alpha=0.45, origin="lower")
+        # Mark external nares
+        if naris_points:
+            for p in naris_points:
+                iz, iy, ix = p["skin_voxel_zyx"]
+                if axis == 0 and abs(iz - mid[0]) <= 3:
+                    ax.plot(ix, iy, "o", color="#00ff66", markersize=8, markeredgecolor="white")
+                    ax.text(ix + 2, iy, p["name"].replace("_", "\n"), color="#00ff66", fontsize=7)
+                elif axis == 1 and abs(iy - mid[1]) <= 3:
+                    ax.plot(ix, iz, "o", color="#00ff66", markersize=8, markeredgecolor="white")
+                elif axis == 2 and abs(ix - mid[2]) <= 3:
+                    ax.plot(iy, iz, "o", color="#00ff66", markersize=8, markeredgecolor="white")
         ax.set_title(title)
         ax.axis("off")
     fig.suptitle(
-        f"{case_id} — head (cyan), bone (white), airway (red)  |  "
+        f"{case_id} — skin (cyan), airway (red), external nares (green)  |  "
         f"superior_is_high_z={superior_is_high_z}"
     )
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=140)
+    fig.savefig(path, dpi=150)
     plt.close(fig)
+
+    # Extra face close-up axial for naris QC
+    if naris_points:
+        fig2, ax = plt.subplots(1, 1, figsize=(6, 6))
+        iz = mid[0]
+        disp = np.clip(hu[iz], -200, 600)
+        ax.imshow(disp, cmap="gray", origin="lower")
+        if skin_shell is not None:
+            ax.contour(skin_shell[iz].astype(float), levels=[0.5], colors=["#00e5ff"], linewidths=1.2)
+        ov = np.ma.masked_where(~airway[iz], airway[iz].astype(float))
+        ax.imshow(ov, cmap="autumn", alpha=0.4, origin="lower")
+        for p in naris_points:
+            _, iy, ix = p["skin_voxel_zyx"]
+            ax.plot(ix, iy, "o", color="#00ff66", markersize=12, markeredgecolor="white", markeredgewidth=1.5)
+            ax.annotate(
+                p["name"],
+                (ix, iy),
+                textcoords="offset points",
+                xytext=(6, 6),
+                color="#00ff66",
+                fontsize=9,
+                fontweight="bold",
+            )
+        ax.set_title(f"{case_id} face axial — external nares on skin")
+        ax.axis("off")
+        face_path = path.with_name(path.stem + "_face_nares.png")
+        fig2.savefig(face_path, dpi=150, bbox_inches="tight")
+        plt.close(fig2)
