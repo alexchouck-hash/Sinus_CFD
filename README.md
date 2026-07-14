@@ -108,7 +108,28 @@ Produces `outputs/P001/P001_flow.npz` (speed + velocity components), streamlines
 
 This is a **potential-flow / Darcy approximation** scaled to ~18 L/min inspiratory flow — good for visualization and early metrics. Full Navier–Stokes CFD comes later.
 
-### 5. Launch the interactive viewer
+### 5. Whole-head case (Visible Human)
+
+```powershell
+# Once: download head CT (~123 MB)
+py -3.12 scripts\download_visible_human_head.py
+
+# Solid head + airway + BCs (nostrils → trachea) + flow
+py -3.12 scripts\process_whole_head.py --case VisibleHuman_Head
+```
+
+Key outputs in `outputs/VisibleHuman_Head/`:
+
+| File | Role |
+|------|------|
+| `*_head.stl` | **Solid head shell** (semi-transparent in viewer) |
+| `*_airway.stl` | Airway lumen surface |
+| `*_boundary_conditions.json` | Nostrils in, **trachea** out, mouth closed |
+| `*_flow.npz` | Velocity field |
+
+Note: this cadaver CT has limited free air in the pharynx; a **low-HU geodesic conduit** to the neck is added so flow has a continuous path (documented in case notes).
+
+### 6. Launch the interactive viewer
 
 ```powershell
 py -3.12 -m streamlit run app\viewer.py
@@ -116,17 +137,16 @@ py -3.12 -m streamlit run app\viewer.py
 
 Features:
 
-- **Tri-planar** speed maps with axial / coronal / sagittal sliders  
-- **3D** semi-transparent cavity + **curved streamlines**  
-- Optional velocity cones  
-- BC / breathing summary  
+- Preset **Head + airway** — semi-transparent **solid head** + airway inside  
+- Tri-planar speed sliders  
+- Curved streamlines; optional velocity cones  
+- Adjustable head / airway opacity  
 
-### 6. Inspect files
+### 7. Inspect files
 
-- **Velocity preview:** `outputs/P001/P001_velocity_preview.png`  
-- **Mask overlay:** `outputs/P001/P001_preview.png`  
-- **STL:** MeshLab / 3D Slicer / Blender  
-- **BCs:** `P001_boundary_conditions.json`  
+- Whole-head preview: `outputs/VisibleHuman_Head/VisibleHuman_Head_preview.png`  
+- Head STL: `outputs/VisibleHuman_Head/VisibleHuman_Head_head.stl`  
+- NasalSeg case still under `outputs/P001/`  
 
 ## Pipeline (high level)
 
