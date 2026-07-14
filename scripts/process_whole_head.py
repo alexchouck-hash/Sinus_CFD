@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Process a whole-head CT: head solid + airway + BCs + optional flow field."""
+"""Process whole-head CT: edge seg, skin, airway, BCs, optional flow."""
 
 from __future__ import annotations
 
@@ -23,15 +23,10 @@ def main() -> int:
         default=REPO_ROOT / "data" / "VisibleHuman_Head" / "VHFCT1mm_Head.nrrd",
     )
     p.add_argument("--case", default="VisibleHuman_Head")
-    p.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Default: outputs/<case>",
-    )
+    p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--tidal-volume-L", type=float, default=0.50)
     p.add_argument("--respiratory-rate", type=float, default=12.0)
-    p.add_argument("--skip-flow", action="store_true", help="Skip velocity field")
+    p.add_argument("--skip-flow", action="store_true")
     p.add_argument("--flow-iterations", type=int, default=400)
     args = p.parse_args()
 
@@ -64,7 +59,7 @@ def main() -> int:
             case_id=args.case,
             breathing=breathing,
             pressure_iterations=args.flow_iterations,
-            n_streamline_seeds=48,
+            n_streamline_seeds=80,
         )
     return 0
 

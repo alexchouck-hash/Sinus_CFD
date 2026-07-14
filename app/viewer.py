@@ -296,6 +296,7 @@ def _fig_3d(
     max_vector_speed: float,
     ports: list[dict],
     bg_mode: str = "dark",
+    max_vectors: int = 6000,
 ) -> go.Figure:
     fig = go.Figure()
     dark = bg_mode == "dark"
@@ -318,8 +319,9 @@ def _fig_3d(
             name="Skin surface",
             color=skin_color,
             opacity=skin_opacity,
-            show_wireframe=False,
-            edge_color=head_edge,
+            show_wireframe=show_wireframe,
+            edge_color="#2a1810" if not dark else "#ffd7b0",
+            wireframe_max_edges=12000,
         )
     elif show_head and head_mesh is not None:
         _add_surface_mesh(
@@ -381,14 +383,32 @@ def _fig_3d(
                 )
             )
 
-    # --- Optional velocity cones (off by default) ---
+    # --- Velocity cones (dense by default) ---
     if show_vectors:
         zz, yy, xx = np.where(airway)
         step = max(int(vector_stride), 1)
-        zz, yy, xx = zz[::step], yy[::step], xx[::step]
-        if len(zz) > 1200:
-            idx = np.linspace(0, len(zz) - 1, 1200, dtype=int)
-            zz, yy, xx = zz[idx], yy[idx], xx[idx]
+        # 3D striding for more uniform density
+        sel = (
+            (zz % step == 0)
+            & (yy % step == 0)
+            & (xx % step == 0)
+        )
+        zz, yy, xx = zz[sel], yy[sel], xx[sel]
+        # Prefer higher-speed samples when over max
+        if len(zz) > max_vectors:
+            sp_all = speed[zz, yy, xx]
+            # mix top-speed and random coverage
+            n_top = max_vectors // 2
+            n_rest = max_vectors - n_top
+            top_idx = np.argpartition(sp_all, -n_top)[-n_top:]
+            rest_pool = np.setdiff1d(np.arange(len(zz)), top_idx, assume_unique=False)
+            rng = np.random.default_rng(0)
+            if len(rest_pool) > n_rest:
+                rest_idx = rng.choice(rest_pool, size=n_rest, replace=False)
+            else:
+                rest_idx = rest_pool
+            keep = np.concatenate([top_idx, rest_idx])
+            zz, yy, xx = zz[keep], yy[keep], xx[keep]
 
         sx, sy, sz = spacing
         ox, oy, oz = origin
@@ -398,7 +418,7 @@ def _fig_3d(
         vx = ux[zz, yy, xx]
         vy = uy[zz, yy, xx]
         vz = uz[zz, yy, xx]
-        scale = 3.0 / max(max_vector_speed, 1e-9)
+        scale = 2.2 / max(max_vector_speed, 1e-9)
         fig.add_trace(
             go.Cone(
                 x=px,
@@ -411,12 +431,12 @@ def _fig_3d(
                 cmin=0,
                 cmax=max_vector_speed,
                 sizemode="absolute",
-                sizeref=scale * 1.5,
+                sizeref=max(scale * 1.1, 0.15),
                 anchor="tail",
-                name="Velocity",
+                name=f"Velocity ({len(px)} cones)",
                 colorbar=dict(title="|u| m/s"),
                 showscale=True,
-                opacity=0.75,
+                opacity=0.85,
             )
         )
 
@@ -504,38 +524,51 @@ def main() -> None:
             help="Head + airway: semi-transparent solid head with airway inside.",
         )
         show_skin = st.checkbox("Show skin surface", value=True)
-        skin_opacity = st.slider("Skin opacity", 0.05, 0.9, 0.35, 0.01)
+        skin_opacity = st.slider("Skin opacity", 0.05, 0.95, 0.55, 0.01)
         show_head = st.checkbox("Show soft-tissue solid (if no skin)", value=False)
         head_opacity = st.slider("Soft-tissue opacity", 0.05, 0.85, 0.25, 0.01)
         show_bone = st.checkbox("Show bone", value=False)
         bone_opacity = st.slider("Bone opacity", 0.05, 1.0, 0.45, 0.01)
         show_mesh = st.checkbox("Show air space (airway)", value=True)
-        mesh_opacity = st.slider("Air space opacity", 0.15, 1.0, 0.55, 0.01)
-        show_wireframe = st.checkbox("Airway wireframe edges", value=False)
+        mesh_opacity = st.slider("Air space opacity", 0.15, 1.0, 0.40, 0.01)
+        show_wireframe = st.checkbox("Skin/airway wireframe edges", value=True)
         show_streamlines = st.checkbox(
             "Streamlines (curved)",
             value=(preset not in ("Cavity only",)),
         )
-        streamline_width = st.slider("Streamline width", 1.0, 8.0, 2.5, 0.5)
+        streamline_width = st.slider("Streamline width", 1.0, 8.0, 2.0, 0.5)
         show_vectors = st.checkbox(
-            "Velocity cones",
-            value=(preset == "Flow overlay"),
+            "Velocity cones (many)",
+            value=True,
         )
-        vector_stride = st.slider("Vector stride (higher = fewer)", 3, 16, 8)
-        bg_mode = st.selectbox("Background", ["dark", "light"], index=0)
+        vector_stride = st.slider(
+            "Vector density (1=max, higher=sparser)",
+            1,
+            8,
+            2,
+            help="Lower = many more cones. Default 2 is dense.",
+        )
+        max_vectors = st.slider("Max velocity cones", 500, 12000, 6000, 500)
+        bg_mode = st.selectbox("Background", ["dark", "light"], index=1)
 
         if preset == "Cavity only":
             show_streamlines = False
-            show_vectors = False
+            show_vectors = True
             show_head = False
             show_skin = False
             mesh_opacity = max(mesh_opacity, 0.7)
         elif preset == "Head + airway":
             show_skin = True
-            skin_opacity = min(max(skin_opacity, 0.28), 0.45)
-            mesh_opacity = max(mesh_opacity, 0.45)
-            streamline_width = min(streamline_width, 3.0)
-            show_vectors = False
+            skin_opacity = max(skin_opacity, 0.5)
+            mesh_opacity = min(mesh_opacity, 0.45)
+            streamline_width = min(streamline_width, 2.5)
+            show_vectors = True
+            vector_stride = min(vector_stride, 2)
+        elif preset == "Flow overlay":
+            show_skin = True
+            skin_opacity = min(skin_opacity, 0.35)
+            show_vectors = True
+            vector_stride = 1
         elif preset == "Cavity first":
             show_head = False
             show_skin = False
@@ -662,6 +695,7 @@ def main() -> None:
         max_vector_speed=vmax,
         ports=ports_lite,
         bg_mode=bg_mode,
+        max_vectors=max_vectors,
     )
     st.plotly_chart(fig3d, use_container_width=True)
     st.caption(

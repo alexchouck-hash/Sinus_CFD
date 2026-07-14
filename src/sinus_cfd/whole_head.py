@@ -33,12 +33,13 @@ from .boundary_conditions import (
 )
 from .physiology import PatientBreathing, summary_text
 from .pipeline import _mask_to_mesh
+from .edge_segment import run_edge_segmentation
 from .skin_and_nares import (
     detect_external_nares,
     extract_skin_shell,
     mesh_skin_surface,
 )
-from .tissues import TISSUE_LABELS, segment_tissues
+from .tissues import TISSUE_LABELS
 
 
 @dataclass
@@ -452,6 +453,96 @@ def _clip_superior_to_start(
     return out
 
 
+def _ports_from_edge_nares(
+    airway: np.ndarray,
+    spacing_xyz: tuple[float, float, float],
+    origin_xyz: tuple[float, float, float],
+    superior_is_high_z: bool,
+    y_anterior_is_low: bool,
+    naris_L: tuple[int, int, int] | None,
+    naris_R: tuple[int, int, int] | None,
+    nose_tip: tuple[int, int, int] | None,
+) -> tuple[list[Port], list[str], dict[str, Any]]:
+    """Build BC ports from edge-detected skin nares + caudal trachea."""
+    warnings: list[str] = []
+    meta: dict[str, Any] = {
+        "nose_tip_zyx": list(nose_tip) if nose_tip else None,
+        "y_anterior_is_low": y_anterior_is_low,
+    }
+    zz, yy, xx = np.where(airway)
+    if len(zz) == 0:
+        raise ValueError("Empty airway")
+    pts = np.column_stack(
+        [
+            xx * spacing_xyz[0] + origin_xyz[0],
+            yy * spacing_xyz[1] + origin_xyz[1],
+            zz * spacing_xyz[2] + origin_xyz[2],
+        ]
+    )
+    face = float(np.prod(sorted(spacing_xyz)[:2]))
+    if superior_is_high_z:
+        tip_idx = zz <= np.percentile(zz, 8)
+        trach_normal = [0.0, 0.0, -1.0]
+    else:
+        tip_idx = zz >= np.percentile(zz, 92)
+        trach_normal = [0.0, 0.0, 1.0]
+    trach_center = pts[tip_idx].mean(axis=0)
+    trach_area = float(max(int(tip_idx.sum()), 1) ** (2 / 3) * face)
+
+    ports: list[Port] = []
+    nrm = [0.0, 1.0 if y_anterior_is_low else -1.0, 0.0]
+    ox, oy, oz = origin_xyz
+    sx, sy, sz = spacing_xyz
+
+    def _add_naris(name: str, zyx: tuple[int, int, int] | None) -> None:
+        if zyx is None:
+            warnings.append(f"Missing edge-detected {name}")
+            return
+        iz, iy, ix = zyx
+        center = [ox + ix * sx, oy + iy * sy, oz + iz * sz]
+        ports.append(
+            Port(
+                name=name,
+                role="inlet",
+                center_mm=center,
+                area_mm2=80.0,
+                normal_xyz=nrm,
+                method="edge_nose_tip_skin_naris",
+                notes="External naris at nose tip (edge/geometry), not orbits.",
+            )
+        )
+        meta.setdefault("naris_points", []).append(
+            {
+                "name": name,
+                "center_mm": center,
+                "skin_voxel_zyx": list(zyx),
+                "depth_mm": 0.0,
+            }
+        )
+
+    _add_naris("left_nostril", naris_L)
+    _add_naris("right_nostril", naris_R)
+    if len([p for p in ports if p.role == "inlet"]) < 2 and nose_tip is not None:
+        # Split tip left/right by a few mm in x
+        iz, iy, ix = nose_tip
+        _add_naris("left_nostril", (iz, iy, min(ix + 8, airway.shape[2] - 1)))
+        _add_naris("right_nostril", (iz, iy, max(ix - 8, 0)))
+        warnings.append("Nares inferred by splitting nose tip L/R.")
+
+    ports.append(
+        Port(
+            name="trachea",
+            role="outlet",
+            center_mm=trach_center.tolist(),
+            area_mm2=trach_area,
+            normal_xyz=trach_normal,
+            method="whole_head_caudal_airway",
+            notes="Caudal airway outlet (trachea direction).",
+        )
+    )
+    return ports, warnings, meta
+
+
 def detect_ports_whole_head(
     hu: np.ndarray,
     body: np.ndarray,
@@ -572,25 +663,42 @@ def process_whole_head(
     spacing = tuple(float(v) for v in image.GetSpacing())
     origin = tuple(float(v) for v in image.GetOrigin())
 
-    print(f"[{case_id}] multi-tissue segmentation…")
-    tissues_full = segment_tissues(
-        hu_full,
-        hu_params={"air_max": air_hu_max},
-        body_hu_min=body_hu_min,
-    )
-    body_full = tissues_full.body
-
-    superior_is_high_z, orient_method = infer_superior_is_high_z(image, body_full)
+    superior_is_high_z, orient_method = infer_superior_is_high_z(image, None)
     notes.append(f"Orientation: {orient_method}")
     print(f"[{case_id}] {orient_method}")
 
-    bb = _bbox(body_full, margin=6)
+    print(f"[{case_id}] edge-aware tissue + air segmentation (crop shoulders)…")
+    seg = run_edge_segmentation(
+        hu_full,
+        superior_is_high_z=superior_is_high_z,
+        body_hu_min=body_hu_min,
+        air_hu_max=air_hu_max,
+    )
+    notes.extend(seg.notes)
+
+    # Crop to head bbox (shoulders already removed from body mask)
+    bb = seg.head_bbox_zyx
     crop_origin_zyx = [bb[0].start, bb[1].start, bb[2].start]
     hu = hu_full[bb]
-    body = body_full[bb]
-    air_all = tissues_full.air[bb]
-    bone = tissues_full.bone[bb]
-    labels_crop = tissues_full.labels[bb]
+    body = seg.body[bb]
+    air_all = seg.air[bb]
+    bone = seg.bone[bb]
+    labels_crop = seg.labels[bb]
+    edge_crop = seg.edge_magnitude[bb]
+
+    # Remap landmark coords into crop space
+    def _to_crop(zyx: tuple[int, int, int] | None) -> tuple[int, int, int] | None:
+        if zyx is None:
+            return None
+        return (
+            zyx[0] - crop_origin_zyx[0],
+            zyx[1] - crop_origin_zyx[1],
+            zyx[2] - crop_origin_zyx[2],
+        )
+
+    nose_tip_c = _to_crop(seg.nose_tip_zyx)
+    naris_L_c = _to_crop(seg.naris_left_zyx)
+    naris_R_c = _to_crop(seg.naris_right_zyx)
 
     origin_crop = (
         origin[0] + crop_origin_zyx[2] * spacing[0],
@@ -599,9 +707,11 @@ def process_whole_head(
     )
 
     print(
-        f"[{case_id}] crop zyx={hu.shape} body={int(body.sum()):,} "
-        f"air={int(air_all.sum()):,} bone={int(bone.sum()):,}"
+        f"[{case_id}] head crop zyx={hu.shape} body={int(body.sum()):,} "
+        f"air={int(air_all.sum()):,} bone={int(bone.sum()):,} "
+        f"shoulder_z0={seg.shoulder_crop_z0}"
     )
+    print(f"[{case_id}] nose_tip={nose_tip_c} naris_L={naris_L_c} naris_R={naris_R_c}")
     print(f"[{case_id}] selecting nasal→trachea path (caudal)…")
     airway, path_info = select_nasal_to_trachea_path(
         air_all, body, hu, bone, superior_is_high_z=superior_is_high_z
@@ -615,9 +725,9 @@ def process_whole_head(
         "Mouth closed: domain is nasal path to caudal outlet; oral cavity excluded when separable."
     )
     notes.append(
-        "Tissue classes: exterior=0, air=1, soft_tissue=2, cartilage=3, bone=4 "
-        f"({', '.join(TISSUE_LABELS.values())})."
+        "Edge-aware tissue classes: exterior=0, air=1, soft_tissue=2, cartilage=3, bone=4."
     )
+    notes.append("Shoulders cropped from body mask using inferior cross-section filter.")
 
     def _write_arr(arr: np.ndarray, name: str, dtype=np.uint8) -> Path:
         img = sitk.GetImageFromArray(arr.astype(dtype))
@@ -632,23 +742,24 @@ def process_whole_head(
     _write_arr(airway.astype(np.uint8), f"{case_id}_airway_mask.nrrd")
     _write_arr(air_all.astype(np.uint8), f"{case_id}_all_interior_air.nrrd")
     _write_arr(labels_crop, f"{case_id}_tissues.nrrd", dtype=np.int16)
-    # Separate class masks for debugging
     _write_arr(bone.astype(np.uint8), f"{case_id}_bone_mask.nrrd")
     _write_arr((labels_crop == 2).astype(np.uint8), f"{case_id}_soft_tissue_mask.nrrd")
+    _write_arr((edge_crop * 255).astype(np.uint8), f"{case_id}_edges.nrrd")
 
     print(f"[{case_id}] meshing skin surface + head solid + airway…")
     skin_shell = extract_skin_shell(body, thickness=1)
     _write_arr(skin_shell.astype(np.uint8), f"{case_id}_skin_shell_mask.nrrd")
 
     try:
+        # Slightly less smoothing keeps facial features (nose) readable
         skin_mesh = mesh_skin_surface(
-            body, spacing, origin_crop, smooth_sigma=0.9, level=0.5
+            body, spacing, origin_crop, smooth_sigma=0.55, level=0.45
         )
         skin_mesh = _decimate(skin_mesh, mesh_decimate_skin)
         skin_stl = output_dir / f"{case_id}_skin.stl"
         skin_mesh.export(skin_stl)
         notes.append(
-            f"Skin surface mesh: {len(skin_mesh.faces):,} faces (outer filled-body isosurface)."
+            f"Skin surface mesh: {len(skin_mesh.faces):,} faces (head-only, shoulders cropped)."
         )
         print(f"[{case_id}] skin mesh faces={len(skin_mesh.faces):,}")
     except Exception as exc:
@@ -672,14 +783,16 @@ def process_whole_head(
     airway_mesh.export(airway_stl)
     airway_mesh_full.export(output_dir / f"{case_id}_airway_full.stl")
 
-    ports, port_warnings, port_meta = detect_ports_whole_head(
-        hu=hu,
-        body=body,
+    # Ports from edge-detected external nares + caudal trachea
+    ports, port_warnings, port_meta = _ports_from_edge_nares(
         airway=airway,
-        interior_air=air_all,
         spacing_xyz=spacing,
         origin_xyz=origin_crop,
         superior_is_high_z=superior_is_high_z,
+        y_anterior_is_low=seg.y_anterior_is_low,
+        naris_L=naris_L_c,
+        naris_R=naris_R_c,
+        nose_tip=nose_tip_c,
     )
     notes.extend(port_warnings)
     for p in ports:
