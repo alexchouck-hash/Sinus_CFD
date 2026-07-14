@@ -68,9 +68,14 @@ def _port_seed_mask(
     spacing_xyz: tuple[float, float, float],
     origin_xyz: tuple[float, float, float],
     airway: np.ndarray,
-    radius_mm: float = 6.0,
+    radius_mm: float = 8.0,
 ) -> np.ndarray:
-    """Spherical seed around a port center, restricted to airway."""
+    """
+    Spherical seed around a port center, restricted to airway.
+
+    Skin-surface naris centers may lie just outside the lumen; we always fall
+    back to the nearest airway voxels so inlet/outlet BCs remain inside the fluid.
+    """
     zz, yy, xx = np.indices(shape_zyx)
     sx, sy, sz = spacing_xyz
     ox, oy, oz = origin_xyz
@@ -81,19 +86,23 @@ def _port_seed_mask(
     dist2 = (px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2
     seed = (dist2 <= radius_mm**2) & airway
     if not seed.any():
-        # Fallback: nearest airway voxel to center
+        # Nearest airway voxels to the port (handles external skin naris centers)
         idx = _phys_to_index(
             np.array([center_mm], dtype=float),
             spacing_xyz,
             origin_xyz,
             shape_zyx,
         )[0]
-        # Grow a small ball of airway around nearest airway point
         air_idx = np.column_stack(np.where(airway))
-        d = np.linalg.norm(air_idx - idx, axis=1)
-        nearest = air_idx[int(np.argmin(d))]
+        if len(air_idx) == 0:
+            return seed
+        d = np.linalg.norm(air_idx.astype(float) - idx.astype(float), axis=1)
+        # Take a neighborhood of nearest airway voxels
+        k = min(80, len(d))
+        nearest_ids = np.argpartition(d, k - 1)[:k]
         seed = np.zeros(shape_zyx, dtype=bool)
-        seed[tuple(nearest)] = True
+        for j in nearest_ids:
+            seed[tuple(air_idx[j])] = True
         seed = ndi.binary_dilation(seed, iterations=2) & airway
     return seed
 
