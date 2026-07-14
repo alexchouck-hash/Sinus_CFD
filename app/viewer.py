@@ -71,6 +71,8 @@ def load_case(case_id: str) -> dict:
 
     stl_path = case_dir / f"{case_id}_airway.stl"
     out["stl_path"] = str(stl_path) if stl_path.is_file() else None
+    head_stl = case_dir / f"{case_id}_head.stl"
+    out["head_stl_path"] = str(head_stl) if head_stl.is_file() else None
 
     bc_path = case_dir / f"{case_id}_boundary_conditions.json"
     if bc_path.is_file():
@@ -78,6 +80,13 @@ def load_case(case_id: str) -> dict:
             out["bc"] = json.load(f)
     else:
         out["bc"] = {}
+
+    stats_path = case_dir / f"{case_id}_stats.json"
+    if stats_path.is_file():
+        with stats_path.open(encoding="utf-8") as f:
+            out["stats"] = json.load(f)
+    else:
+        out["stats"] = {}
 
     return out
 
@@ -210,8 +219,53 @@ def _mesh_wireframe_trace(mesh, max_edges: int = 8000, color: str = "#d8e6f0") -
     )
 
 
+def _add_surface_mesh(
+    fig: go.Figure,
+    mesh,
+    *,
+    name: str,
+    color: str,
+    opacity: float,
+    show_wireframe: bool,
+    edge_color: str,
+    wireframe_max_edges: int = 6000,
+) -> None:
+    v = mesh.vertices
+    f = mesh.faces
+    fig.add_trace(
+        go.Mesh3d(
+            x=v[:, 0],
+            y=v[:, 1],
+            z=v[:, 2],
+            i=f[:, 0],
+            j=f[:, 1],
+            k=f[:, 2],
+            color=color,
+            opacity=float(np.clip(opacity, 0.02, 1.0)),
+            name=name,
+            flatshading=False,
+            lighting=dict(
+                ambient=0.55,
+                diffuse=0.85,
+                specular=0.35,
+                roughness=0.45,
+                fresnel=0.15,
+            ),
+            lightposition=dict(x=80, y=120, z=200),
+            hoverinfo="skip",
+            showlegend=True,
+        )
+    )
+    if show_wireframe:
+        wf = _mesh_wireframe_trace(mesh, max_edges=wireframe_max_edges, color=edge_color)
+        if wf is not None:
+            wf.name = f"{name} edges"
+            fig.add_trace(wf)
+
+
 def _fig_3d(
     mesh,
+    head_mesh,
     streamlines: list,
     ux: np.ndarray,
     uy: np.ndarray,
@@ -220,6 +274,8 @@ def _fig_3d(
     airway: np.ndarray,
     spacing: np.ndarray,
     origin: np.ndarray,
+    show_head: bool,
+    head_opacity: float,
     show_mesh: bool,
     mesh_opacity: float,
     show_wireframe: bool,
@@ -236,42 +292,36 @@ def _fig_3d(
     scene_bg = "#1a1f2b" if dark else "#f4f6f8"
     paper_bg = "#0e1117" if dark else "#ffffff"
     font_c = "#fafafa" if dark else "#111111"
-    mesh_color = "#7eb6d9"  # readable blue-gray
+    mesh_color = "#5ec8ff"  # airway cyan
+    head_color = "#c4a484"  # soft skin / solid head
     edge_color = "#e8f1f8" if dark else "#1a3a52"
+    head_edge = "#8b7355" if dark else "#5c4033"
     stream_width = float(streamline_width)
 
-    # --- Cavity surface first (drawn under flow overlays) ---
-    if show_mesh and mesh is not None:
-        v = mesh.vertices
-        f = mesh.faces
-        fig.add_trace(
-            go.Mesh3d(
-                x=v[:, 0],
-                y=v[:, 1],
-                z=v[:, 2],
-                i=f[:, 0],
-                j=f[:, 1],
-                k=f[:, 2],
-                color=mesh_color,
-                opacity=float(np.clip(mesh_opacity, 0.05, 1.0)),
-                name="Airway cavity",
-                flatshading=False,
-                lighting=dict(
-                    ambient=0.55,
-                    diffuse=0.85,
-                    specular=0.35,
-                    roughness=0.45,
-                    fresnel=0.15,
-                ),
-                lightposition=dict(x=80, y=120, z=200),
-                hoverinfo="skip",
-                showlegend=True,
-            )
+    # --- Head solid (outer shell) — semi-transparent ---
+    if show_head and head_mesh is not None:
+        _add_surface_mesh(
+            fig,
+            head_mesh,
+            name="Head (solid)",
+            color=head_color,
+            opacity=head_opacity,
+            show_wireframe=False,
+            edge_color=head_edge,
         )
-        if show_wireframe:
-            wf = _mesh_wireframe_trace(mesh, color=edge_color)
-            if wf is not None:
-                fig.add_trace(wf)
+
+    # --- Airway cavity ---
+    if show_mesh and mesh is not None:
+        _add_surface_mesh(
+            fig,
+            mesh,
+            name="Airway cavity",
+            color=mesh_color,
+            opacity=mesh_opacity,
+            show_wireframe=show_wireframe,
+            edge_color=edge_color,
+            wireframe_max_edges=5000,
+        )
 
     # --- Streamlines (thinner by default so mesh stays primary) ---
     if show_streamlines:
@@ -407,20 +457,26 @@ def main() -> None:
             )
             return
 
-        case_id = st.selectbox("Case ID", cases, index=0)
+        # Prefer whole-head case when present
+        default_idx = 0
+        if "VisibleHuman_Head" in cases:
+            default_idx = cases.index("VisibleHuman_Head")
+        case_id = st.selectbox("Case ID", cases, index=default_idx)
         st.header("3D display")
         preset = st.radio(
             "Preset",
-            ["Cavity first", "Flow overlay", "Cavity only"],
+            ["Head + airway", "Cavity first", "Flow overlay", "Cavity only"],
             index=0,
-            help="Cavity first emphasizes the semi-transparent model.",
+            help="Head + airway: semi-transparent solid head with airway inside.",
         )
-        show_mesh = st.checkbox("Show cavity mesh", value=True)
-        mesh_opacity = st.slider("Cavity opacity", 0.15, 1.0, 0.62, 0.01)
-        show_wireframe = st.checkbox("Cavity wireframe edges", value=True)
+        show_head = st.checkbox("Show head solid", value=True)
+        head_opacity = st.slider("Head opacity", 0.05, 0.85, 0.28, 0.01)
+        show_mesh = st.checkbox("Show airway cavity", value=True)
+        mesh_opacity = st.slider("Airway opacity", 0.15, 1.0, 0.55, 0.01)
+        show_wireframe = st.checkbox("Airway wireframe edges", value=False)
         show_streamlines = st.checkbox(
             "Streamlines (curved)",
-            value=(preset != "Cavity only"),
+            value=(preset not in ("Cavity only",)),
         )
         streamline_width = st.slider("Streamline width", 1.0, 8.0, 2.5, 0.5)
         show_vectors = st.checkbox(
@@ -433,9 +489,16 @@ def main() -> None:
         if preset == "Cavity only":
             show_streamlines = False
             show_vectors = False
+            show_head = False
             mesh_opacity = max(mesh_opacity, 0.7)
+        elif preset == "Head + airway":
+            show_head = True
+            head_opacity = min(max(head_opacity, 0.22), 0.40)
+            mesh_opacity = max(mesh_opacity, 0.45)
+            streamline_width = min(streamline_width, 3.0)
+            show_vectors = False
         elif preset == "Cavity first":
-            # Keep mesh readable; flow is secondary
+            show_head = False
             mesh_opacity = max(mesh_opacity, 0.55)
             streamline_width = min(streamline_width, 3.0)
 
@@ -491,17 +554,24 @@ def main() -> None:
     st.plotly_chart(fig2d, use_container_width=True)
 
     # ---- 3D ----
-    st.subheader("3D airway + airflow")
+    st.subheader("3D head + airway + airflow")
     mesh = None
+    head_mesh = None
     if data.get("stl_path"):
         try:
-            mesh = _load_mesh_decimated(data["stl_path"])
+            mesh = _load_mesh_decimated(data["stl_path"], target_faces=12000)
         except Exception as exc:
-            st.warning(f"Could not load STL: {exc}")
+            st.warning(f"Could not load airway STL: {exc}")
+    if data.get("head_stl_path"):
+        try:
+            head_mesh = _load_mesh_decimated(data["head_stl_path"], target_faces=18000)
+        except Exception as exc:
+            st.warning(f"Could not load head STL: {exc}")
+    elif show_head:
+        st.info("No head solid for this case (NasalSeg FOV). Use VisibleHuman_Head.")
 
     streamlines = data["streamlines"] if show_streamlines else []
     ports = bc.get("ports", [])
-    # Drop huge face_indices from hover noise — ports already stripped in json for centers
     ports_lite = [
         {
             "name": p.get("name"),
@@ -513,6 +583,7 @@ def main() -> None:
 
     fig3d = _fig_3d(
         mesh=mesh,
+        head_mesh=head_mesh,
         streamlines=streamlines if show_streamlines else [],
         ux=data["ux"],
         uy=data["uy"],
@@ -521,6 +592,8 @@ def main() -> None:
         airway=airway,
         spacing=data["spacing"],
         origin=data["origin"],
+        show_head=show_head and head_mesh is not None,
+        head_opacity=head_opacity,
         show_mesh=show_mesh,
         mesh_opacity=mesh_opacity,
         show_wireframe=show_wireframe,
@@ -534,8 +607,9 @@ def main() -> None:
     )
     st.plotly_chart(fig3d, use_container_width=True)
     st.caption(
-        "Tip: use preset **Cavity first** or raise **Cavity opacity**. "
-        "Wireframe edges outline the airway. Turn off velocity cones if they dominate."
+        "Tip: preset **Head + airway** — solid head shell (semi-transparent) with "
+        "airway inside. Raise head opacity to see the face/skull outline; lower it "
+        "to see streamlines through the head."
     )
 
     # ---- BC summary ----

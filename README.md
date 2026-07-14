@@ -21,7 +21,8 @@ This project aims to take a CT scan of a human head, reconstruct the nasal cavit
 | Surface export (STL) | Working |
 | BCs: nostrils in / trachea out / mouth closed | Working (physiology + port detection) |
 | Approximate airflow velocity field | Working (potential-flow preview) |
-| **Interactive viewer** (tri-planar + 3D streamlines) | Working (`app/viewer.py`) |
+| **Whole-head CT** (Visible Human) | Working — solid head + airway + trachea outlet |
+| **Interactive viewer** (semi-transparent head + airway) | Working (`app/viewer.py`) |
 | Volume mesh + OpenFOAM CFD | Not yet |
 | Ostium pathways / mucus / CRS·NAO·NVC | Roadmap (`docs/product_roadmap.md`) |
 | Virtual surgery variants | Not yet |
