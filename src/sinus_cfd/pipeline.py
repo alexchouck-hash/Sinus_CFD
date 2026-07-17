@@ -170,6 +170,32 @@ def _clean_mask(
     return keep[labeled]
 
 
+def build_hu_threshold_mask(
+    hu_zyx: np.ndarray,
+    hu_max: float = -400.0,
+    hu_min: float = -1024.0,
+    min_component_voxels: int = 200,
+    max_gap_voxels: int = 28,
+) -> np.ndarray:
+    """
+    Classical threshold + region-grow airway mask from HU alone (no expert labels).
+
+    Steps: HU threshold -> morphological closing -> bridge small gaps through
+    air (region-grow) -> drop components smaller than ``min_component_voxels``.
+    Shared by ``process_case(mask_source="hu")`` and the NasalSeg Dice evaluation.
+    """
+    mask = _hu_air_mask(hu_zyx, hu_max=hu_max, hu_min=hu_min)
+    return _clean_mask(
+        mask,
+        min_component_voxels=min_component_voxels,
+        keep_all_large_components=True,
+        hu_zyx=hu_zyx,
+        hu_max=hu_max,
+        hu_min=hu_min,
+        max_gap_voxels=max_gap_voxels,
+    )
+
+
 def _mask_to_mesh(
     mask_zyx: np.ndarray,
     spacing_xyz: tuple[float, float, float],
