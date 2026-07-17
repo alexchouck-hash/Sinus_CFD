@@ -69,6 +69,43 @@ def _nrrd_to_nifti(src: Path, dst: Path) -> None:
     sitk.WriteImage(img, str(dst), useCompression=True)
 
 
+def _geometry_disagrees(a: sitk.Image, b: sitk.Image, atol: float = 1e-3) -> bool:
+    """True if spacing/origin/direction differ by more than float rounding noise."""
+    return (
+        not np.allclose(a.GetSpacing(), b.GetSpacing(), atol=atol)
+        or not np.allclose(a.GetOrigin(), b.GetOrigin(), atol=atol)
+        or not np.allclose(a.GetDirection(), b.GetDirection(), atol=1e-6)
+    )
+
+
+def _write_label_nifti(lab_src: Path, dst: Path, ref_img: sitk.Image, cid: str) -> None:
+    """
+    Write the label volume with the paired image's spacing/origin/direction.
+
+    A handful of NasalSeg label NRRDs carry a spacing/origin/direction that
+    genuinely disagrees with their paired image (14/130 cases as of this
+    dataset release) even though the voxel array size always matches.
+    nnU-Net's integrity check treats that as a fatal error. Since sizes
+    agree, the intended correspondence is voxel-index-to-voxel-index, so we
+    always stamp the image's geometry onto the label rather than trust the
+    label's own (sometimes wrong) header — this also sidesteps NIfTI's
+    float32 header vs NRRD's float64 introducing spurious rounding
+    "mismatches" on every case if compared after a round-trip.
+    """
+    lab = sitk.ReadImage(str(lab_src))
+    if lab.GetSize() != ref_img.GetSize():
+        raise ValueError(
+            f"{cid}: label/image voxel array size mismatch "
+            f"({lab.GetSize()} vs {ref_img.GetSize()}) — cannot assume "
+            "index correspondence, skipping geometry fix-up."
+        )
+    if _geometry_disagrees(lab, ref_img):
+        print(f"  {cid}: label geometry disagreed with image header — copied image geometry onto label")
+    lab.CopyInformation(ref_img)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(lab, str(dst), useCompression=True)
+
+
 def _remap_airway(lab: sitk.Image) -> sitk.Image:
     a = sitk.GetArrayFromImage(lab).astype(np.uint8)
     out = np.zeros_like(a)
@@ -128,12 +165,18 @@ def prepare(
         img_dst = images_tr / f"{cid}_0000.nii.gz"
         lab_dst = labels_tr / f"{cid}.nii.gz"
         _nrrd_to_nifti(img_src, img_dst)
+        ref_img = sitk.ReadImage(str(img_dst))
         if remap == "airway":
             lab_img = sitk.ReadImage(str(lab_src))
+            if lab_img.GetSize() != ref_img.GetSize():
+                raise ValueError(f"{cid}: label/image size mismatch {lab_img.GetSize()} vs {ref_img.GetSize()}")
+            if _geometry_disagrees(lab_img, ref_img):
+                print(f"  {cid}: label geometry disagreed with image header — copied image geometry onto label")
+            lab_img.CopyInformation(ref_img)
             lab_img = _remap_airway(lab_img)
             sitk.WriteImage(lab_img, str(lab_dst), useCompression=True)
         else:
-            _nrrd_to_nifti(lab_src, lab_dst)
+            _write_label_nifti(lab_src, lab_dst, ref_img, cid)
         if (i + 1) % 20 == 0 or i + 1 == len(cases):
             print(f"  {i + 1}/{len(cases)}")
 

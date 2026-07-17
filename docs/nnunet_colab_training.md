@@ -34,6 +34,18 @@ your Google Drive, e.g. `MyDrive/sinus_cfd/NasalSeg_nnUNet_raw.zip`. That
 path is what the notebook expects by default (`DRIVE_ZIP` variable, edit it
 if you put it elsewhere).
 
+**If you already uploaded a zip and hit `nnUNetv2_plan_and_preprocess`
+errors** (`Spacing mismatch between segmentation and corresponding images`,
+or a wall of `Origin`/`Direction mismatch` warnings followed by
+`RuntimeError: Some images have errors`): that was a real bug in the
+original conversion, now fixed — 12-14 of the 130 NasalSeg label NRRDs carry
+a spacing/origin/direction in their own header that disagrees with the
+paired image, even though the voxel array size always matches. `prepare_nnunet_nasalseg.py`
+now stamps the image's geometry onto the label before writing (safe, since
+size always agrees — the intended correspondence is voxel-index-to-voxel-index,
+not the label's own header). **Re-run** `prepare_nnunet_nasalseg.py`, re-zip,
+and **re-upload to Drive** before retrying the notebook.
+
 ## Step 3 — run the notebook
 
 Open `notebooks/train_nnunet_colab.ipynb` in Colab — either upload it
