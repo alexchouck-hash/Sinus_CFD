@@ -74,6 +74,9 @@ After data changes: hard-refresh browser; use sidebar **Reload data** if cache i
 | `open_path.py` | Most-open geodesics, frontal instrument corridors, restriction tubes |
 | `sinus_anatomy.py` | Heuristic frontal / sphenoid / maxillary labels |
 | `surgical_zones.py` | IT / MT / septum classification + treatment ranking |
+| `geometry_metrics.py` | Dual-side CSA + MCA reports |
+| `cfd_metrics.py` | ΔP, resistance, L/R inlet allocation from flow.npz |
+| `virtual_surgery.py` | Virtual IT lumen edit + pre/post compare |
 | `openfoam_import.py` | Map simpleFoam U onto CT grid |
 
 ## Key outputs (`outputs/VisibleHuman_Head/`)
@@ -113,6 +116,7 @@ Large volumes and `outputs/**` are **not** in git. Agents must regenerate or use
 |-----|---------|
 | `docs/architecture.md` | Full system architecture + data flow (current implementation) |
 | `docs/architecture_and_roadmap.md` | Field methodology, CFD quality bar, staged plan |
+| `docs/strategy_mca_cfd_virtual.md` | MCA + CFD metrics + virtual IT (current strategy branch) |
 | `docs/product_roadmap.md` | Product milestones |
 | `docs/viewer.md` | Viewer layers and toggles |
 | `docs/surgical_guidance.md` | Zones, frontal paths, treatments |

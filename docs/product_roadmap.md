@@ -33,11 +33,13 @@ engineering plan), see **`docs/architecture_and_roadmap.md`**.
 
 | Item | Notes |
 |------|--------|
+| **MCA / CSA geometry report** | **In progress** — `scripts/compute_geometry_metrics.py` (branch `feature/mca-cfd-metrics-virtual-surgery`) |
+| **CFD ΔP / R / L-R flux** | **In progress** — `scripts/compute_cfd_metrics.py` |
+| **Virtual IT reduction loop** | **In progress** — `scripts/run_virtual_it_reduction.py` (geometry pre/post; foam re-solve later) |
 | Patient CT upload path | De-ID DICOM → same pipeline as VH |
 | Better sinus/turbinate labels | nnU-Net or TotalSegmentator-class models |
-| Virtual surgery: edit mask → re-run pathlines/CFD | Compare pre/post Q and high-\|u\| volume |
-| Calibrated resistance / pressure drop metrics | Beyond visualization speed maps |
-| OpenFOAM dual-inlet balance checks | Explicit 50/50 flux reporting |
+| Virtual surgery + re-mesh OpenFOAM | Full remesh/solve after mask edit |
+| Prism boundary-layer mesh quality | Needed for trusted WSS / heat flux |
 
 ---
 
