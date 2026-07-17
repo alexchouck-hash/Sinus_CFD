@@ -113,3 +113,35 @@ Two real paths forward, not yet tried:
    the more reliable route, since distinguishing nasal cavity from sinus air
    by geometry alone is exactly the kind of ambiguous case learned
    segmentation handles better than hand-tuned heuristics.
+
+## nnU-Net results (pending)
+
+Path 2 is underway: `nnUNetTrainer_250epochs`, fold 0 of `3d_fullres`, on
+Colab (see `docs/nnunet_colab_training.md`). Once training finishes,
+`scripts/compare_nnunet_vs_classical.py` scores it against the same ground
+truth and classical baseline as above, on nnU-Net's own held-out fold-0
+validation cases — fill in from that script's printed summary:
+
+| Approach | mean Dice (labels 1-3) |
+|---|---:|
+| classical threshold + largest components (hu_max=-350) | 0.254 |
+| nnU-Net (`nnUNetTrainer_250epochs`, fold 0) | *pending* |
+
+nnU-Net per-structure Dice (mean) — this is the number that actually tests
+whether the model learned to separate nasal cavity from sinus, where every
+classical approach above failed to:
+
+| Structure | mean Dice |
+|---|---:|
+| left_nasal_cavity | *pending* |
+| right_nasal_cavity | *pending* |
+| nasopharynx | *pending* |
+| left_maxillary_sinus | *pending* |
+| right_maxillary_sinus | *pending* |
+
+Once trained, the model is also wired into the working pipeline as
+`process_case(..., mask_source="nnunet")` (`src/sinus_cfd/nnunet_infer.py`),
+which — unlike `mask_source="labels"` — needs no expert labels at all. That's
+what makes it usable on a real new-patient CT rather than only on NasalSeg's
+130 pre-labeled cases: the prediction supplies both the airway mask and the
+label map boundary-condition port placement needs.

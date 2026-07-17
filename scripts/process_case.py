@@ -41,9 +41,26 @@ def main() -> int:
     )
     parser.add_argument(
         "--mask-source",
-        choices=("labels", "hu", "labels_and_hu"),
+        choices=("labels", "hu", "labels_and_hu", "nnunet"),
         default="labels",
         help="How to build the airway mask (default: labels)",
+    )
+    parser.add_argument(
+        "--nnunet-dataset-id", type=int, default=501,
+        help="nnU-Net dataset id (default: 501 = NasalSeg)",
+    )
+    parser.add_argument(
+        "--nnunet-configuration", default="3d_fullres",
+        help="nnU-Net configuration (default: 3d_fullres)",
+    )
+    parser.add_argument("--nnunet-fold", type=int, default=0, help="nnU-Net fold (default: 0)")
+    parser.add_argument(
+        "--nnunet-trainer", default="nnUNetTrainer_250epochs",
+        help="nnU-Net trainer class name (default: nnUNetTrainer_250epochs)",
+    )
+    parser.add_argument(
+        "--nnunet-plans", default="nnUNetPlans",
+        help="nnU-Net plans identifier (default: nnUNetPlans)",
     )
     parser.add_argument(
         "--include-sinuses",
@@ -136,6 +153,11 @@ def main() -> int:
         hu_max=args.hu_max,
         breathing=breathing,
         write_bcs=not args.no_bcs,
+        nnunet_dataset_id=args.nnunet_dataset_id,
+        nnunet_configuration=args.nnunet_configuration,
+        nnunet_fold=args.nnunet_fold,
+        nnunet_trainer=args.nnunet_trainer,
+        nnunet_plans=args.nnunet_plans,
     )
     return 0
 

@@ -273,6 +273,11 @@ def process_case(
     breathing: PatientBreathing | None = None,
     write_bcs: bool = True,
     face_tag_radius_mm: float = 8.0,
+    nnunet_dataset_id: int = 501,
+    nnunet_configuration: str = "3d_fullres",
+    nnunet_fold: int = 0,
+    nnunet_trainer: str = "nnUNetTrainer_250epochs",
+    nnunet_plans: str = "nnUNetPlans",
 ) -> CaseStats:
     """
     Process one CT case into mask + STL surface + preview + BC setup.
@@ -283,9 +288,14 @@ def process_case(
       - Mouth: closed / blocked (excluded from fluid domain)
 
     mask_source:
-      - "labels": use expert NasalSeg labels (recommended)
+      - "labels": use expert NasalSeg labels (recommended when available)
       - "hu": HU air threshold only
       - "labels_and_hu": intersection of labels with HU air
+      - "nnunet": trained nnU-Net prediction (see docs/nnunet_colab_training.md).
+        Also supplies the predicted label map for boundary-condition port
+        placement, so this is the mask_source for CTs with no expert labels
+        at all (e.g. a new patient scan) — requires nnunetv2 installed and
+        nnUNet_results set, see sinus_cfd.nnunet_infer.
     """
     image_path = Path(image_path)
     if case_id is None:
@@ -323,6 +333,25 @@ def process_case(
         mask = _labels_to_mask(label_zyx, airway_labels) & _hu_air_mask(
             hu_zyx, hu_max=hu_max, hu_min=hu_min
         )
+    elif mask_source == "nnunet":
+        from .nnunet_infer import predict_labels
+
+        predicted_labels = predict_labels(
+            image,
+            dataset_id=nnunet_dataset_id,
+            configuration=nnunet_configuration,
+            fold=nnunet_fold,
+            trainer=nnunet_trainer,
+            plans=nnunet_plans,
+        )
+        # Use the prediction for BC port placement too when no expert labels
+        # were supplied — this is what lets the pipeline run on a CT with no
+        # ground truth at all.
+        if label_zyx is None:
+            label_zyx = predicted_labels
+            for val, name in LABEL_NAMES.items():
+                label_counts[name] = int((label_zyx == val).sum())
+        mask = _labels_to_mask(predicted_labels, airway_labels)
     else:
         raise ValueError(f"Unknown mask_source: {mask_source}")
 
