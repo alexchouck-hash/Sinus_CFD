@@ -32,9 +32,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.15.1-pink-fix-small-ports"
+APP_VERSION = "0.16.0-geometry-report"
 APP_VERSION_LABEL = (
-    "reddish translucent removal zones · smaller naris/trachea markers"
+    "geometry-report mode (per-side volume / MCA / L/R asymmetry) · "
+    "reddish translucent removal zones"
 )
 
 DEFAULT_CASE = "P001"
@@ -256,6 +257,104 @@ def list_cases() -> list[str]:
         if d.is_dir() and (d / f"{d.name}_flow.npz").is_file():
             cases.append(d.name)
     return cases
+
+
+def list_geometry_cases() -> list[str]:
+    """Cases with a Stage-2 geometry report (scripts/geometry_report.py output)."""
+    if not OUTPUTS.is_dir():
+        return []
+    return [
+        d.name
+        for d in sorted(OUTPUTS.iterdir())
+        if d.is_dir() and (d / f"{d.name}_geometry_report.json").is_file()
+    ]
+
+
+def load_geometry_report(case_id: str) -> dict | None:
+    path = OUTPUTS / case_id / f"{case_id}_geometry_report.json"
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def render_geometry_report() -> None:
+    """
+    Stage-2 per-side airway geometry: volume, minimal cross-sectional area
+    (MCA), and the L/R asymmetry that flags a unilaterally obstructed airway.
+    Reads scripts/geometry_report.py output from outputs/<case>/.
+    """
+    st.title("Sinus_CFD — Nasal Airway Geometry")
+    st.caption("Per-side volume · minimal cross-sectional area (MCA) · L/R asymmetry — no CFD")
+
+    geo_cases = list_geometry_cases()
+    if not geo_cases:
+        st.info(
+            "No geometry reports found under `outputs/`. Generate one with:\n\n"
+            "```\npy -3.12 scripts/geometry_report.py --case P001 --data-root data\n```"
+        )
+        return
+
+    case_id = st.selectbox("Case", geo_cases, index=0)
+    report = load_geometry_report(case_id)
+    if report is None:
+        st.error(f"Could not read geometry report for {case_id}.")
+        return
+
+    left = report["left"]
+    right = report["right"]
+    src = report.get("mask_source", "labels")
+    st.caption(f"Segmentation source: **{src}**")
+
+    # Headline: obstruction asymmetry
+    ratio = report.get("mca_ratio")
+    if ratio is not None and not (isinstance(ratio, float) and np.isnan(ratio)):
+        more = report.get("more_obstructed_side", "unknown")
+        if ratio >= 0.85:
+            verdict, color = "roughly symmetric", "normal"
+        elif ratio >= 0.6:
+            verdict, color = f"mild asymmetry — {more} side narrower", "off"
+        else:
+            verdict, color = f"marked asymmetry — {more} side obstructed", "inverse"
+        st.metric("L/R MCA ratio", f"{ratio:.2f}", verdict, delta_color=color)
+    else:
+        st.warning("L/R MCA ratio unavailable (one or both cavities absent).")
+
+    # Per-side metric tiles
+    c_left, c_right = st.columns(2)
+    for col, side, label in ((c_left, left, "Left"), (c_right, right, "Right")):
+        with col:
+            st.subheader(label)
+            if not side.get("present"):
+                st.warning("No lumen for this side.")
+                continue
+            st.metric("Volume", f"{side['volume_ml']:.1f} mL")
+            st.metric(
+                "MCA",
+                f"{side['mca_mm2']:.0f} mm²",
+                f"{side['mca_location']} · {side['mca_ap_position_mm']:.0f} mm from naris",
+                delta_color="off",
+            )
+
+    # Area-distance curve
+    img_path = OUTPUTS / case_id / f"{case_id}_area_profile.png"
+    if img_path.is_file():
+        st.image(str(img_path), caption="Cross-sectional area vs distance from anterior naris")
+
+    with st.expander("Method & caveats"):
+        st.markdown(
+            "- Area = actual lumen voxel count per coronal slice × pixel area "
+            "(faithful for the slit-shaped nasal valve, unlike a π·r² disk).\n"
+            "- Profiles are typically unimodal, so the MCA sits at an end of the "
+            "airway body (end narrowing, not a focal internal stenosis) — reported "
+            "honestly via the location fields.\n"
+            "- The **L/R MCA ratio is the most robust output**; on near-symmetric "
+            "cases the 'more obstructed side' can flip within noise.\n"
+            "- See `docs/stage2_geometry_metrics.md`."
+        )
+        st.json({k: v for k, v in report.items() if k not in ("left", "right")})
 
 
 # ---------------------------------------------------------------------------
@@ -1116,6 +1215,15 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+
+    mode = st.sidebar.radio(
+        "View",
+        ("Airflow demo", "Geometry report"),
+        help="Airflow: Visible Human flow demo. Geometry: per-side NasalSeg airway metrics (Stage 2).",
+    )
+    if mode == "Geometry report":
+        render_geometry_report()
+        return
 
     st.title("Sinus_CFD — Airflow Viewer")
     st.caption(f"`{APP_VERSION}` · {APP_VERSION_LABEL}")
