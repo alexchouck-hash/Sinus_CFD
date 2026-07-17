@@ -66,7 +66,8 @@ Open **http://127.0.0.1:8501**. Sidebar: toggle frontal paths and pink zones (IT
 | Doc | Audience |
 |-----|----------|
 | **[`AGENTS.md`](AGENTS.md)** | **Start here for AI agents** — pipeline, modules, conventions |
-| [`docs/architecture.md`](docs/architecture.md) | System architecture + data flow |
+| [`docs/architecture.md`](docs/architecture.md) | System architecture + data flow (what ships today) |
+| [`docs/architecture_and_roadmap.md`](docs/architecture_and_roadmap.md) | Methodology, CFD/mesh guidance, staged engineering plan |
 | [`docs/viewer.md`](docs/viewer.md) | Viewer layers and cache |
 | [`docs/surgical_guidance.md`](docs/surgical_guidance.md) | Frontal paths, zones, treatments |
 | [`docs/data-sources.md`](docs/data-sources.md) | NasalSeg vs Visible Human |

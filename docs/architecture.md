@@ -124,6 +124,8 @@ Agents and developers must run the pipeline locally to regenerate outputs.
 
 ## Related docs
 
+- [architecture_and_roadmap.md](architecture_and_roadmap.md) — methodology, CFD/mesh guidance, staged plan  
+- [product_roadmap.md](product_roadmap.md) — product milestones  
 - [viewer.md](viewer.md)  
 - [surgical_guidance.md](surgical_guidance.md)  
 - [data-sources.md](data-sources.md)  

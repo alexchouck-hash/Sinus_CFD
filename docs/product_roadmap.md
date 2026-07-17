@@ -24,6 +24,8 @@ Clinical decision-support (future): upload head CT → structured airway/sinus a
 | nnU-Net Dataset501 scaffold | Scaffold only |
 
 See **`AGENTS.md`** and **`docs/architecture.md`** for how to run the current stack.
+For methodology (segmentation thresholds, CFD mesh quality, clinical metrics, staged
+engineering plan), see **`docs/architecture_and_roadmap.md`**.
 
 ---
 

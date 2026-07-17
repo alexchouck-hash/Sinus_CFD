@@ -111,7 +111,9 @@ Large volumes and `outputs/**` are **not** in git. Agents must regenerate or use
 
 | Doc | Content |
 |-----|---------|
-| `docs/architecture.md` | Full system architecture + data flow |
+| `docs/architecture.md` | Full system architecture + data flow (current implementation) |
+| `docs/architecture_and_roadmap.md` | Field methodology, CFD quality bar, staged plan |
+| `docs/product_roadmap.md` | Product milestones |
 | `docs/viewer.md` | Viewer layers and toggles |
 | `docs/surgical_guidance.md` | Zones, frontal paths, treatments |
 | `docs/data-sources.md` | NasalSeg vs Visible Human |
