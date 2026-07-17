@@ -49,21 +49,28 @@ STRUCTURE_NAMES = {
 }
 
 
-def _resample_labels_to(ref: sitk.Image, moving: sitk.Image) -> sitk.Image:
-    """Nearest-neighbour resample a label map onto ref's grid (no interpolation)."""
-    if (
-        moving.GetSize() == ref.GetSize()
-        and np.allclose(moving.GetSpacing(), ref.GetSpacing(), atol=1e-3)
-        and np.allclose(moving.GetOrigin(), ref.GetOrigin(), atol=1e-3)
-    ):
-        # Same grid already — just align headers to avoid float noise tripping sitk.
-        moving.CopyInformation(ref)
-        return moving
+def _aligned_pred_array(truth_img: sitk.Image, pred_img: sitk.Image) -> np.ndarray:
+    """
+    Return the prediction as a (z, y, x) array on the truth's voxel grid.
+
+    When the voxel array sizes match — always true across NasalSeg, since
+    nnU-Net writes predictions on the native image grid and image/label sizes
+    always agree — the intended correspondence is voxel-index-to-voxel-index,
+    exactly what training used. We compare by index rather than by physical
+    coordinates. This matters because ~14 NasalSeg label NRRDs carry a
+    spacing/origin/direction in their header that disagrees with the paired
+    image (e.g. a flipped z-direction or a 220 mm origin shift); a
+    physical-coordinate resample would misalign the prediction against those
+    and report a spurious ~0 Dice. Only when sizes genuinely differ do we fall
+    back to a nearest-neighbour resample onto the truth grid.
+    """
+    if pred_img.GetSize() == truth_img.GetSize():
+        return sitk.GetArrayFromImage(pred_img)
     rs = sitk.ResampleImageFilter()
-    rs.SetReferenceImage(ref)
+    rs.SetReferenceImage(truth_img)
     rs.SetInterpolator(sitk.sitkNearestNeighbor)
     rs.SetDefaultPixelValue(0)
-    return rs.Execute(moving)
+    return sitk.GetArrayFromImage(rs.Execute(pred_img))
 
 
 def _find_prediction(pred_dir: Path, cid: str) -> Path | None:
@@ -132,8 +139,7 @@ def main() -> int:
         hu = sitk.GetArrayFromImage(sitk.ReadImage(str(image_path)))
 
         pred_img = sitk.ReadImage(str(_find_prediction(args.pred_dir, cid)))
-        pred_img = _resample_labels_to(truth_img, pred_img)
-        pred = sitk.GetArrayFromImage(pred_img)
+        pred = _aligned_pred_array(truth_img, pred_img)
 
         nnunet_airway = dice_coefficient(
             labels_to_mask(pred, airway), labels_to_mask(truth, airway)

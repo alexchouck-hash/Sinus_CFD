@@ -114,32 +114,46 @@ Two real paths forward, not yet tried:
    by geometry alone is exactly the kind of ambiguous case learned
    segmentation handles better than hand-tuned heuristics.
 
-## nnU-Net results (pending)
+## nnU-Net results
 
-Path 2 is underway: `nnUNetTrainer_250epochs`, fold 0 of `3d_fullres`, on
-Colab (see `docs/nnunet_colab_training.md`). Once training finishes,
-`scripts/compare_nnunet_vs_classical.py` scores it against the same ground
-truth and classical baseline as above, on nnU-Net's own held-out fold-0
-validation cases — fill in from that script's printed summary:
+Path 2 done: `nnUNetTrainer_250epochs`, fold 0 of `3d_fullres`, trained on
+Colab (see `docs/nnunet_colab_training.md`).
+`scripts/compare_nnunet_vs_classical.py` scored it against the same ground
+truth and classical baseline as above, on nnU-Net's **26 held-out fold-0
+validation cases** (never trained on):
 
-| Approach | mean Dice (labels 1-3) |
+| Approach | mean airway Dice (labels 1-3) |
 |---|---:|
-| classical threshold + largest components (hu_max=-350) | 0.254 |
-| nnU-Net (`nnUNetTrainer_250epochs`, fold 0) | *pending* |
+| classical threshold + largest components (hu_max=-350) | 0.260 ± 0.044 |
+| **nnU-Net (`nnUNetTrainer_250epochs`, fold 0)** | **0.885 ± 0.137** |
 
-nnU-Net per-structure Dice (mean) — this is the number that actually tests
-whether the model learned to separate nasal cavity from sinus, where every
-classical approach above failed to:
+A **+0.625 mean improvement (3.4×)**. The per-structure Dice is the number
+that actually shows the model learned to separate nasal cavity from
+paranasal sinus — the distinction every classical approach above structurally
+could not make (they lump all air in one connected blob):
 
 | Structure | mean Dice |
 |---|---:|
-| left_nasal_cavity | *pending* |
-| right_nasal_cavity | *pending* |
-| nasopharynx | *pending* |
-| left_maxillary_sinus | *pending* |
-| right_maxillary_sinus | *pending* |
+| left_nasal_cavity | 0.772 |
+| right_nasal_cavity | 0.763 |
+| nasopharynx | 0.722 |
+| left_maxillary_sinus | 0.725 |
+| right_maxillary_sinus | 0.966 |
 
-Once trained, the model is also wired into the working pipeline as
+(These match nnU-Net's own `fold_0/validation/summary.json` to 3 decimals,
+confirming the comparison harness scores the same thing nnU-Net reports.)
+
+**Evaluation gotcha, same root cause as the training fix:** ~14 NasalSeg
+label NRRDs have a header (spacing/origin/direction) that disagrees with the
+paired image — a flipped z-direction or ~220 mm origin shift. Scoring a
+prediction against those by *physical coordinates* (resampling) misaligns it
+and reports a spurious ~0 Dice (P025, P100, P105 all hit this). Since the
+voxel array sizes always match and training used voxel-index correspondence,
+`compare_nnunet_vs_classical.py` compares by voxel index too. Before that
+fix the three broken-header cases dragged the reported mean down to 0.80 ±
+0.29; after it, 0.885 ± 0.137.
+
+The model is also wired into the working pipeline as
 `process_case(..., mask_source="nnunet")` (`src/sinus_cfd/nnunet_infer.py`),
 which — unlike `mask_source="labels"` — needs no expert labels at all. That's
 what makes it usable on a real new-patient CT rather than only on NasalSeg's
