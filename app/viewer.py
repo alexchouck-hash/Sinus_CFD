@@ -32,9 +32,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.15.1-pink-fix-small-ports"
+APP_VERSION = "0.16.0-mca-cfd-virtual-IT"
 APP_VERSION_LABEL = (
-    "reddish translucent removal zones · smaller naris/trachea markers"
+    "MCA/CSA metrics · OpenFOAM ΔP/R/L-R flux · virtual IT compare"
 )
 
 DEFAULT_CASE = "P001"
@@ -70,6 +70,9 @@ def case_data_fingerprint(case_id: str) -> str:
         f"{case_id}_cavity_left.stl",
         f"{case_id}_cavity_right.stl",
         f"{case_id}_ct_nasal_meta.json",
+        f"{case_id}_geometry_metrics.json",
+        f"{case_id}_cfd_metrics.json",
+        f"{case_id}_virtual_IT_compare.json",
     ]
     return "|".join(f"{n}:{int(_file_mtime(case_dir / n))}" for n in keys)
 
@@ -244,6 +247,27 @@ def load_case(case_id: str, data_fingerprint: str) -> dict:
             out["passage"] = json.load(f)
     else:
         out["passage"] = {}
+
+    geo_path = case_dir / f"{case_id}_geometry_metrics.json"
+    if geo_path.is_file():
+        with geo_path.open(encoding="utf-8") as f:
+            out["geometry_metrics"] = json.load(f)
+    else:
+        out["geometry_metrics"] = {}
+
+    cfd_m_path = case_dir / f"{case_id}_cfd_metrics.json"
+    if cfd_m_path.is_file():
+        with cfd_m_path.open(encoding="utf-8") as f:
+            out["cfd_metrics"] = json.load(f)
+    else:
+        out["cfd_metrics"] = {}
+
+    virt_path = case_dir / f"{case_id}_virtual_IT_compare.json"
+    if virt_path.is_file():
+        with virt_path.open(encoding="utf-8") as f:
+            out["virtual_IT_compare"] = json.load(f)
+    else:
+        out["virtual_IT_compare"] = {}
 
     return out
 
@@ -524,6 +548,8 @@ def _fig_3d(
     show_sphenoid: bool = False,
     show_maxillary: bool = False,
     sinus_opacity: float = 0.35,
+    mca_markers: list | None = None,
+    show_mca: bool = True,
 ) -> go.Figure:
     fig = go.Figure()
     dark = bg_mode == "dark"
@@ -983,6 +1009,37 @@ def _fig_3d(
             )
         )
 
+    # MCA markers (min cross-section along naris→trachea)
+    if show_mca and mca_markers:
+        for mk in mca_markers:
+            xyz = mk.get("xyz_mm") or []
+            if len(xyz) < 3:
+                continue
+            side = str(mk.get("side") or "?")
+            area = mk.get("mca_mm2")
+            label = f"MCA {side}"
+            if area is not None:
+                label = f"MCA {side} {float(area):.0f}mm²"
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[float(xyz[0])],
+                    y=[float(xyz[1])],
+                    z=[float(xyz[2])],
+                    mode="markers+text",
+                    marker=dict(
+                        size=8,
+                        color="#e11d48",
+                        symbol="x",
+                        line=dict(width=1, color="#7f1d1d"),
+                        opacity=0.95,
+                    ),
+                    text=[label],
+                    textposition="bottom center",
+                    textfont=dict(size=9, color="#e11d48"),
+                    name=f"MCA ({side})",
+                )
+            )
+
     # Animated particles riding pathlines (optional)
     frames: list = []
     if animate_pathlines and path_arrays:
@@ -1190,6 +1247,11 @@ def main() -> None:
         show_removal = (
             show_removal_inferior or show_removal_middle or show_removal_septum
         )
+        show_mca = st.checkbox(
+            "MCA markers (min cross-section)",
+            value=True,
+            help="Minimal cross-sectional area along L/R naris→trachea centerlines.",
+        )
         if st.button("Reload data"):
             st.cache_data.clear()
             st.rerun()
@@ -1338,11 +1400,158 @@ def main() -> None:
         )
 
     # Metrics
+    geo_m = data.get("geometry_metrics") or {}
+    cfd_m = data.get("cfd_metrics") or {}
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Max |u|", f"{meta.get('max_speed_m_s', float(speed[airway].max() if airway.any() else 0)):.3f} m/s")
     c2.metric("Mean |u|", f"{meta.get('mean_speed_m_s', float(speed[airway].mean() if airway.any() else 0)):.3f} m/s")
     c3.metric("Target Q", f"{meta.get('target_flow_L_per_min', 18):.1f} L/min")
-    c4.metric("App ver", APP_VERSION.split("-")[0])
+    g_mca = (geo_m.get("global_mca") or {}).get("mca_mm2")
+    c4.metric("MCA", f"{g_mca:.1f} mm²" if g_mca is not None else "—")
+
+    # CFD resistance / allocation row
+    pr = cfd_m.get("pressure") or {}
+    rs = cfd_m.get("resistance") or {}
+    al = cfd_m.get("inlet_allocation") or {}
+    if cfd_m:
+        d1, d2, d3, d4 = st.columns(4)
+        dp = pr.get("delta_p_abs")
+        if dp is None and pr.get("delta_p_inlet_minus_outlet") is not None:
+            dp = abs(float(pr["delta_p_inlet_minus_outlet"]))
+        r_abs = rs.get("R_abs")
+        if r_abs is None and rs.get("R_delta_p_over_Q") is not None:
+            r_abs = abs(float(rs["R_delta_p_over_Q"]))
+        d1.metric("|ΔP|", f"{dp:.2f}" if dp is not None else "—")
+        d2.metric("R = |ΔP|/Q", f"{r_abs:.0f}" if r_abs is not None else "—")
+        d3.metric(
+            "Q left (scaled)",
+            f"{al.get('left_Q_L_per_min_scaled_to_target', 0):.1f} L/min",
+        )
+        d4.metric(
+            "Q right (scaled)",
+            f"{al.get('right_Q_L_per_min_scaled_to_target', 0):.1f} L/min",
+        )
+        st.caption(
+            f"CFD metrics from `{cfd_m.get('method', '?')}` · "
+            f"L/R probe split "
+            f"**{(al.get('left_fraction_from_probe') or 0)*100:.0f}% / "
+            f"{(al.get('right_fraction_from_probe') or 0)*100:.0f}%** · "
+            "research only (not validated clinical units)."
+        )
+    else:
+        st.info(
+            "No CFD metrics yet. Run: "
+            "`py -3.12 scripts/compute_cfd_metrics.py --case VisibleHuman_Head`"
+        )
+
+    if geo_m.get("sides"):
+        with st.expander("Geometry: CSA / MCA by side", expanded=False):
+            for s in geo_m["sides"]:
+                m = s.get("mca") or {}
+                st.markdown(
+                    f"**{s.get('name')}** · length `{s.get('centerline_length_mm', 0):.1f}` mm · "
+                    f"MCA **{m.get('mca_mm2', 0):.1f} mm²** at s=`{m.get('mca_path_s_mm', 0):.1f}` mm · "
+                    f"area min/mean/max "
+                    f"`{s.get('area_min_mm2', 0):.1f}` / "
+                    f"`{s.get('area_mean_mm2', 0):.1f}` / "
+                    f"`{s.get('area_max_mm2', 0):.1f}` mm²"
+                )
+            # Simple CSA curves
+            try:
+                import plotly.express as px  # noqa: F401
+            except Exception:
+                pass
+            fig_csa = go.Figure()
+            for s in geo_m["sides"]:
+                xs = [float(c.get("path_s_mm", 0)) for c in (s.get("cross_sections") or [])]
+                ys = [float(c.get("area_mm2", 0)) for c in (s.get("cross_sections") or [])]
+                if xs:
+                    fig_csa.add_trace(
+                        go.Scatter(
+                            x=xs,
+                            y=ys,
+                            mode="lines+markers",
+                            name=f"{s.get('name')} CSA",
+                            line=dict(width=2),
+                        )
+                    )
+                    m = s.get("mca") or {}
+                    if m.get("mca_path_s_mm") is not None:
+                        fig_csa.add_trace(
+                            go.Scatter(
+                                x=[float(m["mca_path_s_mm"])],
+                                y=[float(m["mca_mm2"])],
+                                mode="markers",
+                                name=f"{s.get('name')} MCA",
+                                marker=dict(size=12, symbol="x", color="#e11d48"),
+                            )
+                        )
+            fig_csa.update_layout(
+                height=280,
+                margin=dict(l=40, r=20, t=30, b=40),
+                xaxis_title="Path distance from naris (mm)",
+                yaxis_title="Cross-section area (mm²)",
+                legend=dict(orientation="h"),
+            )
+            st.plotly_chart(fig_csa, use_container_width=True)
+    elif not geo_m:
+        st.info(
+            "No geometry metrics yet. Run: "
+            "`py -3.12 scripts/compute_geometry_metrics.py --case VisibleHuman_Head`"
+        )
+
+    virt = data.get("virtual_IT_compare") or {}
+    if virt:
+        with st.expander("Virtual IT reduction — pre/post", expanded=True):
+            g = virt.get("geometry") or {}
+            st.markdown(
+                f"**Procedure:** `{virt.get('procedure')}` · shave `{virt.get('shave_mm')}` mm · "
+                f"removed **{virt.get('voxels_removed', 0)}** voxels "
+                f"({virt.get('volume_removed_ml', 0):.3f} mL)"
+            )
+            v1, v2, v3, v4 = st.columns(4)
+            v1.metric(
+                "MCA baseline",
+                f"{g.get('mca_mm2_baseline'):.1f} mm²"
+                if g.get("mca_mm2_baseline") is not None
+                else "—",
+            )
+            v2.metric(
+                "MCA virtual",
+                f"{g.get('mca_mm2_virtual'):.1f} mm²"
+                if g.get("mca_mm2_virtual") is not None
+                else "—",
+                delta=(
+                    f"{g.get('mca_delta_mm2'):+.1f}"
+                    if g.get("mca_delta_mm2") is not None
+                    else None
+                ),
+            )
+            v3.metric(
+                "Mean nasal CSA Δ",
+                f"{g.get('mean_csa_delta_mm2'):+.1f} mm²"
+                if g.get("mean_csa_delta_mm2") is not None
+                else "—",
+            )
+            v4.metric(
+                "Tissue opened",
+                f"{virt.get('volume_removed_ml', 0):.2f} mL",
+            )
+            cf = virt.get("cfd") or {}
+            if g.get("note"):
+                st.caption(g["note"])
+            st.caption(
+                (virt.get("research_disclaimer") or "")
+                + " "
+                + (cf.get("note") or "")
+            )
+            for n in (virt.get("edit_notes") or [])[:4]:
+                st.caption(f"• {n}")
+    else:
+        st.caption(
+            "Virtual IT compare: "
+            "`py -3.12 scripts/run_virtual_it_reduction.py --case VisibleHuman_Head`"
+        )
 
     if meta.get("notes"):
         with st.expander("Method notes / caveats", expanded=is_openfoam):
@@ -1570,6 +1779,8 @@ def main() -> None:
         show_sphenoid=show_sphenoid and sphenoid_mesh is not None,
         show_maxillary=show_maxillary,
         sinus_opacity=sinus_opacity,
+        mca_markers=(data.get("geometry_metrics") or {}).get("mca_markers") or [],
+        show_mca=show_mca,
     )
     st.plotly_chart(fig3d, use_container_width=True)
     st.caption(
