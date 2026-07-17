@@ -33,6 +33,7 @@ import SimpleITK as sitk
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from sinus_cfd.metrics import dice_coefficient as dice  # noqa: E402
 from sinus_cfd.pipeline import (  # noqa: E402
     DEFAULT_AIRWAY_LABELS,
     DEFAULT_ALL_AIRWAY_LABELS,
@@ -40,16 +41,6 @@ from sinus_cfd.pipeline import (  # noqa: E402
 )
 
 DEFAULT_THRESHOLDS = (-350.0, -400.0, -450.0, -500.0, -550.0, -600.0)
-
-
-def dice(pred: np.ndarray, truth: np.ndarray) -> float:
-    pred = pred.astype(bool)
-    truth = truth.astype(bool)
-    denom = int(pred.sum()) + int(truth.sum())
-    if denom == 0:
-        return 1.0  # both empty: trivially agree
-    intersection = int((pred & truth).sum())
-    return 2.0 * intersection / denom
 
 
 def list_cases(nasalseg_root: Path) -> list[str]:
