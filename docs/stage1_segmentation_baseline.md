@@ -63,9 +63,53 @@ With sinuses folded into ground truth (labels 1–5, `--include-sinuses`):
    already scaffolded — `docs/nnunet_nasal.md`), rather than a threshold
    sweep alone.
 
+## Follow-up: does seeding or a body mask close the gap?
+
+Tested two candidate fixes on a 3-case spot check (P001, P065, P130), both
+against the same labels-1-3 ground truth:
+
+| Approach | mean Dice |
+|---|---:|
+| plain threshold + largest components (baseline above) | 0.262 |
+| + `tissues.segment_body` mask (exclude exterior scanner-FOV air) | 0.067 |
+| `nasal_airway_ct.extract_ct_nasal_airway` (nostril-seeded growth) | 0.064 |
+
+Both candidates made things **worse**, and for related reasons — both were
+built for whole-head CT (Visible Human), not NasalSeg's pre-cropped FOV:
+
+- `segment_body` builds the body silhouette by thresholding tissue and
+  filling holes. Hole-filling only works when the air cavity is fully
+  enclosed by tissue *within the array*. NasalSeg crops the FOV tight
+  around the nose, so real nasal-cavity air is often touching the crop
+  boundary (~25% of boundary voxels are air-range HU, checked on P001) —
+  indistinguishable from true exterior air by this method. The mask ends up
+  excluding real airway, not just scanner background.
+- `extract_ct_nasal_airway` restricts its "vestibule + septum-split" domain
+  to a small ROI anchored at the detected naris (built to find nostril
+  ports for whole-head boundary conditions, not to reproduce the full
+  nasal-cavity + nasopharynx extent). Its `passage_lumen` came out at ~10k
+  voxels vs ~80k in the ground truth — it's solving a different, narrower
+  problem than this Dice test asks.
+
+**Conclusion:** for NasalSeg-style pre-cropped volumes, the crop has
+already done the "remove scanner background" step, so the plain
+threshold + largest-components baseline is the better of the three
+classical options tested. The ~0.25 Dice ceiling isn't an exterior-air
+problem or a threshold-tuning problem — it's specifically that nothing
+here distinguishes nasal-cavity air from paranasal-sinus air within the
+same connected blob.
+
 ## Next step
 
-Re-run this same Dice measurement against `nasal_airway_ct.extract_ct_nasal_airway`
-(nostril-seeded growth, already excludes sinuses by construction) to check
-whether seeding — not thresholding — closes most of the gap, before
-committing to training nnU-Net.
+Two real paths forward, not yet tried:
+
+1. A seed-and-flood approach scoped to the crop itself (not the whole-head
+   ROI logic above) — seed from the most-anterior air voxels (no naris/
+   vestibule restriction) and flood through air, then split off components
+   whose connection to the seed passes through a narrow bottleneck
+   consistent with a sinus ostium (a caliber threshold along the connecting
+   path), rather than keeping every large component.
+2. nnU-Net on NasalSeg (already scaffolded, `docs/nnunet_nasal.md`) — likely
+   the more reliable route, since distinguishing nasal cavity from sinus air
+   by geometry alone is exactly the kind of ambiguous case learned
+   segmentation handles better than hand-tuned heuristics.
