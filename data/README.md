@@ -1,6 +1,11 @@
 # Data directory
 
-Place downloaded CT volumes here. This folder’s contents (except this README) are gitignored.
+Place downloaded CT volumes here. Contents (except this README) are **gitignored**.
+
+**Primary demo case today:** Visible Human whole head (`VisibleHuman_Head/`).  
+**Labeled FOV for learning:** NasalSeg (+ optional nnU-Net Dataset501).
+
+Pipeline overview for agents: **`../AGENTS.md`**, architecture: **`../docs/architecture.md`**.
 
 ## 1. NasalSeg (labeled nasal / sinus FOV)
 

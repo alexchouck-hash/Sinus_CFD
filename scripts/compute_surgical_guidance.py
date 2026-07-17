@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Surgical guidance layers for the Streamlit viewer:
+Surgical guidance for the Streamlit viewer (docs/surgical_guidance.md).
 
-  1. Label frontal / sphenoid / maxillary L/R sinuses (CT air heuristics)
-  2. Least-resistance instrument path: nostril → frontal sinus
-     (most-open: high distance-to-wall + dark HU air)
-  3. Magenta/pink "areas to remove" = narrowest bottlenecks along that path
+  1. Label frontal / sphenoid / maxillary L/R (CT air heuristics)
+  2. Dual instrument paths: L/R naris → ipsilateral frontal
+  3. High-|u| corridor along naris → trachea
+  4. Split into inferior turbinate / middle turbinate / septum
+  5. Rank least-invasive treatment options
 
 Example:
   py -3.12 scripts/compute_surgical_guidance.py --case VisibleHuman_Head

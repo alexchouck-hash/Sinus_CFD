@@ -1,5 +1,10 @@
 # Most-open dual centerlines (demo quality)
 
+Also see:
+
+- **Turbulent viewer pathlines:** `scripts/regenerate_curvy_pathlines.py`, `flow_field.py`  
+- **Frontal instrument corridors + high-|u| zones:** `docs/surgical_guidance.md`, `compute_surgical_guidance.py`  
+
 ## Question
 
 Is there an algorithm for centerlines from nares → trachea that prefer the

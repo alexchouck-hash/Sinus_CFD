@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Regenerate dense *curvy* pathlines: **nostrils → trachea**.
+Regenerate dense *curvy / turbulent* pathlines for the Streamlit viewer.
 
-Every path starts at a naris and ends at the trachea. Seeds near both
-nostrils (plus optional mid-passage seeds that are reoriented naris→trachea).
-Trilinear velocity sampling + small steps bend lines around corners.
-Optional light swirl for a turbulent *look* (demo viz, not LES).
+Seeds throughout the airspace (cavities + sinuses) and denser at the nares.
+Integration: trilinear U, helical swirl (stronger near nares), soft trachea
+attract (inhale). Higher seed speed → longer traces. Viewer draws wispy fade.
+
+See AGENTS.md and docs/architecture.md.
 
 Example:
   py -3.12 scripts/regenerate_curvy_pathlines.py --case VisibleHuman_Head
-  py -3.12 scripts/regenerate_curvy_pathlines.py --case VisibleHuman_Head --swirl 0.12 --naris-seeds 120
+  py -3.12 scripts/regenerate_curvy_pathlines.py --case VisibleHuman_Head --swirl 0.28 --naris-seeds 180
 """
 
 from __future__ import annotations

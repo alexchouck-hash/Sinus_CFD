@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Sinus_CFD interactive viewer.
+Sinus_CFD interactive viewer (Streamlit + Plotly).
 
-- Tri-planar CT/speed slices with sliders
-- Semi-transparent 3D airway cavity
-- Curved streamlines + velocity glyphs
+Demo layers (Visible Human):
+  - Skin + L/R cavities + frontal sinus
+  - Turbulent wispy pathlines (volume/naris seeds → trachea)
+  - Purple dual naris→frontal instrument paths
+  - Pink high-|u| zones: inferior turbinate / middle turbinate / septum
+  - Treatment recommendations (heuristic)
+
+Sidebar: toggles for frontal paths and each removal zone.
+See docs/viewer.md and AGENTS.md.
 
 Run from repo root:
-  py -3.12 -m pip install -r requirements.txt
-  py -3.12 -m streamlit run app/viewer.py
+  py -3.12 -m streamlit run app/viewer.py --server.address 127.0.0.1 --server.port 8501
 """
 
 from __future__ import annotations

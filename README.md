@@ -1,265 +1,171 @@
 # Sinus_CFD
 
-**Computational fluid dynamics of nasal airflow and sinus drainage from head CT anatomy.**
+**CT-based nasal airflow visualization and surgical-planning *research demo*.**
 
-This project aims to take a CT scan of a human head, reconstruct the nasal cavity and paranasal sinuses, and simulate how **airflow** and **drainage** change when the anatomy is modified (e.g., septoplasty, turbinate reduction, ostium enlargement, or other structural interventions).
+Ingest head CT → reconstruct nasal airspaces → estimate or import CFD velocity → show **turbulent pathlines**, **naris→frontal instrument corridors**, and **high-velocity tissue targets** with least-invasive treatment suggestions.
 
-## Goals
+> **Not a medical device.** For research and education only. Do not use for clinical decisions without validation and regulatory clearance.
 
-1. **Ingest** head / sinus CT volumes (DICOM, NRRD, or NIfTI)
-2. **Segment** airways and sinuses (expert labels and/or HU air threshold)
-3. **Build** 3D surface / volume meshes suitable for CFD
-4. **Simulate** inspiratory/expiratory airflow and simple drainage / clearance proxies
-5. **Compare** baseline vs. surgically (or virtually) altered anatomy
+**GitHub:** https://github.com/alexchouck-hash/Sinus_CFD (`main`)
 
-## Current status
+---
 
-| Step | Status |
-|------|--------|
-| Public CT data (NasalSeg) | Working — download into `data/` |
-| Airway mask from labels / HU | Working (`scripts/process_case.py`) |
-| Surface export (STL) | Working |
-| BCs: nostrils in / trachea out / mouth closed | Working (physiology + port detection) |
-| Approximate airflow velocity field | Working (potential-flow preview) |
-| **Whole-head CT** (Visible Human) | Working — solid head + airway + trachea outlet |
-| **Interactive viewer** (semi-transparent head + airway) | Working (`app/viewer.py`) |
-| Volume mesh + OpenFOAM CFD | Not yet |
-| Ostium pathways / mucus / CRS·NAO·NVC | Roadmap (`docs/product_roadmap.md`) |
-| Virtual surgery variants | Not yet |
+## Current demo (Visible Human)
 
-### Boundary conditions (intent)
+| Capability | Status |
+|------------|--------|
+| Whole-head CT (Visible Human Female 1 mm) | Working |
+| Tip nares + L/R cavities + tip vestibule open | Working |
+| OpenFOAM simpleFoam velocity (when imported) | Working |
+| Turbulent **wispy** pathlines (volume + naris seeds → trachea) | Working |
+| Dual purple **naris → frontal** paths | Working |
+| Pink **IT / MT / septum** high-\|u\| zones (toggles) | Working |
+| Treatment ranking (demo heuristic) | Working |
+| Streamlit viewer | Working (`app/viewer.py` **0.15.x**) |
+| nnU-Net NasalSeg scaffold | Scaffold only (weak GPU) |
 
-| Boundary | Treatment |
-|----------|-----------|
-| **Both nostrils** | **Inlets** — share total inspiratory flow (default 50/50) |
-| **Trachea** | **Outlet** — pressure reference (on NasalSeg: distal nasopharynx *proxy*) |
-| **Mouth** | **Closed** — oral cavity excluded from the fluid domain |
+### Boundary conditions
 
-**Typical resting breath → CFD flow**
+| Boundary | Role |
+|----------|------|
+| Left + right nostrils | Inlets (~50/50 of total Q) |
+| Trachea | Outlet (pressure reference) |
+| Mouth | Closed |
 
-- \(V_T = 0.5\) L, RR = 12 /min, I:E ≈ 1:2 → \(T_i \approx 1.67\) s  
-- Mean inspiratory flow \(Q = V_T / T_i \approx \mathbf{18\ L/min}\), held quasi-steady for \(T_i\)  
-- Patient scaling later: `--weight-kg`, measured \(V_T\)/RR, L/R split  
+Resting breath scale: \(V_T \approx 0.5\) L, RR 12 → mean inspiratory **~18 L/min** (quasi-steady). Details: [`docs/boundary_conditions.md`](docs/boundary_conditions.md).
 
-Details: [`docs/boundary_conditions.md`](docs/boundary_conditions.md)
+---
 
-### First case result (NasalSeg `P001`)
-
-- **Mask:** expert labels 1–3 (L/R nasal cavity + nasopharynx), cleaned to largest component  
-- **Airway volume:** ~28.5 mL  
-- **Surface:** ~30k vertices / ~60k faces  
-- **Flow set-point:** ~18 L/min total (~9 L/min per nostril), \(T_i \approx 1.67\) s  
-- **Outputs (local):** mask, STL, preview, `*_boundary_conditions.json`, OpenFOAM BC sketch, port markers
-
-## Quick start
-
-### 1. Install dependencies
+## Quick start (demo case)
 
 ```powershell
 cd C:\Users\houck\Documents\Sinus_CFD
 py -3.12 -m pip install -r requirements.txt
-```
 
-### 2. Download NasalSeg (once)
-
-```powershell
-cd data
-# If not already downloaded:
-# Invoke-WebRequest -Uri "https://zenodo.org/records/13893419/files/NasalSeg.zip?download=1" -OutFile "NasalSeg.zip"
-# Expand-Archive NasalSeg.zip -DestinationPath NasalSeg
-```
-
-Layout after unzip:
-
-```text
-data/NasalSeg/
-  images/P001_img.nrrd … P130_img.nrrd
-  labels/P001_seg.nrrd … P130_seg.nrrd
-```
-
-### 3. Process one case → mask + STL
-
-```powershell
-cd C:\Users\houck\Documents\Sinus_CFD
-py -3.12 scripts\process_case.py --case P001
-```
-
-Useful flags:
-
-| Flag | Meaning |
-|------|---------|
-| `--mask-source labels` | Expert labels (default; recommended) |
-| `--mask-source hu` | HU air threshold only |
-| `--mask-source labels_and_hu` | Intersection of both |
-| `--include-sinuses` | Also include maxillary sinuses (labels 4–5) |
-| `--case P010` | Another subject |
-| `--tidal-volume-L 0.5` | Tidal volume (default 0.5 L) |
-| `--respiratory-rate 12` | Breaths/min |
-| `--weight-kg 70` | Scale \(V_T \approx 7\) mL/kg (patient matching) |
-| `--left-flow-fraction 0.5` | L/R nostril flow split |
-
-### 4. Compute airflow velocity (preview field)
-
-```powershell
-py -3.12 scripts\compute_flow.py --case P001
-```
-
-Produces `outputs/P001/P001_flow.npz` (speed + velocity components), streamlines, and `P001_speed.nrrd`.
-
-This is a **potential-flow / Darcy approximation** scaled to ~18 L/min inspiratory flow — good for visualization and early metrics. Full Navier–Stokes CFD comes later.
-
-### 5. Whole-head case (Visible Human)
-
-```powershell
-# Once: download head CT (~123 MB)
+# Data (once)
 py -3.12 scripts\download_visible_human_head.py
 
-# Solid head + airway + BCs (nostrils → trachea) + flow
+# Full chain if outputs missing (subset if already processed)
 py -3.12 scripts\process_whole_head.py --case VisibleHuman_Head
+py -3.12 scripts\refine_nasal_ct.py --case VisibleHuman_Head
+py -3.12 scripts\extend_nasal_to_tip.py --case VisibleHuman_Head
+# Optional CFD:
+#   export + OpenFOAM Docker/WSL + import_openfoam_results.py
+py -3.12 scripts\regenerate_curvy_pathlines.py --case VisibleHuman_Head
+py -3.12 scripts\compute_surgical_guidance.py --case VisibleHuman_Head
+
+py -3.12 -m streamlit run app\viewer.py --server.address 127.0.0.1 --server.port 8501
 ```
 
-Key outputs in `outputs/VisibleHuman_Head/`:
+Open **http://127.0.0.1:8501**. Sidebar: toggle frontal paths and pink zones (IT / MT / septum).
 
-| File | Role |
-|------|------|
-| `*_head.stl` | **Solid head shell** (semi-transparent in viewer) |
-| `*_airway.stl` | Airway lumen surface |
-| `*_boundary_conditions.json` | Nostrils in, **trachea** out, mouth closed |
-| `*_flow.npz` | Velocity field |
+---
 
-Note: this cadaver CT has limited free air in the pharynx; a **low-HU geodesic conduit** to the neck is added so flow has a continuous path (documented in case notes).
+## Agent / developer docs
 
-### 6. Launch the interactive viewer
+| Doc | Audience |
+|-----|----------|
+| **[`AGENTS.md`](AGENTS.md)** | **Start here for AI agents** — pipeline, modules, conventions |
+| [`docs/architecture.md`](docs/architecture.md) | System architecture + data flow |
+| [`docs/viewer.md`](docs/viewer.md) | Viewer layers and cache |
+| [`docs/surgical_guidance.md`](docs/surgical_guidance.md) | Frontal paths, zones, treatments |
+| [`docs/data-sources.md`](docs/data-sources.md) | NasalSeg vs Visible Human |
+| [`docs/docker_openfoam.md`](docs/docker_openfoam.md) | OpenFOAM in Docker |
+| [`docs/open_paths.md`](docs/open_paths.md) | Most-open path algorithm |
+| [`docs/product_roadmap.md`](docs/product_roadmap.md) | Product direction |
 
-```powershell
-py -3.12 -m streamlit run app\viewer.py
+---
+
+## Pipeline overview
+
+```text
+CT (Visible Human / NasalSeg)
+  → process_whole_head / process_case
+  → refine_nasal_ct + extend_nasal_to_tip
+  → OpenFOAM import or potential-flow compute_flow
+  → regenerate_curvy_pathlines   # wispy turbulent seeds
+  → compute_surgical_guidance  # frontal paths + pink zones + treatments
+  → Streamlit viewer
 ```
 
-Features:
+### Key scripts
 
-- Preset **Head + airway** — semi-transparent **solid head** + airway inside  
-- Tri-planar speed sliders  
-- Curved streamlines; optional velocity cones  
-- Adjustable head / airway opacity  
+| Script | Purpose |
+|--------|---------|
+| `process_whole_head.py` | Head mask, airway, BCs, initial flow |
+| `refine_nasal_ct.py` | L/R cavities, septum, naris shell |
+| `extend_nasal_to_tip.py` | Open vestibules to skin tip |
+| `import_openfoam_results.py` | Foam `U` → CT grid |
+| `regenerate_curvy_pathlines.py` | Turbulent pathlines JSON |
+| `compute_surgical_guidance.py` | Sinuses, frontal paths, zones, treatments |
+| `rebuild_skin_surface.py` | Cleaner skin STL |
 
-### 7. Inspect files
+### Key library modules (`src/sinus_cfd/`)
 
-- Whole-head preview: `outputs/VisibleHuman_Head/VisibleHuman_Head_preview.png`  
-- Head STL: `outputs/VisibleHuman_Head/VisibleHuman_Head_head.stl`  
-- NasalSeg case still under `outputs/P001/`  
+| Module | Role |
+|--------|------|
+| `flow_field.py` | Velocity field + curvy pathlines |
+| `open_path.py` | Most-open geodesics, frontal corridors |
+| `surgical_zones.py` | IT/MT/septum + treatment ranking |
+| `sinus_anatomy.py` | Frontal/sphenoid/maxillary heuristics |
+| `nasal_airway_ct.py` | CT naris / cavities / septum |
+| `openfoam_import.py` | Foam → NPZ |
 
-## Pipeline (high level)
-
-```
-CT (NRRD/DICOM/NIfTI)
-    → load + spacing/origin
-    → airway mask (labels 1–3; mouth excluded)
-    → morphological clean + largest component
-    → marching cubes surface (STL)
-    → ports: left/right nostril inlets + trachea outlet (proxy)
-    → physiology → Q (L/min) for duration Ti
-    → [next] volume mesh + CFD (OpenFOAM / similar)
-    → [next] virtual anatomy edits → re-run → compare
-```
-
-NasalSeg label map:
-
-| ID | Structure |
-|----|-----------|
-| 1 | Left nasal cavity |
-| 2 | Right nasal cavity |
-| 3 | Nasopharynx |
-| 4 | Left maxillary sinus |
-| 5 | Right maxillary sinus |
-
-Default CFD airway uses **1–3** (continuous nasal path). Use `--include-sinuses` for drainage-oriented studies.
-
-## Sample CT data (public)
-
-Large medical volumes are **not** stored in this repository. Keep them under `data/` (gitignored).
-
-### NasalSeg (labeled nasal FOV — current pipeline)
-
-| | |
-|---|---|
-| **What** | 130 CT scans with nasal/paranasal labels |
-| **FOV** | Sinonasal region only (not whole head) |
-| **Size** | ~224 MB |
-| **Download** | [Zenodo](https://zenodo.org/records/13893419) |
-
-### Visible Human Female head (whole-head CT)
-
-| | |
-|---|---|
-| **What** | Full head CT, 1 mm slices (~234) |
-| **FOV** | Entire head (skull, sinuses, soft tissue) |
-| **Labels** | None (use HU / future auto-seg) |
-| **Download** | `py -3.12 scripts\download_visible_human_head.py` |
-| **Source** | [Harvard Dataverse doi:10.7910/DVN/3JDZCT](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/3JDZCT) |
-
-### Other sources
-
-- [TCIA Head-Neck-PET-CT](https://www.cancerimagingarchive.net/collection/head-neck-pet-ct/)  
-- [TCIA HNSCC](https://www.cancerimagingarchive.net/collection/hnscc/)  
-- [Stanford AIMI SinoCT](https://aimi.stanford.edu/data)  
-- See `docs/data-sources.md` for more detail  
+---
 
 ## Repository layout
 
 ```text
 Sinus_CFD/
+├── AGENTS.md                 # agent onboarding
 ├── README.md
-├── requirements.txt
-├── app/
-│   └── viewer.py         # Streamlit tri-planar + 3D airflow viewer
-├── data/                 # local CT downloads (not committed)
-├── docs/                 # BCs, product roadmap, data sources
-├── outputs/              # masks, STL, flow fields (not committed)
-├── scripts/
-│   ├── process_case.py   # CT → mask + STL + BCs
-│   └── compute_flow.py   # mask + BCs → velocity field
-└── src/sinus_cfd/
-    ├── pipeline.py
-    ├── physiology.py
-    ├── boundary_conditions.py
-    └── flow_field.py
+├── app/viewer.py             # Streamlit UI
+├── docs/                     # architecture, surgical, OpenFOAM, …
+├── scripts/                  # CLI pipelines
+├── src/sinus_cfd/            # Python package
+├── foam/VisibleHuman_Head/   # OpenFOAM case
+├── data/                     # local CTs (gitignored)
+└── outputs/                  # generated (gitignored)
 ```
 
-### OpenFOAM case (next step after geometry)
+---
+
+## NasalSeg (labeled FOV)
+
+```powershell
+py -3.12 scripts\download_nasalseg.py
+py -3.12 scripts\process_case.py --case P001
+py -3.12 scripts\compute_flow.py --case P001
+```
+
+Labels 1–3 = L/R nasal + nasopharynx (default continuous path). See [`docs/nnunet_nasal.md`](docs/nnunet_nasal.md) for Dataset501 scaffold.
+
+---
+
+## OpenFOAM (optional)
 
 ```powershell
 py -3.12 scripts\export_openfoam_geometry.py --case VisibleHuman_Head
 py -3.12 scripts\scaffold_openfoam_case.py --case VisibleHuman_Head
-# then in WSL/Linux with OpenFOAM:
-#   cd foam/VisibleHuman_Head && ./Allrun
+# Docker or WSL: Allrun / Allrun.docker
+py -3.12 scripts\import_openfoam_results.py --case VisibleHuman_Head
 ```
 
-See [`docs/openfoam.md`](docs/openfoam.md) and `foam/VisibleHuman_Head/README.md`.
+See [`docs/docker_openfoam.md`](docs/docker_openfoam.md), [`docs/openfoam.md`](docs/openfoam.md).
 
-### Product direction
-
-Long-term: surgeons/patients **upload CT** → auto analysis for **CRS**, **NAO**, **NVC**, polyps → interactive airflow/drainage viewer → virtual surgery comparison.  
-See [`docs/product_roadmap.md`](docs/product_roadmap.md).
+---
 
 ## License & ethics
 
-- Use only **de-identified, publicly licensed** imaging for development.
-- Respect each dataset’s license and citation requirements.
-- This software is for research and educational exploration; it is **not** a medical device and must not be used for clinical decision-making without appropriate validation and regulatory clearance.
+- Use de-identified, publicly licensed imaging for development.  
+- Respect dataset licenses and citations.  
+- **Research only** — not validated for clinical use.
 
-## Citation
-
-If you use NasalSeg:
+### NasalSeg
 
 ```bibtex
-@article{zhang2024nasalseg,
-  title={NasalSeg: A Dataset for Automatic Segmentation of Nasal Cavity and Paranasal Sinuses from 3D CT Images},
-  author={Zhang, Yichi and Wang, Jing and Pan, Tan and Jiang, Quanling and Ge, Jingjie and Guo, Xin and Jiang, Chen and Lu, Jie and Zhang, Jianning and Liu, Xueling and others},
-  journal={Scientific Data},
-  volume={11},
-  number={1},
-  pages={1--5},
-  year={2024},
-  publisher={Nature Publishing Group}
+@article{nasalseg,
+  title={NasalSeg},
+  # See Zenodo record 13893419 for citation details
 }
 ```

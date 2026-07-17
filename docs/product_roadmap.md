@@ -2,92 +2,81 @@
 
 ## Vision
 
-A clinical decision-support app where surgeons and patients can **upload a head CT**, receive **structured airway/sinus analysis**, and **interactively explore** airflow and drainage under baseline and virtually modified anatomy.
+Clinical decision-support (future): upload head CT → structured airway/sinus analysis → interactive airflow/drainage under baseline and virtual surgery.
 
-**Not a medical device yet.** All current outputs are research prototypes.
+**Not a medical device.** Current code is a research prototype.
 
 ---
 
-## Viewer (current → near term)
+## Implemented (demo — Visible Human)
 
 | Capability | Status |
 |------------|--------|
-| Tri-planar velocity with sliders | **Now** (Streamlit) |
-| 3D semi-transparent cavity | **Now** |
-| Curved streamlines + optional velocity cones | **Now** (potential-flow field) |
-| Full Navier–Stokes CFD (OpenFOAM) | Next |
-| Patient-specific VT / RR / L–R split | Partial (CLI + physiology module) |
+| Whole-head CT process + skin/airway | Done |
+| CT L/R cavities, tip vestibules | Done |
+| OpenFOAM simpleFoam import | Done (case foam + import script) |
+| Turbulent wispy pathlines (volume + naris seeds) | Done |
+| Dual naris→frontal instrument paths | Done |
+| High-\|u\| zones: IT / MT / septum + toggles | Done |
+| Heuristic treatment ranking | Done |
+| Streamlit viewer | Done (`app/viewer.py`) |
+| NasalSeg process + potential flow | Done |
+| nnU-Net Dataset501 scaffold | Scaffold only |
 
-### Run the viewer
-
-```powershell
-cd C:\Users\houck\Documents\Sinus_CFD
-py -3.12 scripts\process_case.py --case P001
-py -3.12 scripts\compute_flow.py --case P001
-py -3.12 -m streamlit run app\viewer.py
-```
+See **`AGENTS.md`** and **`docs/architecture.md`** for how to run the current stack.
 
 ---
 
-## Planned clinical modules
+## Near term
 
-### 1. Pathway analysis (shortest path)
-
-- Shortest path **naris → sinus ostium → sinus lumen** (geodesic in air mask / surface)
-- Compare left vs right, pre- vs post–virtual ostium widening
-- Metrics: path length, min cross-section along path, tortuosity
-
-### 2. Mucus / drainage
-
-- Mucociliary transport **out** of sinuses (surface advection toward ostium / nasopharynx)
-- Scenario: **widened ostium** → recompute drainage proxy and residence time
-- Visualization: particle tracks on mucosal surface (distinct from bulk air streamlines)
-
-### 3. Imaging diagnosis assists
-
-| Code | Condition | Imaging / geometry cues (high level) |
-|------|-----------|--------------------------------------|
-| **CRS** | Chronic rhinosinusitis | Mucosal thickening, opacification, ostiomeatal obstruction patterns |
-| **NAO** | Nasal airway obstruction | Septal deviation, turbinate hypertrophy, minimal cross-sectional area, elevated resistance |
-| **NVC** | Nasal valve collapse | Narrow internal/external valve angle, dynamic cues if available |
-| **Polyps** | Nasal polyps | Soft-tissue masses in nasal cavity / sinuses (ML segmentation) |
-
-These will require **labeled training data**, radiologist review, and regulatory pathway before clinical use.
-
-### 4. Upload & report workflow (long-term)
-
-1. Secure CT upload (DICOM de-identification)  
-2. Auto segmentation (airway, sinuses, septum, turbinates, ostia)  
-3. CFD / potential-flow + pathway + drainage metrics  
-4. Interactive viewer (this app)  
-5. Optional virtual surgery (septoplasty, turbinate reduction, ostium enlargement)  
-6. Structured report for surgeon–patient discussion  
+| Item | Notes |
+|------|--------|
+| Patient CT upload path | De-ID DICOM → same pipeline as VH |
+| Better sinus/turbinate labels | nnU-Net or TotalSegmentator-class models |
+| Virtual surgery: edit mask → re-run pathlines/CFD | Compare pre/post Q and high-\|u\| volume |
+| Calibrated resistance / pressure drop metrics | Beyond visualization speed maps |
+| OpenFOAM dual-inlet balance checks | Explicit 50/50 flux reporting |
 
 ---
 
-## Boundary condition policy (locked intent)
+## Medium term
 
-- **Inlets:** both nostrils  
-- **Outlet:** trachea (proxy until FOV includes trachea)  
-- **Mouth:** closed  
-- **Flow:** typical tidal inhale sustained for typical \(T_i\); later patient-matched  
+### Pathway analysis
 
-See `docs/boundary_conditions.md`.
+- Naris → ostium → sinus geodesic (per sinus)  
+- Metrics: length, min cross-section, tortuosity  
+
+### Drainage / mucus proxies
+
+- Surface advection toward ostium  
+- Virtual ostium widening scenarios  
+
+### Imaging assists (need labels + validation)
+
+| Code | Condition |
+|------|-----------|
+| CRS | Chronic rhinosinusitis patterns |
+| NAO | Septal deviation, turbinate hypertrophy, MCA |
+| NVC | Nasal valve geometry |
+| Polyps | Soft-tissue masses |
 
 ---
 
-## Technical stack (current prototype)
+## Long term
 
-| Layer | Choice |
-|-------|--------|
-| Segmentation / mesh | SimpleITK, scikit-image, trimesh |
-| Flow (preview) | Voxel Laplace / potential flow |
-| Flow (target) | OpenFOAM or equivalent |
-| Viewer | Streamlit + Plotly |
-| Data | NasalSeg + future clinical DICOM |
+1. Secure CT upload + de-identification  
+2. Auto-segmentation of airway, sinuses, septum, turbinates, ostia  
+3. Report + interactive virtual surgery comparison  
+4. Regulatory pathway if clinical claims are made  
 
 ---
 
-## Disclaimer
+## Viewer evolution
 
-Educational / research software only. **Not for clinical diagnosis or treatment decisions** without validated models, clinical studies, and appropriate regulatory clearance.
+| Capability | Status |
+|------------|--------|
+| 3D skin + cavities + wispy pathlines | **Now** |
+| Frontal paths + zone pink toggles | **Now** |
+| Treatment panel | **Now** |
+| Side-by-side pre/post virtual surgery | Planned |
+| Time-resolved breath cycle | Planned |

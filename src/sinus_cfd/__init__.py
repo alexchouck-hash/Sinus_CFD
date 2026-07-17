@@ -1,4 +1,10 @@
-"""Sinus_CFD: CT-based nasal airway segmentation, flow preview, and BCs."""
+"""
+Sinus_CFD: CT-based nasal airway segmentation, flow visualization, and surgical demo.
+
+Public entrypoints used by scripts and tests. Additional modules (open_path,
+surgical_zones, sinus_anatomy, openfoam_import, …) are importable by full path;
+see AGENTS.md and docs/architecture.md.
+"""
 
 from .boundary_conditions import build_boundary_setup
 from .flow_field import compute_flow_field
