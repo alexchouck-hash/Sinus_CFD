@@ -18,7 +18,7 @@ in `docs/architecture_and_roadmap.md`.
 |-------|--------|----------|
 | **1. Segmentation you trust** | **Done** | nnU-Net (`nnUNetTrainer_250epochs`, fold 0) **0.885 airway Dice** vs 0.260 classical baseline on 26 held-out cases; per-structure 0.72–0.97, cleanly separating nasal cavity from sinus. `docs/stage1_segmentation_baseline.md` |
 | **2. Geometry analysis (no CFD)** | **Done** | Per-side volume, minimal cross-sectional area (MCA), L/R asymmetry ratio. `docs/stage2_geometry_metrics.md`, `scripts/geometry_report.py`, viewer "Geometry report" mode |
-| 3. Real Navier–Stokes CFD | Not started | Only potential-flow preview exists; the bulk of remaining work (prism-layer mesh, resistance/wall-shear/heat-flux) |
+| 3. Real Navier–Stokes CFD | **In progress** | Full pipeline runs end-to-end in Docker OpenFOAM: CT → passage → geometry export → **prism-layer mesh** (`--wall-layers`, default 5) → `simpleFoam` laminar → nasal resistance R=ρΔP/Q validated vs published range (`scripts/compute_nasal_resistance.py`). Remaining: finer mesh for validation-grade numbers, watertight-STL cleanup |
 | 4. Virtual surgery loop | Not started | Depends on Stage 3; MVP geometry metrics are the pre/post quantities to compare |
 | 5. Pathology (polyps, ostium patency) | Not started | |
 | 6. Navigation export | Not started | |
@@ -31,6 +31,14 @@ py -3.12 scripts/compare_nnunet_vs_classical.py --pred-dir <fold_0/validation> -
 
 # Per-side geometry report (expert labels, or --mask-source nnunet on any CT)
 py -3.12 scripts/geometry_report.py --case P001 --data-root data
+
+# Real CFD one case (needs Docker Desktop running)
+py -3.12 scripts/process_case.py --case P001 --data-root data
+py -3.12 scripts/analyze_passage.py --case P001 --skip-flow
+py -3.12 scripts/export_openfoam_geometry.py --case P001
+py -3.12 scripts/scaffold_openfoam_case.py --case P001 --wall-layers 5
+powershell -File scripts/run_openfoam_docker.ps1 -Case P001
+py -3.12 scripts/compute_nasal_resistance.py --case P001
 ```
 
 Training the model on Colab: `docs/nnunet_colab_training.md` +
