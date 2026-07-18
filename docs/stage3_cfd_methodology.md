@@ -79,7 +79,7 @@ Deliberately avoided: `pyvista.PolyData.fill_holes` — its own docs warn
 the whole process uncatchably. Everything above uses only trimesh + scipy +
 skimage, already dependencies.
 
-## Result after the fix
+## Result after the fix — and a second bug the "no change" result exposed
 
 Re-ran P001 with the watertight surface. Mesh quality transformed exactly as
 predicted:
@@ -90,49 +90,90 @@ predicted:
 | checkMesh verdict | Failed 1 check | **Mesh OK.** |
 | Max skewness | 12.5 (429 flagged faces) | **3.48 (none flagged)** |
 
-But the resistance number **did not move**: still 0.049 Pa·s/mL, still below
-the published range. That's a real, informative result, not a wasted fix —
-it isolates *which* mesh property the bulk resistance number is actually
-sensitive to.
+But the reported resistance was **identical to 4 significant figures**
+(0.049 Pa·s/mL, ΔP=14.56 Pa) — and stayed identical again after bumping mesh
+refinement 5x (53k → 259k cells). Three meshes differing by up to 8x in cell
+count cannot legitimately produce bit-identical pressure drops; this was a
+second, separate bug, not a mesh-independence result.
 
-**Why:** prism layers and low skewness are about *near-wall gradient*
-fidelity — the quantities they're specifically needed for are wall shear
-stress and heat flux, not the domain-averaged pressure drop. The final mesh
-was only ~53,565 cells (50,785 hex + 2,780 prism) for a 68 mL domain — about
-1 mm average cell size. Stage 2's own geometry metrics
-(`docs/stage2_geometry_metrics.md`) measured this case's MCA at ~9-37 mm²,
-implying a throat only ~3-6 mm across — so a 1mm mesh puts only ~3-6 cells
-across the narrowest constriction, well under the ~8-10 cells generally
-needed to resolve the local velocity profile and pressure drop there. A
-too-coarse throat numerically "widens" the constriction and under-predicts
-resistance, independent of how good the wall layers are elsewhere.
+**Root cause:** the case directory was never cleaned between Docker runs (no
+`Allclean`). `simpleFoam`'s `surfaceFieldValue` functionObjects silently skip
+rewriting `.dat` output for time values they've already written — so
+re-running over the same time range (0→500) left `postProcessing/` holding
+the *first* run's numbers while the mesh and field files (`500/U`, `500/p`)
+correctly reflected each new mesh. No error, no warning, just stale data
+masquerading as a fresh result. Caught by noticing the exact-match was
+physically implausible, then confirmed via file mtimes: `postProcessing/`
+files were timestamped from run 2, not run 3 or 4.
 
-**Fix applied:** bumped `snappyHexMesh` surface refinement from level (1 2)
-on the wall / (2 2) on ports to **(2 3)** / **(3 3)**, with `maxGlobalCells`
-raised 900k → 2M to give the extra resolution room. Re-run in progress; see
-whether resistance moves toward the 0.10-0.35 Pa·s/mL range with the throat
-now resolved at ~4-8x finer cells.
+**Fixed** by cleaning (`rm -rf` time dirs, `processor*`, `constant/polyMesh`,
+`postProcessing`, logs) at the start of every run — both
+`scripts/run_openfoam_docker.ps1` and the case's `Allrun.docker` — and adding
+a defensive check to `compute_nasal_resistance.py` that warns if any
+`postProcessing/*/*/surfaceFieldValue.dat` predates `constant/polyMesh/owner`
+(which a fresh meshing pass always rewrites), so this can't recur silently.
 
-This is the mesh-independence check recommended below, arriving earlier than
-planned because the first result made it clear resolution, not layer
-presence, was the active constraint.
+**The genuine, trustworthy number** (properly cleaned, 259k-cell mesh, prism
+layers present, checkMesh OK): **R = 0.052 Pa·s/mL** (ΔP=15.66 Pa at 18 L/min).
+Monitored inlet pressure had settled to within ~3% over the last 100
+iterations — reasonably but not perfectly converged. This is the *only*
+number in this doc's history that hasn't been contaminated by one of the two
+bugs above; the earlier "before/after layers" comparison is retracted since
+run 2 (layers added) was likely also serving run 1's stale data, not its own.
+
+Still below the published 0.10-0.35 Pa·s/mL range. Plausible explanations,
+not yet distinguished:
+
+1. **Nasal resistance is flow-dependent (nonlinear).** The commonly-cited
+   range is typically measured by active rhinomanometry at a standardized
+   ~150 Pa driving pressure — far above quiet resting breathing's ~15 Pa. If
+   resistance rises with flow (inertial/turbulent losses at the valve
+   increasing faster than linearly), a lower R at low ΔP is a genuine
+   physiological effect, not a simulation error. Worth checking directly:
+   re-run at a higher imposed flow rate and see if R increases.
+2. **NasalSeg's cropped FOV may not fully capture the nasal vestibule/valve**
+   — anatomically the dominant resistance site in the real nose — if the
+   crop starts just past it. Whole-head geometry (Visible Human, or a full
+   patient CT) would settle this.
+3. **Mesh still under-resolved at the throat**, even at 259k cells. Not
+   ruled out by one data point; a true mesh-independence study (3+
+   deliberately varied resolutions, properly cleaned between each) is the
+   next rigorous step, not yet done.
+
+## Corrected lesson for anyone re-running this
+
+**Always confirm `postProcessing/` timestamps are newer than
+`constant/polyMesh/owner` before trusting a resistance number** — the fix
+above prevents the silent case, but a manual re-run outside these scripts
+(e.g. an interactive Docker shell) can still hit it.
 
 ## Recommended path forward
 
 **Near-term (this repo, this machine):**
-1. Watertight surface conditioning — **done**, see above.
-2. Prism layers — scaffolded (`--wall-layers`, default 5), keyword bug fixed.
-3. Mesh independence check — refine once (2-3 resolutions) on one case, then
-   lock the recipe rather than re-tuning per patient.
-4. Parallel solve — `decomposePar` across available cores (case already has
+1. Watertight surface conditioning — **done**, verified (mesh watertight,
+   checkMesh OK, skewness 12.5 → 3.2).
+2. Prism layers — **done**, verified (2,780-8,062 prism cells present
+   depending on resolution), keyword bug fixed.
+3. Reproducible clean runs — **done**, verified (the stale-postProcessing bug
+   above is fixed and now defensively checked for).
+4. Mesh independence check — **not actually done yet**, despite appearances.
+   Only one genuine (non-stale) data point exists so far (259k cells, R=0.052
+   Pa·s/mL). A real check needs 3+ deliberately varied resolutions, each a
+   properly cleaned run, compared against each other honestly.
+5. Distinguish the three candidate explanations for R being below the
+   published range (flow-rate nonlinearity, cropped-FOV missing the
+   vestibule, or genuine under-resolution) — cheapest first: re-run the same
+   mesh at a higher imposed flow rate to test the nonlinearity hypothesis
+   before spending more compute on refinement.
+6. Parallel solve — `decomposePar` across available cores (case already has
    `system/decomposeParDict`); free ~4x wall-clock speedup on this machine's
    4 physical cores.
-5. **cfMesh (`cartesianMesh`)** as a snappyHexMesh alternative — already
+7. **cfMesh (`cartesianMesh`)** as a snappyHexMesh alternative — already
    present in the `opencfd/openfoam-run` Docker image, generally more
    tolerant of imperfect surfaces and faster to converge on boundary layers.
    Worth trying if snappy is still fragile on some patients even after the
    watertight fix.
-6. **Frozen-flow thermal step** (near-free clinical payoff): wall heat flux /
+8. **Frozen-flow thermal step** (near-free clinical payoff): wall heat flux /
    mucosal cooling is the *strongest* correlate of perceived nasal patency
    (TRPM8 cooling receptors, not pressure). Once velocity converges, solve a
    passive temperature scalar (wall T=37°C, inlet T=ambient) on the frozen
