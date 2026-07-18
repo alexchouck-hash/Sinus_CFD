@@ -74,6 +74,9 @@ def scaffold(
     foam_root: Path | None = None,
     cells: int = 32,
     wall_layers: int = 5,
+    thermal: bool = True,
+    inlet_temp_K: float = 293.15,
+    wall_temp_K: float = 310.15,
 ) -> Path:
     """
     Write a runnable OpenFOAM case.
@@ -83,6 +86,16 @@ def scaffold(
     mesh as mandatory for trustworthy wall shear stress and heat flux — the
     surgically relevant quantities — so this defaults on. Set to 0 to skip
     (faster mesh, but wall-adjacent gradients are then unreliable).
+
+    ``thermal`` co-solves a passive temperature scalar (OpenFOAM
+    ``scalarTransport`` functionObject) alongside the flow: inspired air enters
+    at ``inlet_temp_K`` (~20 °C), the mucosa wall is held at ``wall_temp_K``
+    (~37 °C), and the air warms as it passes. Mucosal cooling / wall heat flux
+    is the strongest correlate of *perceived* nasal patency (TRPM8 cooling
+    receptors, not pressure), so this is high clinical value for near-zero
+    extra cost — temperature is one-way coupled (passive), so it does not
+    change the velocity/pressure or the resistance number. Extract the total
+    mucosal heat loss with ``scripts/compute_mucosal_cooling.py``.
     """
     outputs_root = outputs_root or (REPO_ROOT / "outputs")
     geom_dir = outputs_root / case_id / "openfoam_geometry"
@@ -379,6 +392,41 @@ mergeTolerance 1e-6;
     }}"""
         for patch in ("left_nostril", "right_nostril", "trachea")
     )
+
+    # Thermal (mucosal cooling) functionObjects: co-solve a passive temperature
+    # scalar on the flow field, and record the flow-weighted (bulk / mixing-cup)
+    # outlet temperature so total mucosal heat loss = rho*cp*Q*(T_out - T_in).
+    if thermal:
+        _thermal_port_fos = "\n".join(
+            f"""    T_{patch}
+    {{
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        writeControl    writeTime;
+        writeFields     false;
+        log             true;
+        regionType      patch;
+        name            {patch};
+        operation       weightedAverage;
+        weightField     phi;
+        fields          (T);
+    }}"""
+            for patch in ("left_nostril", "right_nostril", "trachea")
+        )
+        _thermal_fos = f"""    thermalTransport
+    {{
+        type            scalarTransport;
+        libs            (solverFunctionObjects);
+        field           T;
+        // thermal diffusivity of air alpha = k/(rho*cp) ~ 2.1e-5 m^2/s
+        D               2.1e-5;
+        nCorr           1;
+        resetOnStartUp  false;
+        writeControl    writeTime;
+    }}
+{_thermal_port_fos}"""
+        _patch_fos = _patch_fos + "\n" + _thermal_fos
+
     _write(
         system / "controlDict",
         """
@@ -443,6 +491,7 @@ divSchemes
     div(phi,k)      bounded Gauss upwind;
     div(phi,epsilon) bounded Gauss upwind;
     div(phi,omega)  bounded Gauss upwind;
+    div(phi,T)      bounded Gauss upwind;
     div((nuEff*dev2(T(grad(U))))) Gauss linear;
 }
 
@@ -485,7 +534,7 @@ solvers
         smoother        GaussSeidel;
     }
 
-    "(U|k|epsilon|omega|f|v2)"
+    "(U|k|epsilon|omega|f|v2|T)"
     {
         solver          smoothSolver;
         smoother        symGaussSeidel;
@@ -743,6 +792,66 @@ boundaryField
 """,
     )
 
+    # ---- 0/T (passive temperature scalar for mucosal cooling) ----
+    if thermal:
+        _write(
+            zero / "T",
+            f"""
+FoamFile
+{{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    object      T;
+}}
+
+dimensions      [0 0 0 1 0 0 0];
+
+// Inspired air enters cool; mucosa wall held at body temperature. The air
+// warms toward body temp as it passes -- the heat it gains is the mucosal
+// heat loss (the physical basis of perceived nasal cooling / patency).
+internalField   uniform {inlet_temp_K:.2f};
+
+boundaryField
+{{
+    left_nostril
+    {{
+        type            fixedValue;
+        value           uniform {inlet_temp_K:.2f};
+    }}
+    right_nostril
+    {{
+        type            fixedValue;
+        value           uniform {inlet_temp_K:.2f};
+    }}
+    trachea
+    {{
+        // outflow: carry interior temperature out; if any inflow, use inlet temp
+        type            inletOutlet;
+        inletValue      uniform {inlet_temp_K:.2f};
+        value           uniform {inlet_temp_K:.2f};
+    }}
+    wall
+    {{
+        type            fixedValue;
+        value           uniform {wall_temp_K:.2f};
+    }}
+    box
+    {{
+        type            zeroGradient;
+    }}
+    defaultFaces
+    {{
+        type            zeroGradient;
+    }}
+    solid_air_body
+    {{
+        type            zeroGradient;
+    }}
+}}
+""",
+        )
+
     # ---- Allrun / Allclean (bash for WSL/Linux) ----
     _write(
         foam_root / "Allrun",
@@ -921,6 +1030,19 @@ def main() -> int:
         default=5,
         help="prism boundary layers on the mucosa wall (0 to disable; needed for wall shear/heat flux)",
     )
+    p.add_argument(
+        "--no-thermal",
+        action="store_true",
+        help="skip the passive temperature (mucosal cooling) solve",
+    )
+    p.add_argument(
+        "--inlet-temp-K", type=float, default=293.15,
+        help="inspired air temperature in K (default 293.15 = 20 C)",
+    )
+    p.add_argument(
+        "--wall-temp-K", type=float, default=310.15,
+        help="mucosa wall temperature in K (default 310.15 = 37 C)",
+    )
     args = p.parse_args()
     try:
         scaffold(
@@ -929,6 +1051,9 @@ def main() -> int:
             foam_root=args.foam_root,
             cells=args.cells,
             wall_layers=args.wall_layers,
+            thermal=not args.no_thermal,
+            inlet_temp_K=args.inlet_temp_K,
+            wall_temp_K=args.wall_temp_K,
         )
     except FileNotFoundError as e:
         print(e, file=sys.stderr)
