@@ -67,6 +67,30 @@ def main() -> int:
         print(f"ERROR: no postProcessing/ under {foam} — has the solve run?", file=sys.stderr)
         return 1
 
+    # surfaceFieldValue functionObjects silently skip rewriting data for time
+    # values they've already written -- if a case is re-run without cleaning
+    # (no Allclean) over the *same* time range, postProcessing/ can go stale
+    # while the field files (constant/, e.g. 500/U) correctly reflect the new
+    # mesh, giving a false "mesh-independent" result. Warn if any
+    # postProcessing .dat file predates the mesh, which the polyMesh rewrite
+    # always touches.
+    poly_mesh = foam / "constant" / "polyMesh" / "owner"
+    if poly_mesh.is_file():
+        mesh_time = poly_mesh.stat().st_mtime
+        stale = [
+            dat for dat in pp.glob("*/*/surfaceFieldValue.dat")
+            if dat.stat().st_mtime < mesh_time
+        ]
+        if stale:
+            print(
+                "WARNING: postProcessing data predates the current mesh "
+                f"(stale: {[str(p.relative_to(pp)) for p in stale]}). "
+                "This case was likely re-run without Allclean first, so the "
+                "resistance below may be a leftover from a previous mesh. "
+                "Re-run with Allclean (or the fixed Allrun.docker) before trusting it.",
+                file=sys.stderr,
+            )
+
     p_left = _latest_value(pp / "p_left_nostril")
     p_right = _latest_value(pp / "p_right_nostril")
     p_out = _latest_value(pp / "p_trachea")

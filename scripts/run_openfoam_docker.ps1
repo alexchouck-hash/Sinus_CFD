@@ -109,6 +109,12 @@ command -v blockMesh
 command -v snappyHexMesh
 command -v simpleFoam
 
+echo "== clean (avoid stale postProcessing/ from a prior run -- surfaceFieldValue"
+echo "   functionObjects silently skip rewriting data for time values they've"
+echo "   already written, which reports last run's numbers as if they were new) =="
+rm -rf 0.* [1-9]* processor* constant/polyMesh postProcessing
+rm -f log.*
+
 echo "== blockMesh =="
 blockMesh 2>&1 | tee log.blockMesh
 
