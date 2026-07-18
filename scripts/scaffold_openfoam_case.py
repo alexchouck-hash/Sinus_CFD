@@ -241,9 +241,13 @@ geometry
 
 castellatedMeshControls
 {{
-    // Docker ~8 GB: moderate snap; true fluid keep uses topoSet surfaceToCell
-    maxLocalCells 600000;
-    maxGlobalCells 900000;
+    // Docker ~8 GB: level bumped from (1 2)/(2 2) so the nasal-valve throat
+    // (Stage 2 measured MCA down to ~9 mm2, i.e. a ~3mm-wide constriction)
+    // gets enough cells across it -- the first real run's mesh (~1mm cells,
+    // ~3 cells across the throat) under-resolved it and under-predicted
+    // resistance even with prism layers correctly added.
+    maxLocalCells  1200000;
+    maxGlobalCells 2000000;
     minRefinementCells 0;
     maxLoadUnbalance 0.10;
     nCellsBetweenLevels 2;
@@ -256,13 +260,13 @@ castellatedMeshControls
     {{
         solid_air_body
         {{
-            level (1 2);
+            level (2 3);
             regions
             {{
-                left_nostril  {{ level (2 2); patchInfo {{ type patch; }} }}
-                right_nostril {{ level (2 2); patchInfo {{ type patch; }} }}
-                trachea       {{ level (2 2); patchInfo {{ type patch; }} }}
-                wall          {{ level (1 2); patchInfo {{ type wall; }} }}
+                left_nostril  {{ level (3 3); patchInfo {{ type patch; }} }}
+                right_nostril {{ level (3 3); patchInfo {{ type patch; }} }}
+                trachea       {{ level (3 3); patchInfo {{ type patch; }} }}
+                wall          {{ level (2 3); patchInfo {{ type wall; }} }}
             }}
         }}
     }}

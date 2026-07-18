@@ -81,9 +81,41 @@ skimage, already dependencies.
 
 ## Result after the fix
 
-(Filled in once the re-run with prism layers + watertight surface completes —
-see `foam/P001/log.snappyHexMesh`, `log.checkMesh`, and
-`scripts/compute_nasal_resistance.py --case P001`.)
+Re-ran P001 with the watertight surface. Mesh quality transformed exactly as
+predicted:
+
+| | Before (broken STL) | After (watertight + Taubin) |
+|---|---|---|
+| Prism layers | Failed to add (fatal error) | **2,780 prism cells added** |
+| checkMesh verdict | Failed 1 check | **Mesh OK.** |
+| Max skewness | 12.5 (429 flagged faces) | **3.48 (none flagged)** |
+
+But the resistance number **did not move**: still 0.049 Pa·s/mL, still below
+the published range. That's a real, informative result, not a wasted fix —
+it isolates *which* mesh property the bulk resistance number is actually
+sensitive to.
+
+**Why:** prism layers and low skewness are about *near-wall gradient*
+fidelity — the quantities they're specifically needed for are wall shear
+stress and heat flux, not the domain-averaged pressure drop. The final mesh
+was only ~53,565 cells (50,785 hex + 2,780 prism) for a 68 mL domain — about
+1 mm average cell size. Stage 2's own geometry metrics
+(`docs/stage2_geometry_metrics.md`) measured this case's MCA at ~9-37 mm²,
+implying a throat only ~3-6 mm across — so a 1mm mesh puts only ~3-6 cells
+across the narrowest constriction, well under the ~8-10 cells generally
+needed to resolve the local velocity profile and pressure drop there. A
+too-coarse throat numerically "widens" the constriction and under-predicts
+resistance, independent of how good the wall layers are elsewhere.
+
+**Fix applied:** bumped `snappyHexMesh` surface refinement from level (1 2)
+on the wall / (2 2) on ports to **(2 3)** / **(3 3)**, with `maxGlobalCells`
+raised 900k → 2M to give the extra resolution room. Re-run in progress; see
+whether resistance moves toward the 0.10-0.35 Pa·s/mL range with the throat
+now resolved at ~4-8x finer cells.
+
+This is the mesh-independence check recommended below, arriving earlier than
+planned because the first result made it clear resolution, not layer
+presence, was the active constraint.
 
 ## Recommended path forward
 
