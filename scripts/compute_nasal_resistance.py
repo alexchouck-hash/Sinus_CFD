@@ -54,6 +54,37 @@ def _latest_value(fo_dir: Path) -> float | None:
     return last_val
 
 
+def resistance_from_postprocessing(pp: Path, rho: float = 1.14) -> dict | None:
+    """
+    Compute nasal resistance from a postProcessing/ directory.
+
+    Returns a dict with q_total (m³/s), q_lpm, dp_pa, r_pa_s_ml, or None if the
+    functionObject outputs are missing. Shared by the single-case CLI below and
+    the flow-rate sweep (scripts/run_flow_sweep.py) so both compute R the same way.
+    """
+    p_left = _latest_value(pp / "p_left_nostril")
+    p_right = _latest_value(pp / "p_right_nostril")
+    p_out = _latest_value(pp / "p_trachea")
+    q_left = _latest_value(pp / "Q_left_nostril")
+    q_right = _latest_value(pp / "Q_right_nostril")
+    if None in (p_left, p_right, p_out, q_left, q_right):
+        return None
+
+    q_total = abs(q_left) + abs(q_right)  # m³/s (inlet phi is negative)
+    if q_total <= 0:
+        return None
+    dp_kinematic = 0.5 * (p_left + p_right) - p_out  # m²/s²
+    dp_pa = rho * dp_kinematic
+    return {
+        "q_total_m3_s": q_total,
+        "q_lpm": q_total * 60_000.0,
+        "dp_kinematic": dp_kinematic,
+        "dp_pa": dp_pa,
+        "r_si": dp_pa / q_total,
+        "r_pa_s_ml": dp_pa / q_total * 1e-6,
+    }
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--case", default="VisibleHuman_Head")
@@ -91,40 +122,23 @@ def main() -> int:
                 file=sys.stderr,
             )
 
-    p_left = _latest_value(pp / "p_left_nostril")
-    p_right = _latest_value(pp / "p_right_nostril")
-    p_out = _latest_value(pp / "p_trachea")
-    q_left = _latest_value(pp / "Q_left_nostril")
-    q_right = _latest_value(pp / "Q_right_nostril")
-
-    missing = [n for n, v in [
-        ("p_left_nostril", p_left), ("p_right_nostril", p_right),
-        ("p_trachea", p_out), ("Q_left_nostril", q_left), ("Q_right_nostril", q_right),
-    ] if v is None]
-    if missing:
-        print(f"ERROR: missing functionObject output: {missing}", file=sys.stderr)
+    res = resistance_from_postprocessing(pp, rho=args.rho)
+    if res is None:
+        print("ERROR: missing/empty functionObject output, or zero flow.", file=sys.stderr)
         print("Re-scaffold (adds resistance FOs) and re-run the solve.", file=sys.stderr)
         return 1
 
-    # Inlet phi is negative (flow into domain); use magnitude for Q.
-    q_total = abs(q_left) + abs(q_right)  # m³/s
-    p_in_mean = 0.5 * (p_left + p_right)  # kinematic, m²/s²
-    dp_kinematic = p_in_mean - p_out
-    dp_pa = args.rho * dp_kinematic
-
-    if q_total <= 0:
-        print("ERROR: total flow is zero — check inlet BCs / convergence", file=sys.stderr)
-        return 1
-
-    r_si = dp_pa / q_total  # Pa·s/m³
-    r_pa_s_ml = r_si * 1e-6  # Pa·s/mL
-    q_lpm = q_total * 60_000.0  # m³/s → L/min
+    q_total = res["q_total_m3_s"]
+    q_lpm = res["q_lpm"]
+    dp_kinematic = res["dp_kinematic"]
+    dp_pa = res["dp_pa"]
+    r_pa_s_ml = res["r_pa_s_ml"]
 
     print(f"[{args.case}] nasal resistance (converged simpleFoam)")
     print(f"  total flow Q      : {q_total:.3e} m³/s  ({q_lpm:.1f} L/min)")
     print(f"  ΔP (kinematic)    : {dp_kinematic:.3f} m²/s²")
     print(f"  ΔP (physical)     : {dp_pa:.2f} Pa   (ρ={args.rho} kg/m³)")
-    print(f"  resistance R      : {dp_pa / q_total:.3e} Pa·s/m³")
+    print(f"  resistance R      : {res['r_si']:.3e} Pa·s/m³")
     print(f"                    : {r_pa_s_ml:.3f} Pa·s/mL")
     lo, hi = PUBLISHED_MIN_PA_S_PER_ML, PUBLISHED_MAX_PA_S_PER_ML
     if lo <= r_pa_s_ml <= hi:

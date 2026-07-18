@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Flow-rate sweep on the EXISTING mesh (constant/polyMesh) — tests whether nasal
+# resistance R rises with flow (nonlinearity), which would explain R being below
+# the rhinomanometry-derived published range (measured at ~150 Pa, far above
+# resting breathing's ~15 Pa). Re-solves simpleFoam at several total flow rates
+# WITHOUT re-meshing (mesh is flow-rate-independent for incompressible laminar).
+set -e
+cd /case
+
+if [ -z "$WM_PROJECT_DIR" ]; then
+  for bashrc in /opt/openfoam*/etc/bashrc /usr/lib/openfoam/openfoam*/etc/bashrc; do
+    [ -f "$bashrc" ] && . "$bashrc" && break
+  done
+fi
+echo "WM_PROJECT_DIR=${WM_PROJECT_DIR:-unset}"
+
+if [ ! -f constant/polyMesh/owner ]; then
+  echo "ERROR: no mesh at constant/polyMesh — run Allrun.docker once first." >&2
+  exit 1
+fi
+
+# Total flow rates (L/min): resting -> heavy exercise. Per-nostril = half.
+LPM_LIST="18 36 60 90"
+
+rm -rf sweep
+mkdir -p sweep
+
+for LPM in $LPM_LIST; do
+  # total m^3/s = LPM/60000 ; per nostril = half
+  PERNOSTRIL=$(awk -v l="$LPM" 'BEGIN{printf "%.8e", (l/60000.0)/2.0}')
+  echo "==== flow ${LPM} L/min  (per-nostril ${PERNOSTRIL} m^3/s) ===="
+
+  # Fresh state each iteration (keep 0/ and constant/), avoid stale postProcessing.
+  rm -rf 0.* [1-9]* processor* postProcessing
+  rm -f log.simpleFoam.${LPM}
+
+  # Set the per-nostril volumetric flow rate on both inlets.
+  sed -i "s/volumetricFlowRate constant .*/volumetricFlowRate constant ${PERNOSTRIL};/" 0/U
+
+  simpleFoam > log.simpleFoam.${LPM} 2>&1 || { echo "simpleFoam failed at ${LPM} L/min"; tail -20 log.simpleFoam.${LPM}; exit 1; }
+
+  mkdir -p sweep/${LPM}
+  cp -r postProcessing sweep/${LPM}/postProcessing
+  echo "  done ${LPM} L/min"
+done
+
+# Restore the resting BC so the case is left in its default state.
+sed -i "s/volumetricFlowRate constant .*/volumetricFlowRate constant 1.50000000e-04;/" 0/U
+
+echo "SWEEP DONE"
