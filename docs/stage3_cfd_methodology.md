@@ -121,24 +121,41 @@ number in this doc's history that hasn't been contaminated by one of the two
 bugs above; the earlier "before/after layers" comparison is retracted since
 run 2 (layers added) was likely also serving run 1's stale data, not its own.
 
-Still below the published 0.10-0.35 Pa·s/mL range. Plausible explanations,
-not yet distinguished:
+The resting number is below the published 0.10-0.35 Pa·s/mL range — but a flow
+sweep (`scripts/flow_sweep_report.py`, `foam/P001/Allsweep.docker`) resolved
+why, and it's a validation win, not a defect.
 
-1. **Nasal resistance is flow-dependent (nonlinear).** The commonly-cited
-   range is typically measured by active rhinomanometry at a standardized
-   ~150 Pa driving pressure — far above quiet resting breathing's ~15 Pa. If
-   resistance rises with flow (inertial/turbulent losses at the valve
-   increasing faster than linearly), a lower R at low ΔP is a genuine
-   physiological effect, not a simulation error. Worth checking directly:
-   re-run at a higher imposed flow rate and see if R increases.
-2. **NasalSeg's cropped FOV may not fully capture the nasal vestibule/valve**
-   — anatomically the dominant resistance site in the real nose — if the
-   crop starts just past it. Whole-head geometry (Visible Human, or a full
-   patient CT) would settle this.
-3. **Mesh still under-resolved at the throat**, even at 259k cells. Not
-   ruled out by one data point; a true mesh-independence study (3+
-   deliberately varied resolutions, properly cleaned between each) is the
-   next rigorous step, not yet done.
+### Flow sweep: resistance is nonlinear, and matches the literature at the literature's own condition
+
+Re-solved on the same 259k-cell mesh at four total flow rates (each a fresh,
+properly cleaned run):
+
+| Q (L/min) | ΔP (Pa) | R (Pa·s/mL) |
+|----------:|--------:|------------:|
+| 18 (resting) | 15.7 | 0.052 |
+| 36 | 58.7 | 0.098 |
+| **60** | **156.0** | **0.156** |
+| 90 | 343.8 | 0.229 |
+
+Two things fall out:
+
+1. **R rises 4.4x from 18 → 90 L/min** — strongly nonlinear, exactly as real
+   nasal aerodynamics behaves. ΔP fits Rohrer's equation ΔP = K₁·Q + K₂·Q²
+   (viscous + inertial terms), so R = ΔP/Q ≈ K₁ + K₂·Q rises near-linearly
+   with flow (observed slope ~0.0024 Pa·s/mL per L/min, nearly constant).
+2. **At 60 L/min the pressure drop is 156 Pa** — essentially the ~150 Pa
+   driving pressure at which active rhinomanometry measures the published
+   range — and there **R = 0.156 Pa·s/mL, squarely inside the healthy
+   0.10-0.35 range.**
+
+So the resting-breathing R=0.052 was never wrong. The published range is a
+*different operating point* (≈150 Pa vs. resting's ≈15 Pa), and comparing R at
+resting flow against a 150-Pa-measured range is apples-to-oranges. Evaluated
+at the literature's own condition, this pipeline lands in the literature's own
+range. Candidate explanation #1 is **confirmed**; #2 (cropped FOV) and #3
+(under-resolution) are not needed to explain the resting number, though a
+formal mesh-independence study is still worth doing before quoting any single
+number as validated. Plot: `outputs/P001/P001_flow_sweep.png`.
 
 ## Corrected lesson for anyone re-running this
 
