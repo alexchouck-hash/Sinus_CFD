@@ -157,6 +157,37 @@ range. Candidate explanation #1 is **confirmed**; #2 (cropped FOV) and #3
 formal mesh-independence study is still worth doing before quoting any single
 number as validated. Plot: `outputs/P001/P001_flow_sweep.png`.
 
+### Mucosal cooling (thermal) — validated on first live run
+
+The passive-temperature step (`scalarTransport`, inspired air 20 °C, mucosa
+37 °C; `scripts/compute_mucosal_cooling.py`) ran clean on its first solve and
+produced physiologically sensible numbers with nothing tuned to hit them:
+
+| Quantity | Value |
+|---|---|
+| Bulk outlet air temperature | **34.4 °C** (warmed 14.4 K from 20 °C) |
+| Air conditioning | **85%** of the way to body temperature |
+| Total mucosal heat loss (sensible) | **4.9 W** |
+
+The outlet temperature is the key independent check: published nasopharyngeal
+temperatures during quiet nasal breathing of room air are ~32-34 °C, and this
+lands at 34.4 °C without any calibration. (Only sensible/convective heat is
+modeled; evaporative/latent loss — humidification — is a separate transport
+that would add to the total, so 4.9 W is a lower bound on true nasal heat load.)
+
+Two correctness checks also passed:
+
+- **Resistance was unchanged at 0.052 Pa·s/mL** with the thermal solve added,
+  confirming temperature is correctly one-way coupled (passive) — it does not
+  feed back into the momentum/pressure solution.
+- `scalarTransport` reported `T is converged` and the T solver ran without any
+  dict/scheme error on the first attempt.
+
+This is the metric the roadmap calls the strongest correlate of *perceived*
+patency, now producing a trustworthy global number. Next thermal step (not yet
+done): a spatial **wall heat-flux map** (near-wall ∂T/∂n × k) to show *where*
+cooling concentrates, which is what a surgeon would act on.
+
 ## Corrected lesson for anyone re-running this
 
 **Always confirm `postProcessing/` timestamps are newer than
