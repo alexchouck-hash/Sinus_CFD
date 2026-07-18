@@ -73,7 +73,17 @@ def scaffold(
     outputs_root: Path | None = None,
     foam_root: Path | None = None,
     cells: int = 32,
+    wall_layers: int = 5,
 ) -> Path:
+    """
+    Write a runnable OpenFOAM case.
+
+    ``wall_layers`` adds that many prism boundary layers on the mucosa wall
+    patch (snappyHexMesh addLayers). The roadmap flags a boundary-layer prism
+    mesh as mandatory for trustworthy wall shear stress and heat flux — the
+    surgically relevant quantities — so this defaults on. Set to 0 to skip
+    (faster mesh, but wall-adjacent gradients are then unreliable).
+    """
     outputs_root = outputs_root or (REPO_ROOT / "outputs")
     geom_dir = outputs_root / case_id / "openfoam_geometry"
     if not geom_dir.is_dir():
@@ -211,7 +221,7 @@ FoamFile
 // Castellation + snap on ONE watertight multi-region solid (ports as regions)
 castellatedMesh true;
 snap            true;
-addLayers       false;
+addLayers       {"true" if wall_layers > 0 else "false"};
 
 geometry
 {{
@@ -283,9 +293,16 @@ snapControls
 
 addLayersControls
 {{
+    // relativeSizes: layer thicknesses are fractions of the local cell size.
+    // ~5 layers on the mucosa wall resolve the near-wall velocity/thermal
+    // gradient so wall shear stress and heat flux are meaningful.
     relativeSizes true;
     layers
     {{
+        wall
+        {{
+            nSurfaceLayers {wall_layers};
+        }}
     }}
     expansionRatio 1.2;
     finalLayerThickness 0.3;
@@ -327,6 +344,37 @@ mergeTolerance 1e-6;
     )
 
     # ---- system/controlDict ----
+    # Resistance functionObjects: area-averaged kinematic pressure p and
+    # volumetric flow (sum of phi) on each open patch, logged every write.
+    # scripts/compute_nasal_resistance.py turns these into nasal resistance
+    # R = ρ·ΔP / Q and checks it against published ranges.
+    _patch_fos = "\n".join(
+        f"""    p_{patch}
+    {{
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        writeControl    writeTime;
+        writeFields     false;
+        log             true;
+        regionType      patch;
+        name            {patch};
+        operation       areaAverage;
+        fields          (p);
+    }}
+    Q_{patch}
+    {{
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        writeControl    writeTime;
+        writeFields     false;
+        log             true;
+        regionType      patch;
+        name            {patch};
+        operation       sum;
+        fields          (phi);
+    }}"""
+        for patch in ("left_nostril", "right_nostril", "trachea")
+    )
     _write(
         system / "controlDict",
         """
@@ -357,8 +405,9 @@ runTimeModifiable true;
 
 functions
 {
+__PATCH_FOS__
 }
-""",
+""".replace("__PATCH_FOS__", _patch_fos),
     )
 
     # ---- system/fvSchemes ----
@@ -862,6 +911,12 @@ def main() -> int:
         default=32,
         help="blockMesh cells per edge (32 helps seal watertight cut in Docker ~8 GB)",
     )
+    p.add_argument(
+        "--wall-layers",
+        type=int,
+        default=5,
+        help="prism boundary layers on the mucosa wall (0 to disable; needed for wall shear/heat flux)",
+    )
     args = p.parse_args()
     try:
         scaffold(
@@ -869,6 +924,7 @@ def main() -> int:
             outputs_root=args.outputs_root,
             foam_root=args.foam_root,
             cells=args.cells,
+            wall_layers=args.wall_layers,
         )
     except FileNotFoundError as e:
         print(e, file=sys.stderr)
