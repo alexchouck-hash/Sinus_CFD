@@ -231,11 +231,53 @@ def seal_solid_for_watertight_mesh(
     return sealed
 
 
+def _largest_component(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Keep the connected component with the most faces (drops slivers)."""
+    try:
+        parts = mesh.split(only_watertight=False)
+    except Exception:
+        return mesh
+    if len(parts) <= 1:
+        return mesh
+    return max(parts, key=lambda m: len(m.faces))
+
+
+def _smoothed_field_mesh(
+    solid_closed: np.ndarray,
+    spacing: tuple[float, float, float],
+    origin: tuple[float, float, float],
+    sigma_vox: float = 0.8,
+    pad: int = 3,
+) -> trimesh.Trimesh:
+    """
+    Marching cubes on a Gaussian-blurred field instead of the raw binary mask.
+
+    Raw binary voxel marching cubes on thin, complex topology (nasal
+    passages are exactly this) can hit non-manifold cube configurations —
+    the root cause of the open-edge / high-skewness surfaces that made
+    snappyHexMesh choke on prism layers. Blurring the mask to a continuous
+    field before thresholding at 0.5 removes the voxel-adjacency ambiguity
+    that triggers those configurations, at the cost of ~0.3-0.5 voxel of
+    rounding at the surface (negligible next to CT partial-volume blur).
+    Padding avoids clipping the surface where it nears the array boundary.
+    """
+    padded = np.pad(solid_closed.astype(np.float32), pad, mode="constant", constant_values=0.0)
+    field = ndi.gaussian_filter(padded, sigma=sigma_vox)
+    origin_adj = (
+        origin[0] - pad * spacing[0],
+        origin[1] - pad * spacing[1],
+        origin[2] - pad * spacing[2],
+    )
+    return _mask_to_mesh(field, spacing, origin_adj, level=0.5)
+
+
 def solid_mask_to_watertight_mesh(
     solid_closed: np.ndarray,
     spacing: tuple[float, float, float],
     origin: tuple[float, float, float],
     target_faces: int = 40000,
+    smooth_sigma_vox: float = 0.8,
+    taubin_iterations: int = 15,
 ) -> tuple[trimesh.Trimesh, list[str]]:
     """
     Marching cubes + hole fill + careful decimation for snappyHexMesh.
@@ -243,11 +285,25 @@ def solid_mask_to_watertight_mesh(
     Returns (mesh, notes). Prefers a watertight result over aggressive decimation.
     """
     notes: list[str] = []
-    mesh = _mask_to_mesh(solid_closed, spacing, origin)
+    try:
+        mesh = _smoothed_field_mesh(solid_closed, spacing, origin, sigma_vox=smooth_sigma_vox)
+        notes.append(f"Smoothed-field marching cubes (Gaussian sigma={smooth_sigma_vox} vox).")
+    except Exception as e:
+        mesh = _mask_to_mesh(solid_closed, spacing, origin)
+        notes.append(f"Smoothed-field marching cubes failed ({e}); used raw binary mask.")
+
+    mesh = _largest_component(mesh)
     try:
         mesh.process(validate=True)
     except Exception:
         pass
+
+    if taubin_iterations > 0:
+        try:
+            trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=taubin_iterations)
+            notes.append(f"Taubin-smoothed surface ({taubin_iterations} iterations, shrink-free).")
+        except Exception as e:
+            notes.append(f"Taubin smoothing skipped: {e}")
 
     for _ in range(6):
         if bool(mesh.is_watertight):
@@ -279,6 +335,7 @@ def solid_mask_to_watertight_mesh(
     n_faces_raw = len(mesh.faces)
     if n_faces_raw > target_faces:
         simplified = _decimate(mesh, target_faces)
+        simplified = _largest_component(simplified)
         # Re-fill after decimation (often opens small holes)
         for _ in range(4):
             if bool(simplified.is_watertight):
