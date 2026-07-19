@@ -77,6 +77,8 @@ def scaffold(
     thermal: bool = True,
     inlet_temp_K: float = 293.15,
     wall_temp_K: float = 310.15,
+    refine_level: int = 2,
+    max_global_cells: int = 2_000_000,
 ) -> Path:
     """
     Write a runnable OpenFOAM case.
@@ -220,6 +222,9 @@ mergePatchPairs
 
     # ---- system/snappyHexMeshDict ----
     # Single multi-region closed solid; locationInMesh must be inside fluid
+    rl = int(refine_level)
+    rl1 = rl + 1
+    max_local_cells = max(int(max_global_cells * 0.6), 100_000)
     _write(
         system / "snappyHexMeshDict",
         f"""
@@ -254,13 +259,13 @@ geometry
 
 castellatedMeshControls
 {{
-    // Docker ~8 GB: level bumped from (1 2)/(2 2) so the nasal-valve throat
-    // (Stage 2 measured MCA down to ~9 mm2, i.e. a ~3mm-wide constriction)
-    // gets enough cells across it -- the first real run's mesh (~1mm cells,
-    // ~3 cells across the throat) under-resolved it and under-predicted
-    // resistance even with prism layers correctly added.
-    maxLocalCells  1200000;
-    maxGlobalCells 2000000;
+    // refine_level controls resolution at the nasal-valve throat (Stage 2
+    // measured MCA down to ~9 mm2 -> ~3mm constriction). Wall gets
+    // (refine_level, refine_level+1), open ports get (refine_level+1)^2.
+    // level 2 (~259k cells) is the validated default; the mesh-independence
+    // study (docs/stage3_cfd_methodology.md) sweeps 1/2/3.
+    maxLocalCells  {max_local_cells};
+    maxGlobalCells {max_global_cells};
     minRefinementCells 0;
     maxLoadUnbalance 0.10;
     nCellsBetweenLevels 2;
@@ -273,13 +278,13 @@ castellatedMeshControls
     {{
         solid_air_body
         {{
-            level (2 3);
+            level ({rl} {rl1});
             regions
             {{
-                left_nostril  {{ level (3 3); patchInfo {{ type patch; }} }}
-                right_nostril {{ level (3 3); patchInfo {{ type patch; }} }}
-                trachea       {{ level (3 3); patchInfo {{ type patch; }} }}
-                wall          {{ level (2 3); patchInfo {{ type wall; }} }}
+                left_nostril  {{ level ({rl1} {rl1}); patchInfo {{ type patch; }} }}
+                right_nostril {{ level ({rl1} {rl1}); patchInfo {{ type patch; }} }}
+                trachea       {{ level ({rl1} {rl1}); patchInfo {{ type patch; }} }}
+                wall          {{ level ({rl} {rl1}); patchInfo {{ type wall; }} }}
             }}
         }}
     }}
@@ -1043,6 +1048,14 @@ def main() -> int:
         "--wall-temp-K", type=float, default=310.15,
         help="mucosa wall temperature in K (default 310.15 = 37 C)",
     )
+    p.add_argument(
+        "--refine-level", type=int, default=2,
+        help="snappyHexMesh throat refinement level (1 coarse / 2 default / 3 fine); mesh study sweeps these",
+    )
+    p.add_argument(
+        "--max-global-cells", type=int, default=2_000_000,
+        help="snappyHexMesh maxGlobalCells cap (raise for --refine-level 3)",
+    )
     args = p.parse_args()
     try:
         scaffold(
@@ -1054,6 +1067,8 @@ def main() -> int:
             thermal=not args.no_thermal,
             inlet_temp_K=args.inlet_temp_K,
             wall_temp_K=args.wall_temp_K,
+            refine_level=args.refine_level,
+            max_global_cells=args.max_global_cells,
         )
     except FileNotFoundError as e:
         print(e, file=sys.stderr)

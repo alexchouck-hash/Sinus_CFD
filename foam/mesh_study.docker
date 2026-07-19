@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Mesh-independence study: mesh + solve P001 at 3 refinement levels (m1/m2/m3),
+# each a fresh clean run, differing ONLY in snappyHexMesh throat refinement.
+# Mounted at /foam (the repo's foam/ dir). Reports each level's cell count so
+# scripts/mesh_independence_report.py can extract resistance + check convergence.
+set -e
+
+if [ -z "$WM_PROJECT_DIR" ]; then
+  for bashrc in /opt/openfoam*/etc/bashrc /usr/lib/openfoam/openfoam*/etc/bashrc; do
+    [ -f "$bashrc" ] && . "$bashrc" && break
+  done
+fi
+echo "WM_PROJECT_DIR=${WM_PROJECT_DIR:-unset}"
+
+for LVL in 1 2 3; do
+  CASE=/foam/P001_m${LVL}
+  echo "======== mesh level ${LVL}  (${CASE}) ========"
+  cd "$CASE"
+
+  # Fresh state (the scaffold left 0/ + constant/triSurface + system/).
+  rm -rf 0.* [1-9]* processor* constant/polyMesh postProcessing
+  rm -f log.*
+
+  echo "-- blockMesh --";           blockMesh                 > log.blockMesh 2>&1
+  echo "-- surfaceFeatureExtract --"; surfaceFeatureExtract   > log.surfaceFeatureExtract 2>&1 || true
+  echo "-- snappyHexMesh --";        snappyHexMesh -overwrite  > log.snappyHexMesh 2>&1
+  echo "-- checkMesh --";           checkMesh                 > log.checkMesh 2>&1 || true
+  grep -E "cells:|Max skewness|Mesh OK|Failed" log.checkMesh | head -5
+  echo "-- simpleFoam --";          simpleFoam                > log.simpleFoam 2>&1
+  echo "  level ${LVL} done"
+done
+
+echo "MESH STUDY DONE"
