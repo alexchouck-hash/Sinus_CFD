@@ -381,32 +381,60 @@ def _airway_center(label: np.ndarray) -> tuple[int, int, int]:
     return tuple(s // 2 for s in label.shape)  # type: ignore[return-value]
 
 
-def _triplanar_ct_fig(ct: np.ndarray, label: np.ndarray, cz: int, cy: int, cx: int) -> go.Figure:
-    """CT tri-planar with L/R cavity overlay at the given slice indices."""
-    fig = make_subplots(rows=1, cols=3, subplot_titles=(
-        f"Axial z={cz}", f"Coronal y={cy}", f"Sagittal x={cx}"), horizontal_spacing=0.04)
+@st.cache_data(show_spinner=False)
+def _scrubber_fig(case_id: str, axis: int, default_idx: int, spacing_xyz: tuple) -> go.Figure:
+    """
+    Square, live-scrubbing single-plane CT viewer with an L/R cavity overlay.
 
-    planes = [
-        (ct[cz], label[cz]),
-        (ct[:, cy, :], label[:, cy, :]),
-        (ct[:, :, cx], label[:, :, cx]),
-    ]
-    for col, (ct_slice, lab_slice) in enumerate(planes, start=1):
-        disp = np.clip(ct_slice, -1000, 400).astype(np.float32)
-        fig.add_trace(go.Heatmap(z=disp, colorscale="gray", showscale=False,
-                                 hoverinfo="skip"), row=1, col=col)
-        # L (blue) and R (red) cavity overlays
-        for lid, color in ((1, LEFT_COLOR), (2, RIGHT_COLOR)):
-            m = lab_slice == lid
-            if m.any():
-                ov = np.where(m, 1.0, np.nan)
-                fig.add_trace(go.Heatmap(
-                    z=ov, colorscale=[[0, color], [1, color]], showscale=False,
-                    opacity=0.45, hoverinfo="skip"), row=1, col=col)
-        fig.update_xaxes(visible=False, row=1, col=col)
-        fig.update_yaxes(visible=False, scaleanchor=f"x{col if col>1 else ''}",
-                         row=1, col=col)
-    fig.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10))
+    Uses a Plotly native animation slider (frames = slices) so scrubbing updates
+    client-side *as the slider is dragged* — Streamlit's own slider only fires on
+    release. `constrain='domain'` + a physical scaleratio letterbox each slice
+    into a square panel with correct anatomical aspect.
+    """
+    data = _load_ct_label(case_id)
+    ct, label = data["ct"], data["label"]
+    sx, sy, sz = spacing_xyz
+    ds = 2  # in-plane downsample to keep the embedded frame data light
+    # vertical/horizontal physical spacing per plane → aspect ratio
+    vratio = {0: sy / sx, 1: sz / sx, 2: sz / sy}[axis]
+    n = ct.shape[axis]
+    left_rgb = tuple(int(LEFT_COLOR[k:k + 2], 16) for k in (1, 3, 5))
+    right_rgb = tuple(int(RIGHT_COLOR[k:k + 2], 16) for k in (1, 3, 5))
+
+    def _rgb(i: int) -> np.ndarray:
+        c = np.take(ct, i, axis=axis)[::ds, ::ds]
+        l = np.take(label, i, axis=axis)[::ds, ::ds]
+        g = ((np.clip(c, -1000, 400) + 1000) / 1400 * 255).astype(np.float32)
+        rgb = np.stack([g, g, g], axis=-1)
+        for lid, col in ((1, left_rgb), (2, right_rgb)):
+            m = l == lid
+            rgb[m] = 0.55 * rgb[m] + 0.45 * np.array(col, dtype=np.float32)
+        # go.Image draws row 0 at top, which already matches the array's
+        # anatomical orientation here (verified against the tri-planar view).
+        return rgb.clip(0, 255).astype(np.uint8)
+
+    # Stride to ~120 frames max so the slider stays snappy on thick stacks.
+    stride = max(1, int(np.ceil(n / 120)))
+    idxs = list(range(0, n, stride))
+    if default_idx not in idxs:
+        idxs = sorted(set(idxs) | {default_idx})
+
+    base = [go.Image(z=_rgb(default_idx), dy=vratio, hoverinfo="skip")]
+    frames, steps = [], []
+    for i in idxs:
+        frames.append(go.Frame(name=str(i), data=[dict(type="image", z=_rgb(i))]))
+        steps.append(dict(method="animate", label=str(i),
+                          args=[[str(i)], dict(mode="immediate",
+                                               frame=dict(duration=0, redraw=True),
+                                               transition=dict(duration=0))]))
+    slider = dict(active=idxs.index(default_idx), steps=steps, pad=dict(t=28, b=0),
+                  currentvalue=dict(prefix="slice ", font=dict(size=12)))
+    fig = go.Figure(data=base, frames=frames)
+    fig.update_layout(
+        height=360, margin=dict(l=6, r=6, t=6, b=6), sliders=[slider],
+        xaxis=dict(visible=False, constrain="domain"),
+        yaxis=dict(visible=False, scaleanchor="x", scaleratio=1, constrain="domain"),
+    )
     return fig
 
 
@@ -622,16 +650,18 @@ def render_geometry_report() -> None:
         if data is None or data["label"] is None:
             st.info("CT/label not found for this case (needs data/images + data/labels).")
         else:
-            ct, label = data["ct"], data["label"]
-            nz, ny, nx = ct.shape
-            dz, dy, dx = _airway_center(label)
-            s1, s2, s3 = st.columns(3)
-            cz = s1.slider("Axial (z)", 0, nz - 1, dz, key=f"cz_{case_id}")
-            cy = s2.slider("Coronal (y)", 0, ny - 1, dy, key=f"cy_{case_id}")
-            cx = s3.slider("Sagittal (x)", 0, nx - 1, dx, key=f"cx_{case_id}")
-            st.plotly_chart(_triplanar_ct_fig(ct, label, cz, cy, cx), use_container_width=True)
+            dz, dy, dx = _airway_center(data["label"])
+            sp = data["spacing_xyz"]
+            cols = st.columns(3)
+            for col, (axis, default, title) in zip(
+                cols, ((0, dz, "Axial"), (1, dy, "Coronal"), (2, dx, "Sagittal"))):
+                with col:
+                    st.markdown(f"**{title}**")
+                    st.plotly_chart(
+                        _scrubber_fig(case_id, axis, default, sp),
+                        use_container_width=True, key=f"scrub_{case_id}_{axis}")
             st.caption("CT windowed to soft tissue; left cavity blue, right cavity red. "
-                       "Drag the sliders to scroll through slices.")
+                       "Drag each slider — the slice updates live as you scrub.")
 
     with tab_3d:
         data = _load_ct_label(case_id)
