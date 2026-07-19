@@ -384,6 +384,28 @@ def _compute_streamlines(case_id: str, n_seeds: int = 220) -> dict | None:
     return {"paths": paths, "speeds": speeds, "vmax": vmax}
 
 
+@st.cache_data(show_spinner=False)
+def _airway_surface_trace(case_id: str):
+    """Semi-transparent airway surface from the flow grid, aligned to streamlines."""
+    from skimage import measure
+
+    npz = OUTPUTS / case_id / f"{case_id}_flow.npz"
+    if not npz.is_file():
+        return None
+    d = np.load(npz)
+    airway = d["airway"].astype(np.float32)
+    ox, oy, oz = d["origin_xyz_mm"]
+    sx, sy, sz = d["spacing_xyz_mm"]
+    if airway.sum() < 50:
+        return None
+    v, f, _n, _val = measure.marching_cubes(airway, level=0.5, spacing=(sz, sy, sx), step_size=2)
+    return go.Mesh3d(
+        x=v[:, 2] + ox, y=v[:, 1] + oy, z=v[:, 0] + oz,
+        i=f[:, 0], j=f[:, 1], k=f[:, 2],
+        color="rgb(200,208,225)", opacity=0.18, name="airway", showlegend=False,
+        hoverinfo="skip", lighting=dict(ambient=0.7, diffuse=0.6, specular=0.05))
+
+
 def _zone_of(frac: float) -> int:
     for zi, (lo, hi, _nm, _c) in enumerate(AIRWAY_ZONES):
         if lo <= frac < hi:
@@ -829,7 +851,9 @@ def render_nasal_airflow() -> None:
     # Prefer a physiological case (P001) over the cadaver VH for flow quality.
     default = cases.index("P001") if "P001" in cases else 0
     case_id = st.selectbox("Case", cases, index=default)
-    animate = st.checkbox("Animate particles", value=True)
+    c1, c2 = st.columns(2)
+    animate = c1.checkbox("Animate particles", value=True)
+    show_anatomy = c2.checkbox("Show airway (semi-transparent)", value=True)
 
     sl = _compute_streamlines(case_id)
     if sl is None or not sl["paths"]:
@@ -873,13 +897,23 @@ def render_nasal_airflow() -> None:
                     colorbar=dict(title="m/s", len=0.6), showscale=True),
         name="airflow", hoverinfo="skip")
 
-    fig = go.Figure(data=[line_trace, particle_trace])
+    # Trace order: [airway surface (optional)], streamlines, particles. Track the
+    # particle index so the animation updates the right trace.
+    traces = []
+    if show_anatomy:
+        surf = _airway_surface_trace(case_id)
+        if surf is not None:
+            traces.append(surf)
+    traces.append(line_trace)
+    particle_idx = len(traces)
+    traces.append(particle_trace)
+
+    fig = go.Figure(data=traces)
     if animate:
         frames = []
         for t in range(T):
             fx, fy, fz, fc = _particle_frame(t)
-            # Animate only the particle trace (index 1); the streamlines stay put.
-            frames.append(go.Frame(name=str(t), traces=[1], data=[
+            frames.append(go.Frame(name=str(t), traces=[particle_idx], data=[
                 dict(type="scatter3d", x=fx, y=fy, z=fz,
                      marker=dict(color=fc, colorscale="Turbo", cmin=0, cmax=vmax, size=4))]))
         fig.frames = frames
