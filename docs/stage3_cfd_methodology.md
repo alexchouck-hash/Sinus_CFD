@@ -184,9 +184,29 @@ Two correctness checks also passed:
   dict/scheme error on the first attempt.
 
 This is the metric the roadmap calls the strongest correlate of *perceived*
-patency, now producing a trustworthy global number. Next thermal step (not yet
-done): a spatial **wall heat-flux map** (near-wall ∂T/∂n × k) to show *where*
-cooling concentrates, which is what a surgeon would act on.
+patency, now producing a trustworthy global number. Next thermal step: a spatial
+**wall heat-flux map** (near-wall ∂T/∂n × k) to show *where* cooling
+concentrates — tooling built (`scripts/wall_heat_flux_map.py`, `gradT`
+functionObject), pending a run with it enabled.
+
+### Mesh independence — done, R = 0.052 Pa·s/mL is validated
+
+Ran P001 at three controlled resolutions (`foam/mesh_study.docker`,
+`scripts/mesh_independence_report.py`), each a fresh clean run differing only in
+snappyHexMesh refinement:
+
+| Refine level | Cells | ΔP (Pa) | R (Pa·s/mL) | Δ vs coarser |
+|---|---:|---:|---:|---:|
+| 1 | 74,895 | 16.24 | 0.0541 | — |
+| 2 (default) | 259,283 | 15.66 | 0.0522 | 3.5% |
+| 3 | 816,840 | 15.61 | 0.0520 | **0.3%** |
+
+An 11x increase in cell count moved ΔP by only 0.3% at the finest step (well
+under a 5% tolerance), so **R = 0.052 Pa·s/mL is mesh-independent, not a
+resolution artifact** — and the level-2 default (259k cells) was already
+converged. Together with the flow sweep (matches the published range at
+rhinomanometry's own ~150 Pa condition), the Stage-3 resistance is now validated
+on both axes: numerically converged **and** physiologically correct.
 
 ## Corrected lesson for anyone re-running this
 
