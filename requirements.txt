@@ -6,3 +6,4 @@ trimesh>=4.0
 matplotlib>=3.8
 streamlit>=1.28
 plotly>=5.18
+Pillow>=10.0

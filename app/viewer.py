@@ -391,27 +391,34 @@ def _scrubber_fig(case_id: str, axis: int, default_idx: int, spacing_xyz: tuple)
     release. `constrain='domain'` + a physical scaleratio letterbox each slice
     into a square panel with correct anatomical aspect.
     """
+    import base64
+    import io
+
+    from PIL import Image
+
     data = _load_ct_label(case_id)
     ct, label = data["ct"], data["label"]
     sx, sy, sz = spacing_xyz
-    ds = 2  # in-plane downsample to keep the embedded frame data light
     # vertical/horizontal physical spacing per plane → aspect ratio
     vratio = {0: sy / sx, 1: sz / sx, 2: sz / sy}[axis]
     n = ct.shape[axis]
     left_rgb = tuple(int(LEFT_COLOR[k:k + 2], 16) for k in (1, 3, 5))
     right_rgb = tuple(int(RIGHT_COLOR[k:k + 2], 16) for k in (1, 3, 5))
 
-    def _rgb(i: int) -> np.ndarray:
-        c = np.take(ct, i, axis=axis)[::ds, ::ds]
-        l = np.take(label, i, axis=axis)[::ds, ::ds]
+    def _png_uri(i: int) -> str:
+        # Full-resolution slice, PNG-compressed to a data URI. PNG shrinks CT
+        # slices ~4x (large uniform regions), so full res is actually *smaller*
+        # than half-res raw arrays while keeping live client-side scrubbing.
+        c = np.take(ct, i, axis=axis)
+        l = np.take(label, i, axis=axis)
         g = ((np.clip(c, -1000, 400) + 1000) / 1400 * 255).astype(np.float32)
         rgb = np.stack([g, g, g], axis=-1)
         for lid, col in ((1, left_rgb), (2, right_rgb)):
             m = l == lid
             rgb[m] = 0.55 * rgb[m] + 0.45 * np.array(col, dtype=np.float32)
-        # go.Image draws row 0 at top, which already matches the array's
-        # anatomical orientation here (verified against the tri-planar view).
-        return rgb.clip(0, 255).astype(np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(rgb.clip(0, 255).astype(np.uint8)).save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
     # Stride to ~120 frames max so the slider stays snappy on thick stacks.
     stride = max(1, int(np.ceil(n / 120)))
@@ -419,10 +426,11 @@ def _scrubber_fig(case_id: str, axis: int, default_idx: int, spacing_xyz: tuple)
     if default_idx not in idxs:
         idxs = sorted(set(idxs) | {default_idx})
 
-    base = [go.Image(z=_rgb(default_idx), dy=vratio, hoverinfo="skip")]
+    base = [go.Image(source=_png_uri(default_idx), dy=vratio, hoverinfo="skip")]
     frames, steps = [], []
     for i in idxs:
-        frames.append(go.Frame(name=str(i), data=[dict(type="image", z=_rgb(i))]))
+        frames.append(go.Frame(name=str(i),
+                                data=[dict(type="image", source=_png_uri(i), dy=vratio)]))
         steps.append(dict(method="animate", label=str(i),
                           args=[[str(i)], dict(mode="immediate",
                                                frame=dict(duration=0, redraw=True),
