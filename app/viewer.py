@@ -319,6 +319,71 @@ def list_wholeairway_cases() -> list[str]:
     ]
 
 
+def list_flow_cases() -> list[str]:
+    """Cases with an imported CFD velocity field (<case>_flow.npz)."""
+    if not OUTPUTS.is_dir():
+        return []
+    return [
+        d.name for d in sorted(OUTPUTS.iterdir())
+        if d.is_dir() and (d / f"{d.name}_flow.npz").is_file()
+    ]
+
+
+@st.cache_data(show_spinner=False)
+def _compute_streamlines(case_id: str, n_seeds: int = 220) -> dict | None:
+    """
+    Integrate streamlines through the CFD velocity field, seeded across the
+    nostril inlets. Returns physical-mm paths + per-point speed.
+    """
+    from scipy.ndimage import map_coordinates
+
+    npz = OUTPUTS / case_id / f"{case_id}_flow.npz"
+    if not npz.is_file():
+        return None
+    d = np.load(npz)
+    ux, uy, uz = d["ux"], d["uy"], d["uz"]
+    airway, inlet, speed = d["airway"], d["inlet_mask"], d["speed"]
+    ox, oy, oz = d["origin_xyz_mm"]
+    sx, sy, sz = d["spacing_xyz_mm"]
+    nz, ny, nx = airway.shape
+    vmax = float(speed[airway > 0].max()) if airway.any() else 1.0
+
+    def _one(seed):
+        p = np.array(seed, float)
+        path, sps = [p.copy()], []
+        for _ in range(900):
+            z, y, x = p
+            if not (1 <= z < nz - 2 and 1 <= y < ny - 2 and 1 <= x < nx - 2):
+                break
+            c = np.array([[z], [y], [x]])
+            vz = map_coordinates(uz, c, order=1)[0]
+            vy = map_coordinates(uy, c, order=1)[0]
+            vx = map_coordinates(ux, c, order=1)[0]
+            s = float((vx * vx + vy * vy + vz * vz) ** 0.5)
+            if s < 0.02:
+                break
+            p = p + 0.7 * np.array([vz, vy, vx]) / s
+            zi, yi, xi = np.clip(np.round(p).astype(int), 0, [nz - 1, ny - 1, nx - 1])
+            if airway[zi, yi, xi] == 0:
+                break
+            path.append(p.copy())
+            sps.append(s)
+        return np.array(path), np.array(sps + [sps[-1]] if sps else [0.0])
+
+    iz, iy, ix = np.where(inlet > 0)
+    if len(iz) == 0:
+        return None
+    rng = np.random.default_rng(0)
+    sel = rng.choice(len(iz), min(n_seeds, len(iz)), replace=False)
+    paths, speeds = [], []
+    for k in sel:
+        pa, sp = _one((iz[k], iy[k], ix[k]))
+        if len(pa) > 12:
+            paths.append(np.column_stack([pa[:, 2] * sx + ox, pa[:, 1] * sy + oy, pa[:, 0] * sz + oz]))
+            speeds.append(sp)
+    return {"paths": paths, "speeds": speeds, "vmax": vmax}
+
+
 def _zone_of(frac: float) -> int:
     for zi, (lo, hi, _nm, _c) in enumerate(AIRWAY_ZONES):
         if lo <= frac < hi:
@@ -746,6 +811,109 @@ def render_whole_airway() -> None:
             "- Visible Human is a cadaver with a synthesized pharyngeal conduit, so "
             "its caudal (pharynx/trachea) zone is partly artificial — see "
             "`docs/visible_human_end_to_end.md`.")
+
+
+def render_nasal_airflow() -> None:
+    """Streamlines of the CFD velocity field through the nasal airway, animated."""
+    st.title("Sinus_CFD — Nasal Airflow")
+    st.caption("Streamlines of the OpenFOAM velocity field, seeded at the nostrils "
+               "and coloured by speed — press ▶ to animate the flow")
+
+    cases = list_flow_cases()
+    if not cases:
+        st.info(
+            "No CFD velocity fields found. Import an OpenFOAM result:\n\n"
+            "```\npy -3.12 scripts/import_openfoam_results.py --case P001\n```")
+        return
+
+    # Prefer a physiological case (P001) over the cadaver VH for flow quality.
+    default = cases.index("P001") if "P001" in cases else 0
+    case_id = st.selectbox("Case", cases, index=default)
+    animate = st.checkbox("Animate particles", value=True)
+
+    sl = _compute_streamlines(case_id)
+    if sl is None or not sl["paths"]:
+        st.warning("Could not integrate streamlines for this case (weak/patchy "
+                   "velocity field — try a case with a stronger, converged CFD).")
+        return
+    paths, speeds, vmax = sl["paths"], sl["speeds"], sl["vmax"]
+    st.caption(f"**{len(paths)}** streamlines · peak speed **{vmax:.2f} m/s**")
+
+    # Static streamlines: one Scatter3d, None-separated segments, faint.
+    xs, ys, zs = [], [], []
+    for p in paths:
+        xs += list(p[:, 0]) + [None]
+        ys += list(p[:, 1]) + [None]
+        zs += list(p[:, 2]) + [None]
+    line_trace = go.Scatter3d(
+        x=xs, y=ys, z=zs, mode="lines",
+        line=dict(color="rgba(120,150,200,0.35)", width=2),
+        name="streamlines", hoverinfo="skip")
+
+    # Animated particles: a marker per streamline, advancing along its path,
+    # coloured by local speed (Turbo). Staggered phase → continuous flow.
+    n_particles = min(len(paths), 140)
+    pick = np.linspace(0, len(paths) - 1, n_particles).astype(int)
+    T = 40
+    phases = [(i * 7) % len(paths[j]) for i, j in enumerate(pick)]
+
+    def _particle_frame(t: int):
+        px, py, pz, pc = [], [], [], []
+        for i, j in enumerate(pick):
+            path, sp = paths[j], speeds[j]
+            idx = (phases[i] + t * max(1, len(path) // T)) % len(path)
+            px.append(path[idx, 0]); py.append(path[idx, 1]); pz.append(path[idx, 2])
+            pc.append(float(sp[min(idx, len(sp) - 1)]))
+        return px, py, pz, pc
+
+    px0, py0, pz0, pc0 = _particle_frame(0)
+    particle_trace = go.Scatter3d(
+        x=px0, y=py0, z=pz0, mode="markers",
+        marker=dict(size=4, color=pc0, colorscale="Turbo", cmin=0, cmax=vmax,
+                    colorbar=dict(title="m/s", len=0.6), showscale=True),
+        name="airflow", hoverinfo="skip")
+
+    fig = go.Figure(data=[line_trace, particle_trace])
+    if animate:
+        frames = []
+        for t in range(T):
+            fx, fy, fz, fc = _particle_frame(t)
+            # Animate only the particle trace (index 1); the streamlines stay put.
+            frames.append(go.Frame(name=str(t), traces=[1], data=[
+                dict(type="scatter3d", x=fx, y=fy, z=fz,
+                     marker=dict(color=fc, colorscale="Turbo", cmin=0, cmax=vmax, size=4))]))
+        fig.frames = frames
+        fig.update_layout(updatemenus=[dict(
+            type="buttons", showactive=False, x=0.05, y=0.05,
+            buttons=[
+                dict(label="▶ Play", method="animate",
+                     args=[None, dict(frame=dict(duration=90, redraw=True),
+                                      fromcurrent=True, transition=dict(duration=0))]),
+                dict(label="⏸ Pause", method="animate",
+                     args=[[None], dict(frame=dict(duration=0, redraw=False),
+                                        mode="immediate")]),
+            ])])
+    fig.update_layout(
+        height=600, margin=dict(l=0, r=0, t=10, b=0),
+        scene=dict(aspectmode="data", xaxis_title="x (mm)",
+                   yaxis_title="y (mm)", zaxis_title="z (mm)"),
+        legend=dict(orientation="h", yanchor="bottom", y=0.98))
+    st.plotly_chart(fig, use_container_width=True, key=f"airflow_{case_id}")
+    st.caption("Drag to orbit. Faint lines are streamlines; coloured dots are air "
+               "particles flowing along them (▶ Play). Hot colours = faster flow "
+               "(typically at the nasal valve / narrowest cross-section).")
+
+    with st.expander("Method & caveats"):
+        st.markdown(
+            "- Streamlines integrate the imported OpenFOAM velocity field "
+            "(`scripts/import_openfoam_results.py`), seeded across the nostril "
+            "inlets and stopped at the airway wall.\n"
+            "- **P001** (NasalSeg) has a validated physiological flow (peak ~5 m/s "
+            "at the valve); the **Visible Human** field is weak/patchy (cadaver "
+            "geometry) and may yield few streamlines — see "
+            "`docs/visible_human_end_to_end.md`.\n"
+            "- The animation is illustrative pathline motion, not time-resolved "
+            "(the solve is steady-state inspiration).")
 
 
 @st.cache_data(show_spinner=False)
@@ -1773,17 +1941,22 @@ def main() -> None:
 
     mode = st.sidebar.radio(
         "View",
-        ("Geometry (MVP)", "Whole airway (zones)", "Virtual surgery", "Airflow demo"),
+        ("Geometry (MVP)", "Whole airway (zones)", "Nasal airflow",
+         "Virtual surgery", "Airflow demo"),
         help="Geometry: per-side airway metrics + 3D/CT + wall-flux (Stages 2-3). "
              "Whole airway: full nares→trachea airway coloured by anatomical zone. "
+             "Nasal airflow: animated CFD streamlines through the nose. "
              "Virtual surgery: pre/post edit comparison (Stage 4). "
-             "Airflow: full-head Visible Human CFD.",
+             "Airflow demo: legacy full-head Visible Human view.",
     )
     if mode == "Geometry (MVP)":
         render_geometry_report()
         return
     if mode == "Whole airway (zones)":
         render_whole_airway()
+        return
+    if mode == "Nasal airflow":
+        render_nasal_airflow()
         return
     if mode == "Virtual surgery":
         render_virtual_surgery()
