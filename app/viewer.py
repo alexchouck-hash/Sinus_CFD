@@ -360,15 +360,16 @@ def _area_profile_fig(report: dict) -> go.Figure:
     return fig
 
 
-def _triplanar_ct_fig(ct: np.ndarray, label: np.ndarray, spacing_xyz, report: dict) -> go.Figure:
-    """CT tri-planar with L/R cavity overlay, centred on the airway."""
+def _airway_center(label: np.ndarray) -> tuple[int, int, int]:
     airway = np.isin(label, (1, 2, 3))
     if airway.any():
         zz, yy, xx = np.where(airway)
-        cz, cy, cx = int(np.median(zz)), int(np.median(yy)), int(np.median(xx))
-    else:
-        cz, cy, cx = (s // 2 for s in ct.shape)
+        return int(np.median(zz)), int(np.median(yy)), int(np.median(xx))
+    return tuple(s // 2 for s in label.shape)  # type: ignore[return-value]
 
+
+def _triplanar_ct_fig(ct: np.ndarray, label: np.ndarray, cz: int, cy: int, cx: int) -> go.Figure:
+    """CT tri-planar with L/R cavity overlay at the given slice indices."""
     fig = make_subplots(rows=1, cols=3, subplot_titles=(
         f"Axial z={cz}", f"Coronal y={cy}", f"Sagittal x={cx}"), horizontal_spacing=0.04)
 
@@ -496,10 +497,16 @@ def render_geometry_report() -> None:
         if data is None or data["label"] is None:
             st.info("CT/label not found for this case (needs data/images + data/labels).")
         else:
-            st.plotly_chart(
-                _triplanar_ct_fig(data["ct"], data["label"], data["spacing_xyz"], report),
-                use_container_width=True)
-            st.caption("CT windowed to soft tissue; left cavity blue, right cavity red.")
+            ct, label = data["ct"], data["label"]
+            nz, ny, nx = ct.shape
+            dz, dy, dx = _airway_center(label)
+            s1, s2, s3 = st.columns(3)
+            cz = s1.slider("Axial (z)", 0, nz - 1, dz, key=f"cz_{case_id}")
+            cy = s2.slider("Coronal (y)", 0, ny - 1, dy, key=f"cy_{case_id}")
+            cx = s3.slider("Sagittal (x)", 0, nx - 1, dx, key=f"cx_{case_id}")
+            st.plotly_chart(_triplanar_ct_fig(ct, label, cz, cy, cx), use_container_width=True)
+            st.caption("CT windowed to soft tissue; left cavity blue, right cavity red. "
+                       "Drag the sliders to scroll through slices.")
 
     with tab_3d:
         data = _load_ct_label(case_id)
