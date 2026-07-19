@@ -297,6 +297,35 @@ def list_surgery_reports() -> dict[str, Path]:
     return out
 
 
+# Approximate anatomical zones along the airway centerline (nares→trachea), by
+# normalized arc-length fraction. Fractions are anatomically motivated, not a
+# validated per-patient segmentation — position along the passage, not learned.
+AIRWAY_ZONES = [
+    (0.00, 0.11, "vestibule", "#8dd3c7"),
+    (0.11, 0.16, "nasal valve", "#fb8072"),
+    (0.16, 0.53, "nasal cavity / turbinates", "#80b1d3"),
+    (0.53, 0.78, "nasopharynx", "#b3de69"),
+    (0.78, 1.01, "pharynx / trachea", "#bebada"),
+]
+
+
+def list_wholeairway_cases() -> list[str]:
+    """Cases with a passage centerline (analyze_passage output) — whole airway."""
+    if not OUTPUTS.is_dir():
+        return []
+    return [
+        d.name for d in sorted(OUTPUTS.iterdir())
+        if d.is_dir() and (d / f"{d.name}_passage.json").is_file()
+    ]
+
+
+def _zone_of(frac: float) -> int:
+    for zi, (lo, hi, _nm, _c) in enumerate(AIRWAY_ZONES):
+        if lo <= frac < hi:
+            return zi
+    return len(AIRWAY_ZONES) - 1
+
+
 def _resolve_case_ct_label(case_id: str) -> tuple[Path | None, Path | None]:
     """Find (image, label) NRRD paths for a geometry-report case."""
     # NasalSeg native case (P001, P065, …)
@@ -585,6 +614,138 @@ def render_virtual_surgery() -> None:
             "- Feed the edited label to the CFD pipeline for a pre/post *resistance* "
             "comparison. See `docs/stage4_virtual_surgery.md`.")
         st.json({k: v for k, v in rep.items() if k not in ("pre", "post")})
+
+
+@st.cache_data(show_spinner=False)
+def _airway_zone_data(case_id: str) -> dict | None:
+    """
+    Whole-airway surface coloured by anatomical zone (nares→trachea), plus the
+    per-cross-section area-vs-position with the same zoning. Zones come from
+    normalized arc-length along the passage centerline.
+    """
+    import json
+
+    from scipy.spatial import cKDTree
+    from skimage import measure
+    import SimpleITK as sitk
+
+    cdir = OUTPUTS / case_id
+    pj = cdir / f"{case_id}_passage.json"
+    lumen = cdir / f"{case_id}_passage_lumen.nrrd"
+    if not lumen.is_file():
+        lumen = cdir / f"{case_id}_airway_mask.nrrd"
+    if not pj.is_file() or not lumen.is_file():
+        return None
+    passage = json.loads(pj.read_text(encoding="utf-8"))
+    cl = np.asarray(passage["centerline_mm"], dtype=float)
+    origin = np.asarray(passage["origin_xyz_mm"], dtype=float)
+    if len(cl) < 2:
+        return None
+    seg = np.linalg.norm(np.diff(cl, axis=0), axis=1)
+    frac = np.concatenate([[0.0], np.cumsum(seg)])
+    frac = frac / frac[-1]
+
+    img = sitk.ReadImage(str(lumen))
+    mask = sitk.GetArrayFromImage(img).astype(np.float32)
+    sx, sy, sz = (float(v) for v in img.GetSpacing())
+    verts, faces, _n, _v = measure.marching_cubes(mask, level=0.5, spacing=(sz, sy, sx), step_size=2)
+    vphys = np.column_stack([verts[:, 2] + origin[0], verts[:, 1] + origin[1], verts[:, 0] + origin[2]])
+    _d, nn = cKDTree(cl).query(vphys)
+    vzone = np.array([_zone_of(frac[i]) for i in nn])
+    hexcol = [z[3] for z in AIRWAY_ZONES]
+    rgb = {i: tuple(int(hexcol[i][k:k + 2], 16) for k in (1, 3, 5)) for i in range(len(AIRWAY_ZONES))}
+    vcolor = np.array([rgb[z] for z in vzone], dtype=np.uint8)
+
+    # Area-vs-position: map each cross-section to its centerline fraction.
+    xsec = passage.get("cross_sections") or []
+    area_pts = []
+    if xsec:
+        cl_idx_tree = cKDTree(cl)
+        for xs in xsec:
+            zyx = xs.get("zyx")
+            if zyx is None:
+                continue
+            p = np.array([zyx[2] * sx + origin[0], zyx[1] * sy + origin[1], zyx[0] * sz + origin[2]])
+            _dd, ni = cl_idx_tree.query(p)
+            area_pts.append((float(frac[ni]), float(xs["area_mm2"])))
+        area_pts.sort()
+    return {
+        "verts": vphys, "faces": faces, "vcolor": vcolor,
+        "length_mm": float(np.linalg.norm(np.diff(cl, axis=0), axis=1).sum()),
+        "area_pts": area_pts,
+    }
+
+
+def render_whole_airway() -> None:
+    """Whole nares→trachea airway coloured by approximate anatomical zone."""
+    st.title("Sinus_CFD — Whole Airway (anatomical zones)")
+    st.caption("Full nares→trachea airway from a whole-head scan, coloured by "
+               "approximate anatomical region along the centerline")
+
+    cases = list_wholeairway_cases()
+    if not cases:
+        st.info(
+            "No whole-airway cases found (need analyze_passage output). Process a "
+            "whole-head CT:\n\n```\npy -3.12 scripts/process_whole_head.py --skip-flow\n"
+            "py -3.12 scripts/analyze_passage.py --case VisibleHuman_Head --skip-flow\n```")
+        return
+
+    default = cases.index("VisibleHuman_Head") if "VisibleHuman_Head" in cases else 0
+    case_id = st.selectbox("Case", cases, index=default)
+    data = _airway_zone_data(case_id)
+    if data is None:
+        st.error("Could not build the zoned airway for this case.")
+        return
+
+    st.caption(f"Airway centerline length **{data['length_mm']:.0f} mm** (nares → trachea)")
+
+    v, f, vc = data["verts"], data["faces"], data["vcolor"]
+    mesh = go.Mesh3d(
+        x=v[:, 0], y=v[:, 1], z=v[:, 2], i=f[:, 0], j=f[:, 1], k=f[:, 2],
+        vertexcolor=vc, opacity=1.0, name="airway", showlegend=False,
+        lighting=dict(ambient=0.6, diffuse=0.8, specular=0.15))
+    proxies = [go.Scatter3d(
+        x=[None], y=[None], z=[None], mode="markers",
+        marker=dict(size=9, color=c), name=nm)
+        for (_lo, _hi, nm, c) in AIRWAY_ZONES]
+    fig = go.Figure(data=[mesh] + proxies)
+    fig.update_layout(
+        height=580, margin=dict(l=0, r=0, t=10, b=0),
+        scene=dict(aspectmode="data", xaxis_title="x (mm)",
+                   yaxis_title="y (mm)", zaxis_title="z (mm)"),
+        legend=dict(orientation="h", yanchor="bottom", y=0.0))
+    st.plotly_chart(fig, use_container_width=True, key=f"airway3d_{case_id}")
+    st.caption("Rotatable whole airway — drag to orbit. Zones are approximate, "
+               "assigned by position along the nares→trachea centerline.")
+
+    if data["area_pts"]:
+        fracs = [p[0] for p in data["area_pts"]]
+        areas = [p[1] for p in data["area_pts"]]
+        af = go.Figure()
+        for lo, hi, nm, c in AIRWAY_ZONES:
+            af.add_vrect(x0=lo, x1=min(hi, 1.0), fillcolor=c, opacity=0.18,
+                         line_width=0, annotation_text=nm.split(" / ")[0],
+                         annotation_position="top", annotation=dict(font_size=9))
+        af.add_trace(go.Scatter(x=fracs, y=areas, mode="lines+markers",
+                                line=dict(color="#333", width=2), name="area"))
+        af.update_layout(height=320, margin=dict(l=60, r=20, t=30, b=40),
+                         xaxis_title="position along airway (0 = naris, 1 = trachea)",
+                         yaxis_title="cross-sectional area (mm²)", showlegend=False)
+        st.plotly_chart(af, use_container_width=True, key=f"airway_area_{case_id}")
+        st.caption("Cross-sectional area from nares to trachea, shaded by zone. "
+                   "The dip is the airway's minimal cross-section.")
+
+    with st.expander("Method & caveats"):
+        st.markdown(
+            "- Zones are assigned by **normalized arc-length along the passage "
+            "centerline** (nares=0 → trachea=1) using anatomically-motivated "
+            "fractions — a position-based approximation, **not** a validated "
+            "anatomical segmentation.\n"
+            "- Best on a **whole-head** scan (e.g. Visible Human); NasalSeg crops "
+            "stop at the nasopharynx.\n"
+            "- Visible Human is a cadaver with a synthesized pharyngeal conduit, so "
+            "its caudal (pharynx/trachea) zone is partly artificial — see "
+            "`docs/visible_human_end_to_end.md`.")
 
 
 @st.cache_data(show_spinner=False)
@@ -1612,13 +1773,17 @@ def main() -> None:
 
     mode = st.sidebar.radio(
         "View",
-        ("Geometry (MVP)", "Virtual surgery", "Airflow demo"),
+        ("Geometry (MVP)", "Whole airway (zones)", "Virtual surgery", "Airflow demo"),
         help="Geometry: per-side airway metrics + 3D/CT + wall-flux (Stages 2-3). "
+             "Whole airway: full nares→trachea airway coloured by anatomical zone. "
              "Virtual surgery: pre/post edit comparison (Stage 4). "
              "Airflow: full-head Visible Human CFD.",
     )
     if mode == "Geometry (MVP)":
         render_geometry_report()
+        return
+    if mode == "Whole airway (zones)":
+        render_whole_airway()
         return
     if mode == "Virtual surgery":
         render_virtual_surgery()
