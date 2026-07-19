@@ -435,11 +435,14 @@ def _scrubber_fig(case_id: str, axis: int, default_idx: int, spacing_xyz: tuple)
                           args=[[str(i)], dict(mode="immediate",
                                                frame=dict(duration=0, redraw=True),
                                                transition=dict(duration=0))]))
-    slider = dict(active=idxs.index(default_idx), steps=steps, pad=dict(t=28, b=0),
+    slider = dict(active=idxs.index(default_idx), steps=steps, pad=dict(t=30, b=10),
+                  y=0, yanchor="top", len=0.9, x=0.05,
                   currentvalue=dict(prefix="slice ", font=dict(size=12)))
     fig = go.Figure(data=base, frames=frames)
+    # Extra bottom margin reserves room for the slider so it isn't clipped on
+    # first render (the "disappears until you double-click" glitch).
     fig.update_layout(
-        height=360, margin=dict(l=6, r=6, t=6, b=6), sliders=[slider],
+        height=400, margin=dict(l=6, r=6, t=6, b=70), sliders=[slider],
         xaxis=dict(visible=False, constrain="domain"),
         yaxis=dict(visible=False, scaleanchor="x", scaleratio=1, constrain="domain"),
     )
@@ -448,7 +451,12 @@ def _scrubber_fig(case_id: str, axis: int, default_idx: int, spacing_xyz: tuple)
 
 @st.cache_data(show_spinner=False)
 def _airway_3d_traces(case_id: str, spacing_xyz: tuple) -> list:
-    """Marching-cubes L/R cavity + nasopharynx surfaces as Plotly Mesh3d."""
+    """
+    One connected airway surface (L/R nasal cavity + nasopharynx merged and
+    gap-bridged) with each region colour-coded per vertex — so it reads as a
+    single reconstructed airway, not three floating blobs.
+    """
+    from scipy import ndimage as ndi
     from skimage import measure
 
     data = _load_ct_label(case_id)
@@ -456,27 +464,47 @@ def _airway_3d_traces(case_id: str, spacing_xyz: tuple) -> list:
         return []
     label = data["label"]
     sx, sy, sz = spacing_xyz
-    traces = []
-    parts = [(1, "left cavity", LEFT_COLOR, 0.55),
-             (2, "right cavity", RIGHT_COLOR, 0.55),
-             (3, "nasopharynx", "#7fbf7b", 0.35)]
-    for lid, nm, color, op in parts:
-        mask = label == lid
-        if mask.sum() < 50:
-            continue
-        try:
-            # step_size=2 ~quarters the face count for a lighter/faster WebGL mesh
-            verts, faces, _n, _v = measure.marching_cubes(
-                mask.astype(np.float32), level=0.5, spacing=(sz, sy, sx), step_size=2)
-        except (ValueError, RuntimeError):
-            continue
-        # verts are (z,y,x) physical → plot as (x,y,z)
-        traces.append(go.Mesh3d(
-            x=verts[:, 2], y=verts[:, 1], z=verts[:, 0],
-            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-            color=color, opacity=op, name=nm, showlegend=True,
-            lighting=dict(ambient=0.55, diffuse=0.8, specular=0.2), flatshading=False,
-        ))
+
+    merged = np.isin(label, (1, 2, 3))
+    if merged.sum() < 50:
+        return []
+    # Bridge 1-2 voxel gaps (e.g. cavity↔nasopharynx at the choanae) so the
+    # airway is a single connected surface.
+    merged = ndi.binary_closing(merged, structure=np.ones((3, 3, 3)), iterations=1)
+
+    try:
+        verts, faces, _n, _v = measure.marching_cubes(
+            merged.astype(np.float32), level=0.5, spacing=(sz, sy, sx), step_size=1)
+    except (ValueError, RuntimeError):
+        return []
+
+    # Colour each vertex by the nearest *original* label (handles closed-gap
+    # voxels and the septal boundary between L and R).
+    _d, (iz, iy, ix) = ndi.distance_transform_edt(label == 0, return_indices=True)
+    vz = np.clip(np.round(verts[:, 0] / sz).astype(int), 0, label.shape[0] - 1)
+    vy = np.clip(np.round(verts[:, 1] / sy).astype(int), 0, label.shape[1] - 1)
+    vx = np.clip(np.round(verts[:, 2] / sx).astype(int), 0, label.shape[2] - 1)
+    region = label[iz[vz, vy, vx], iy[vz, vy, vx], ix[vz, vy, vx]]
+
+    col = {
+        1: tuple(int(LEFT_COLOR[k:k + 2], 16) for k in (1, 3, 5)),
+        2: tuple(int(RIGHT_COLOR[k:k + 2], 16) for k in (1, 3, 5)),
+        3: (127, 191, 123),
+    }
+    vcolor = np.array([col.get(int(r), (160, 160, 160)) for r in region], dtype=np.uint8)
+
+    traces = [go.Mesh3d(
+        x=verts[:, 2], y=verts[:, 1], z=verts[:, 0],
+        i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+        vertexcolor=vcolor, opacity=1.0, name="airway", showlegend=False,
+        lighting=dict(ambient=0.6, diffuse=0.8, specular=0.15), flatshading=False,
+    )]
+    # Legend proxies (vertexcolor meshes don't populate the legend).
+    for lid, nm in ((1, "left cavity"), (2, "right cavity"), (3, "nasopharynx")):
+        r, g, b = col[lid]
+        traces.append(go.Scatter3d(
+            x=[None], y=[None], z=[None], mode="markers",
+            marker=dict(size=9, color=f"rgb({r},{g},{b})"), name=nm, showlegend=True))
     return traces
 
 
