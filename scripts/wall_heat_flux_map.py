@@ -160,7 +160,7 @@ def main() -> int:
         tri_faces = np.arange(len(verts_flat)).reshape(-1, 3)
         q_arr = np.array(tri_q)
         qn = np.sqrt(np.clip(q_arr, 0, None))
-        qn = (qn - qn.min()) / (qn.ptp() + 1e-12)
+        qn = (qn - qn.min()) / (np.ptp(qn) + 1e-12)
         # simple viridis-ish ramp without matplotlib dependency at runtime
         try:
             import matplotlib.cm as cm
