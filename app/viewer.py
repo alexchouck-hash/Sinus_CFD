@@ -32,11 +32,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 # Bump when viewer behavior or expected data layout changes (shown in UI).
-APP_VERSION = "0.16.0-geometry-report"
+APP_VERSION = "0.17.0-mvp-geometry"
 APP_VERSION_LABEL = (
-    "geometry-report mode (per-side volume / MCA / L/R asymmetry) · "
-    "reddish translucent removal zones"
+    "MVP geometry view: interactive L/R constriction charts · tri-planar CT "
+    "with cavity overlay · rotatable 3D airway"
 )
+
+DATA_ROOT = REPO_ROOT / "data"
+LEFT_COLOR = "#2b8cbe"   # blue = left cavity
+RIGHT_COLOR = "#d6604d"  # red = right cavity
 
 DEFAULT_CASE = "P001"
 OUTPUTS = REPO_ROOT / "outputs"
@@ -280,14 +284,160 @@ def load_geometry_report(case_id: str) -> dict | None:
         return None
 
 
+def _resolve_case_ct_label(case_id: str) -> tuple[Path | None, Path | None]:
+    """Find (image, label) NRRD paths for a geometry-report case."""
+    # NasalSeg native case (P001, P065, …)
+    img = DATA_ROOT / "images" / f"{case_id}_img.nrrd"
+    lab = DATA_ROOT / "labels" / f"{case_id}_seg.nrrd"
+    if img.is_file() and lab.is_file():
+        return img, lab
+    # Post-op virtual-surgery case: edited label under outputs/, base image from
+    # the parent NasalSeg case id (e.g. P065_postop_septoplasty_left -> P065).
+    postop = OUTPUTS / case_id / f"{case_id.split('_')[0]}_postop_label.nrrd"
+    if not postop.is_file():
+        hits = list((OUTPUTS / case_id).glob("*_postop_label.nrrd"))
+        postop = hits[0] if hits else postop
+    base_id = case_id.split("_")[0]
+    base_img = DATA_ROOT / "images" / f"{base_id}_img.nrrd"
+    if postop.is_file() and base_img.is_file():
+        return base_img, postop
+    return None, None
+
+
+@st.cache_data(show_spinner=False)
+def _load_ct_label(case_id: str) -> dict | None:
+    """Load CT + label arrays (z,y,x) and spacing for a case, or None."""
+    import SimpleITK as sitk
+
+    img_p, lab_p = _resolve_case_ct_label(case_id)
+    if img_p is None or lab_p is None:
+        return None
+    img = sitk.ReadImage(str(img_p))
+    lab_img = sitk.ReadImage(str(lab_p))
+    ct = sitk.GetArrayFromImage(img)
+    label = sitk.GetArrayFromImage(lab_img)
+    if ct.shape != label.shape:
+        # geometry mismatch on some NasalSeg labels — index correspondence holds
+        label = label if label.shape == ct.shape else None
+    return {
+        "ct": ct,
+        "label": label,
+        "spacing_xyz": tuple(float(v) for v in img.GetSpacing()),
+    }
+
+
+def _area_profile_fig(report: dict) -> go.Figure:
+    """Interactive L/R cross-sectional-area-vs-distance chart with MCA markers."""
+    fig = go.Figure()
+    for side_key, color in (("left", LEFT_COLOR), ("right", RIGHT_COLOR)):
+        s = report.get(side_key, {})
+        prof = s.get("area_profile") or []
+        if not s.get("present") or not prof:
+            continue
+        ap = [p["ap_mm"] for p in prof]
+        area = [p["area_mm2"] for p in prof]
+        fig.add_trace(go.Scatter(
+            x=ap, y=area, mode="lines", name=f"{side_key} ({s['volume_ml']:.1f} mL)",
+            line=dict(color=color, width=2.5),
+            hovertemplate=f"{side_key}<br>%{{x:.1f}} mm<br>%{{y:.0f}} mm²<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=[s["mca_ap_position_mm"]], y=[s["mca_mm2"]], mode="markers+text",
+            marker=dict(color=color, size=14, symbol="triangle-down",
+                        line=dict(color="white", width=1)),
+            text=[f"MCA {s['mca_mm2']:.0f}"], textposition="bottom center",
+            textfont=dict(color=color, size=11), showlegend=False,
+            hovertemplate=f"{side_key} MCA<br>%{{y:.0f}} mm² @ %{{x:.1f}} mm<extra></extra>",
+        ))
+    fig.update_layout(
+        height=420,
+        xaxis_title="distance from anterior naris (mm)",
+        yaxis_title="cross-sectional area (mm²)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(l=60, r=20, t=30, b=50),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def _triplanar_ct_fig(ct: np.ndarray, label: np.ndarray, spacing_xyz, report: dict) -> go.Figure:
+    """CT tri-planar with L/R cavity overlay, centred on the airway."""
+    airway = np.isin(label, (1, 2, 3))
+    if airway.any():
+        zz, yy, xx = np.where(airway)
+        cz, cy, cx = int(np.median(zz)), int(np.median(yy)), int(np.median(xx))
+    else:
+        cz, cy, cx = (s // 2 for s in ct.shape)
+
+    fig = make_subplots(rows=1, cols=3, subplot_titles=(
+        f"Axial z={cz}", f"Coronal y={cy}", f"Sagittal x={cx}"), horizontal_spacing=0.04)
+
+    planes = [
+        (ct[cz], label[cz]),
+        (ct[:, cy, :], label[:, cy, :]),
+        (ct[:, :, cx], label[:, :, cx]),
+    ]
+    for col, (ct_slice, lab_slice) in enumerate(planes, start=1):
+        disp = np.clip(ct_slice, -1000, 400).astype(np.float32)
+        fig.add_trace(go.Heatmap(z=disp, colorscale="gray", showscale=False,
+                                 hoverinfo="skip"), row=1, col=col)
+        # L (blue) and R (red) cavity overlays
+        for lid, color in ((1, LEFT_COLOR), (2, RIGHT_COLOR)):
+            m = lab_slice == lid
+            if m.any():
+                ov = np.where(m, 1.0, np.nan)
+                fig.add_trace(go.Heatmap(
+                    z=ov, colorscale=[[0, color], [1, color]], showscale=False,
+                    opacity=0.45, hoverinfo="skip"), row=1, col=col)
+        fig.update_xaxes(visible=False, row=1, col=col)
+        fig.update_yaxes(visible=False, scaleanchor=f"x{col if col>1 else ''}",
+                         row=1, col=col)
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10))
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def _airway_3d_traces(case_id: str, spacing_xyz: tuple) -> list:
+    """Marching-cubes L/R cavity + nasopharynx surfaces as Plotly Mesh3d."""
+    from skimage import measure
+
+    data = _load_ct_label(case_id)
+    if data is None or data["label"] is None:
+        return []
+    label = data["label"]
+    sx, sy, sz = spacing_xyz
+    traces = []
+    parts = [(1, "left cavity", LEFT_COLOR, 0.55),
+             (2, "right cavity", RIGHT_COLOR, 0.55),
+             (3, "nasopharynx", "#7fbf7b", 0.35)]
+    for lid, nm, color, op in parts:
+        mask = label == lid
+        if mask.sum() < 50:
+            continue
+        try:
+            # step_size=2 ~quarters the face count for a lighter/faster WebGL mesh
+            verts, faces, _n, _v = measure.marching_cubes(
+                mask.astype(np.float32), level=0.5, spacing=(sz, sy, sx), step_size=2)
+        except (ValueError, RuntimeError):
+            continue
+        # verts are (z,y,x) physical → plot as (x,y,z)
+        traces.append(go.Mesh3d(
+            x=verts[:, 2], y=verts[:, 1], z=verts[:, 0],
+            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+            color=color, opacity=op, name=nm, showlegend=True,
+            lighting=dict(ambient=0.55, diffuse=0.8, specular=0.2), flatshading=False,
+        ))
+    return traces
+
+
 def render_geometry_report() -> None:
     """
-    Stage-2 per-side airway geometry: volume, minimal cross-sectional area
-    (MCA), and the L/R asymmetry that flags a unilaterally obstructed airway.
-    Reads scripts/geometry_report.py output from outputs/<case>/.
+    MVP nasal-airway geometry view: interactive L/R constriction charts, a
+    tri-planar CT with cavity overlay, and a rotatable 3D airway. Reads the
+    Stage-2 geometry report (scripts/geometry_report.py) plus the case CT/label.
     """
     st.title("Sinus_CFD — Nasal Airway Geometry")
-    st.caption("Per-side volume · minimal cross-sectional area (MCA) · L/R asymmetry — no CFD")
+    st.caption("Per-side volume · minimal cross-sectional area (MCA) · L/R asymmetry")
 
     geo_cases = list_geometry_cases()
     if not geo_cases:
@@ -297,59 +447,86 @@ def render_geometry_report() -> None:
         )
         return
 
-    case_id = st.selectbox("Case", geo_cases, index=0)
+    default_idx = geo_cases.index("P065") if "P065" in geo_cases else 0
+    case_id = st.selectbox("Case", geo_cases, index=default_idx)
     report = load_geometry_report(case_id)
     if report is None:
         st.error(f"Could not read geometry report for {case_id}.")
         return
 
-    left = report["left"]
-    right = report["right"]
-    src = report.get("mask_source", "labels")
-    st.caption(f"Segmentation source: **{src}**")
+    left, right = report["left"], report["right"]
+    st.caption(f"Segmentation source: **{report.get('mask_source', 'labels')}**")
 
-    # Headline: obstruction asymmetry
+    # Headline metrics row
     ratio = report.get("mca_ratio")
-    if ratio is not None and not (isinstance(ratio, float) and np.isnan(ratio)):
-        more = report.get("more_obstructed_side", "unknown")
-        if ratio >= 0.85:
-            verdict, color = "roughly symmetric", "normal"
-        elif ratio >= 0.6:
-            verdict, color = f"mild asymmetry — {more} side narrower", "off"
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        if left.get("present"):
+            st.metric("Left MCA", f"{left['mca_mm2']:.0f} mm²",
+                      f"{left['volume_ml']:.1f} mL volume", delta_color="off")
+    with m2:
+        if right.get("present"):
+            st.metric("Right MCA", f"{right['mca_mm2']:.0f} mm²",
+                      f"{right['volume_ml']:.1f} mL volume", delta_color="off")
+    with m3:
+        if ratio is not None and not (isinstance(ratio, float) and np.isnan(ratio)):
+            more = report.get("more_obstructed_side", "unknown")
+            if ratio >= 0.85:
+                verdict, color = "roughly symmetric", "normal"
+            elif ratio >= 0.6:
+                verdict, color = f"{more} side narrower", "off"
+            else:
+                verdict, color = f"{more} side obstructed", "inverse"
+            st.metric("L/R MCA ratio", f"{ratio:.2f}", verdict, delta_color=color)
         else:
-            verdict, color = f"marked asymmetry — {more} side obstructed", "inverse"
-        st.metric("L/R MCA ratio", f"{ratio:.2f}", verdict, delta_color=color)
-    else:
-        st.warning("L/R MCA ratio unavailable (one or both cavities absent).")
+            st.metric("L/R MCA ratio", "n/a")
 
-    # Per-side metric tiles
-    c_left, c_right = st.columns(2)
-    for col, side, label in ((c_left, left, "Left"), (c_right, right, "Right")):
-        with col:
-            st.subheader(label)
-            if not side.get("present"):
-                st.warning("No lumen for this side.")
-                continue
-            st.metric("Volume", f"{side['volume_ml']:.1f} mL")
-            st.metric(
-                "MCA",
-                f"{side['mca_mm2']:.0f} mm²",
-                f"{side['mca_location']} · {side['mca_ap_position_mm']:.0f} mm from naris",
-                delta_color="off",
-            )
+    tab_chart, tab_ct, tab_3d = st.tabs(
+        ["📉 Constriction charts", "🩻 CT slices", "🌐 3D airway"])
 
-    # Area-distance curve
-    img_path = OUTPUTS / case_id / f"{case_id}_area_profile.png"
-    if img_path.is_file():
-        st.image(str(img_path), caption="Cross-sectional area vs distance from anterior naris")
+    with tab_chart:
+        st.plotly_chart(_area_profile_fig(report), use_container_width=True)
+        st.caption(
+            "Cross-sectional area along each passage from the anterior naris. "
+            "The ▼ marks each side's minimal cross-sectional area (MCA) — the "
+            "constriction. A large L/R gap is the obstruction signal.")
+
+    with tab_ct:
+        data = _load_ct_label(case_id)
+        if data is None or data["label"] is None:
+            st.info("CT/label not found for this case (needs data/images + data/labels).")
+        else:
+            st.plotly_chart(
+                _triplanar_ct_fig(data["ct"], data["label"], data["spacing_xyz"], report),
+                use_container_width=True)
+            st.caption("CT windowed to soft tissue; left cavity blue, right cavity red.")
+
+    with tab_3d:
+        data = _load_ct_label(case_id)
+        if data is None or data["label"] is None:
+            st.info("CT/label not found for this case.")
+        else:
+            traces = _airway_3d_traces(case_id, data["spacing_xyz"])
+            if not traces:
+                st.info("Could not build 3D surfaces for this case.")
+            else:
+                fig = go.Figure(data=traces)
+                fig.update_layout(
+                    height=560, margin=dict(l=0, r=0, t=10, b=0),
+                    scene=dict(aspectmode="data",
+                               xaxis_title="x (mm)", yaxis_title="y (mm)", zaxis_title="z (mm)"),
+                    legend=dict(orientation="h", yanchor="bottom", y=0.0),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption("Rotatable nasal airway — drag to orbit. Left blue, right red, "
+                           "nasopharynx green.")
 
     with st.expander("Method & caveats"):
         st.markdown(
             "- Area = actual lumen voxel count per coronal slice × pixel area "
             "(faithful for the slit-shaped nasal valve, unlike a π·r² disk).\n"
             "- Profiles are typically unimodal, so the MCA sits at an end of the "
-            "airway body (end narrowing, not a focal internal stenosis) — reported "
-            "honestly via the location fields.\n"
+            "airway body (end narrowing, not a focal internal stenosis).\n"
             "- The **L/R MCA ratio is the most robust output**; on near-symmetric "
             "cases the 'more obstructed side' can flip within noise.\n"
             "- See `docs/stage2_geometry_metrics.md`."
@@ -1218,10 +1395,10 @@ def main() -> None:
 
     mode = st.sidebar.radio(
         "View",
-        ("Airflow demo", "Geometry report"),
-        help="Airflow: Visible Human flow demo. Geometry: per-side NasalSeg airway metrics (Stage 2).",
+        ("Geometry (MVP)", "Airflow demo"),
+        help="Geometry: per-side nasal airway metrics + 3D/CT (Stage 2). Airflow: Visible Human flow demo.",
     )
-    if mode == "Geometry report":
+    if mode == "Geometry (MVP)":
         render_geometry_report()
         return
 
