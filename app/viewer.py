@@ -284,6 +284,19 @@ def load_geometry_report(case_id: str) -> dict | None:
         return None
 
 
+def list_surgery_reports() -> dict[str, Path]:
+    """Virtual-surgery pre/post reports (scripts/virtual_surgery.py output)."""
+    out: dict[str, Path] = {}
+    if not OUTPUTS.is_dir():
+        return out
+    for d in sorted(OUTPUTS.iterdir()):
+        if not d.is_dir():
+            continue
+        for js in d.glob("*_virtual_surgery.json"):
+            out[d.name] = js
+    return out
+
+
 def _resolve_case_ct_label(case_id: str) -> tuple[Path | None, Path | None]:
     """Find (image, label) NRRD paths for a geometry-report case."""
     # NasalSeg native case (P001, P065, …)
@@ -431,11 +444,118 @@ def _airway_3d_traces(case_id: str, spacing_xyz: tuple) -> list:
     return traces
 
 
+def _prepost_area_fig(pre: dict, post: dict) -> go.Figure:
+    """Overlay pre (dashed) vs post (solid) area profiles for both sides."""
+    fig = go.Figure()
+    for side_key, color in (("left", LEFT_COLOR), ("right", RIGHT_COLOR)):
+        for tag, rep, dash in (("pre", pre, "dot"), ("post", post, "solid")):
+            s = rep.get(side_key, {})
+            prof = s.get("area_profile") or []
+            if not s.get("present") or not prof:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[p["ap_mm"] for p in prof], y=[p["area_mm2"] for p in prof],
+                mode="lines", name=f"{side_key} {tag}",
+                line=dict(color=color, width=2.5, dash=dash),
+                opacity=1.0 if tag == "post" else 0.55,
+            ))
+    fig.update_layout(
+        height=420, xaxis_title="distance from anterior naris (mm)",
+        yaxis_title="cross-sectional area (mm²)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(l=60, r=20, t=30, b=50), hovermode="x unified")
+    return fig
+
+
+def render_virtual_surgery() -> None:
+    """Stage-4 virtual surgery: pre/post geometry comparison from the edit report."""
+    st.title("Sinus_CFD — Virtual Surgery (pre / post)")
+    st.caption("Parameterized turbinate reduction / septoplasty · predicted geometry change")
+
+    reports = list_surgery_reports()
+    if not reports:
+        st.info(
+            "No virtual-surgery reports found. Generate one with:\n\n"
+            "```\npy -3.12 scripts/virtual_surgery.py --case P065 "
+            "--procedure septoplasty --side auto --depth-mm 3\n```")
+        return
+
+    key = st.selectbox("Edited case", list(reports))
+    try:
+        rep = json.loads(reports[key].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        st.error("Could not read the surgery report.")
+        return
+
+    pre, post = rep["pre"], rep["post"]
+    st.markdown(
+        f"**{rep['case']}** — {rep['procedure'].replace('_', ' ')} on **{rep['side']}** "
+        f"side, {rep['depth_mm']:.0f} mm  ·  air added **{rep['air_added_ml']:.1f} mL**")
+
+    # Metric deltas
+    cols = st.columns(3)
+    for col, side in ((cols[0], "left"), (cols[1], "right")):
+        a, b = pre.get(side, {}), post.get(side, {})
+        if a.get("present") and b.get("present"):
+            d = b["mca_mm2"] - a["mca_mm2"]
+            col.metric(f"{side.title()} MCA", f"{b['mca_mm2']:.0f} mm²",
+                       f"{d:+.0f} mm² vs pre", delta_color="normal")
+    r_pre, r_post = pre.get("mca_ratio"), post.get("mca_ratio")
+    if isinstance(r_pre, (int, float)) and isinstance(r_post, (int, float)) \
+            and not (np.isnan(r_pre) or np.isnan(r_post)):
+        toward = "toward balanced" if abs(1 - r_post) < abs(1 - r_pre) else "less balanced"
+        cols[2].metric("L/R MCA ratio", f"{r_post:.2f}",
+                       f"{r_post - r_pre:+.2f} ({toward})",
+                       delta_color="normal" if toward.startswith("toward") else "inverse")
+
+    st.plotly_chart(_prepost_area_fig(pre, post), use_container_width=True)
+    st.caption("Dashed = pre-op, solid = post-op. The operated side's curve lifts where "
+               "tissue was removed — widening its minimal cross-section (MCA).")
+
+    with st.expander("Method & caveats"):
+        st.markdown(
+            "- Geometric mimic: the air lumen is grown into adjacent tissue "
+            "(turbinate reduction = lateral, septoplasty = medial toward midline), "
+            "not a tissue-accurate resection.\n"
+            "- Ranks a *specified* parameterized edit; does not prescribe the operation.\n"
+            "- Feed the edited label to the CFD pipeline for a pre/post *resistance* "
+            "comparison. See `docs/stage4_virtual_surgery.md`.")
+        st.json({k: v for k, v in rep.items() if k not in ("pre", "post")})
+
+
+@st.cache_data(show_spinner=False)
+def _wall_flux_trace(case_id: str):
+    """Load the wall-heat-flux PLY (scripts/wall_heat_flux_map.py) as Plotly Mesh3d."""
+    ply = OUTPUTS / case_id / f"{case_id}_wall_heat_flux.ply"
+    if not ply.is_file():
+        return None
+    import trimesh
+
+    mesh = trimesh.load(str(ply), process=False)
+    faces = mesh.faces
+    fc = np.asarray(mesh.visual.face_colors)[:, :3]
+    # Cap face count for smooth WebGL: uniform stride keeps the surface dense
+    # enough to read as a heat map while ~halving the payload.
+    max_faces = 55_000
+    if len(faces) > max_faces:
+        keep = np.round(np.linspace(0, len(faces) - 1, max_faces)).astype(int)
+        faces, fc = faces[keep], fc[keep]
+    facecolor = [f"rgb({int(r)},{int(g)},{int(b)})" for r, g, b in fc]
+    v = mesh.vertices
+    return go.Mesh3d(
+        x=v[:, 0], y=v[:, 1], z=v[:, 2],
+        i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+        facecolor=facecolor, opacity=1.0, name="wall heat flux",
+        lighting=dict(ambient=0.7, diffuse=0.7, specular=0.1),
+    )
+
+
 def render_geometry_report() -> None:
     """
     MVP nasal-airway geometry view: interactive L/R constriction charts, a
-    tri-planar CT with cavity overlay, and a rotatable 3D airway. Reads the
-    Stage-2 geometry report (scripts/geometry_report.py) plus the case CT/label.
+    tri-planar CT with cavity overlay, a rotatable 3D airway, and (when a CFD
+    thermal run exists) the wall heat-flux / mucosal-cooling map. Reads the
+    Stage-2 geometry report plus the case CT/label and CFD outputs.
     """
     st.title("Sinus_CFD — Nasal Airway Geometry")
     st.caption("Per-side volume · minimal cross-sectional area (MCA) · L/R asymmetry")
@@ -482,8 +602,13 @@ def render_geometry_report() -> None:
         else:
             st.metric("L/R MCA ratio", "n/a")
 
-    tab_chart, tab_ct, tab_3d = st.tabs(
-        ["📉 Constriction charts", "🩻 CT slices", "🌐 3D airway"])
+    has_flux = (OUTPUTS / case_id / f"{case_id}_wall_heat_flux.ply").is_file()
+    tab_names = ["📉 Constriction charts", "🩻 CT slices", "🌐 3D airway"]
+    if has_flux:
+        tab_names.append("🔥 Wall heat flux")
+    tabs = st.tabs(tab_names)
+    tab_chart, tab_ct, tab_3d = tabs[0], tabs[1], tabs[2]
+    tab_flux = tabs[3] if has_flux else None
 
     with tab_chart:
         st.plotly_chart(_area_profile_fig(report), use_container_width=True)
@@ -527,6 +652,25 @@ def render_geometry_report() -> None:
                 st.plotly_chart(fig, use_container_width=True)
                 st.caption("Rotatable nasal airway — drag to orbit. Left blue, right red, "
                            "nasopharynx green.")
+
+    if tab_flux is not None:
+        with tab_flux:
+            trace = _wall_flux_trace(case_id)
+            if trace is None:
+                st.info("No wall heat-flux map for this case.")
+            else:
+                fig = go.Figure(data=[trace])
+                fig.update_layout(
+                    height=560, margin=dict(l=0, r=0, t=10, b=0),
+                    scene=dict(aspectmode="data",
+                               xaxis_title="x (mm)", yaxis_title="y (mm)", zaxis_title="z (mm)"),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption(
+                    "Mucosal wall heat flux from the CFD thermal solve — **bright = "
+                    "strong cooling** (where inspired air pulls the most heat from the "
+                    "mucosa). Mucosal cooling is the strongest correlate of *perceived* "
+                    "nasal patency. See `docs/stage3_cfd_methodology.md`.")
 
     with st.expander("Method & caveats"):
         st.markdown(
@@ -1402,11 +1546,16 @@ def main() -> None:
 
     mode = st.sidebar.radio(
         "View",
-        ("Geometry (MVP)", "Airflow demo"),
-        help="Geometry: per-side nasal airway metrics + 3D/CT (Stage 2). Airflow: Visible Human flow demo.",
+        ("Geometry (MVP)", "Virtual surgery", "Airflow demo"),
+        help="Geometry: per-side airway metrics + 3D/CT + wall-flux (Stages 2-3). "
+             "Virtual surgery: pre/post edit comparison (Stage 4). "
+             "Airflow: full-head Visible Human CFD.",
     )
     if mode == "Geometry (MVP)":
         render_geometry_report()
+        return
+    if mode == "Virtual surgery":
+        render_virtual_surgery()
         return
 
     st.title("Sinus_CFD — Airflow Viewer")
