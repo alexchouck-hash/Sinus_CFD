@@ -429,6 +429,15 @@ mergeTolerance 1e-6;
         resetOnStartUp  false;
         writeControl    writeTime;
     }}
+    gradT
+    {{
+        // grad(T) volVectorField -> wall heat flux q = k*(grad(T).n) per face,
+        // extracted spatially by scripts/wall_heat_flux_map.py.
+        type            grad;
+        libs            (fieldFunctionObjects);
+        field           T;
+        writeControl    writeTime;
+    }}
 {_thermal_port_fos}"""
         _patch_fos = _patch_fos + "\n" + _thermal_fos
 
