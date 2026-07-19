@@ -79,6 +79,7 @@ Fallback tags tried by the script: `2312`, then Foundation-style community image
 | Pull fails | Check network; try `-Image opencfd/openfoam-run:2312` |
 | snappy empty mesh | Check `log.snappyHexMesh`; adjust `locationInMesh` |
 | Permission errors on files | Run Docker Desktop as your user; avoid admin-only folders |
+| Docker Desktop crashes on startup with `initializing Inference manager … remove …\Docker\run\dockerInference: The file cannot be accessed by the system` (or the same for `docker-secrets-engine\engine.sock`) | Docker's AI/Inference feature leaves an orphaned AF_UNIX socket as a broken reparse point that no tool can delete (`fsutil reparsepoint delete`, `\\?\` paths, `cmd del` all fail). **Durable fix:** quit Docker, set `EnableDockerAI` to `false` in `%AppData%\Docker\settings-store.json` (back it up first), rename the broken socket's parent dir aside so Docker recreates it clean (`Rename-Item "$env:LocalAppData\Docker\run" run.broken`; same for `…\docker-secrets-engine`), then relaunch. Disabling Docker AI stops the socket from being recreated broken each boot — this project only needs Docker to run the OpenFOAM image, so the AI feature is safe to leave off. |
 
 ## Compose alternative
 
