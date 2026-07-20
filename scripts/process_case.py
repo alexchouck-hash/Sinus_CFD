@@ -115,6 +115,12 @@ def main() -> int:
         action="store_true",
         help="Skip boundary-condition JSON / OpenFOAM sketch",
     )
+    parser.add_argument(
+        "--no-hu-bridge",
+        action="store_true",
+        help="Keep the domain label-faithful (nasal airway only); do NOT bridge "
+             "through HU air, which would pull the dead-end paranasal sinuses in",
+    )
     args = parser.parse_args()
 
     image_path, label_path = resolve_nasalseg_case(args.data_root, args.case)
@@ -153,6 +159,7 @@ def main() -> int:
         hu_max=args.hu_max,
         breathing=breathing,
         write_bcs=not args.no_bcs,
+        hu_bridge=not args.no_hu_bridge,
         nnunet_dataset_id=args.nnunet_dataset_id,
         nnunet_configuration=args.nnunet_configuration,
         nnunet_fold=args.nnunet_fold,

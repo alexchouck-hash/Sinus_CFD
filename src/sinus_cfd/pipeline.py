@@ -273,6 +273,7 @@ def process_case(
     breathing: PatientBreathing | None = None,
     write_bcs: bool = True,
     face_tag_radius_mm: float = 8.0,
+    hu_bridge: bool = True,
     nnunet_dataset_id: int = 501,
     nnunet_configuration: str = "3d_fullres",
     nnunet_fold: int = 0,
@@ -357,12 +358,18 @@ def process_case(
 
     # Mouth closed: domain is nasal cavities + nasopharynx only (labels 1–3 by default).
     # Oral cavity is never added to the mask when using label-based sources.
-    # Bridge through HU air so left/right nostrils + nasopharynx form one domain.
+    # hu_bridge=True bridges label gaps through HU air so L/R/NP form one domain,
+    # but that HU growth also reaches the paranasal sinuses through their ostia,
+    # wrongly pulling near-closed dead-end cavities into the inspiratory fluid
+    # domain. hu_bridge=False keeps the domain label-faithful (nasal airway only)
+    # and relies on a slightly larger morphological close to connect L/R/NP — the
+    # physically correct CFD domain for label-segmented cases.
     mask = _clean_mask(
         mask,
         min_component_voxels=min_component_voxels,
+        closing_radius=1 if hu_bridge else 2,
         keep_all_large_components=True,
-        hu_zyx=hu_zyx,
+        hu_zyx=hu_zyx if hu_bridge else None,
         hu_max=hu_max,
         hu_min=hu_min,
     )

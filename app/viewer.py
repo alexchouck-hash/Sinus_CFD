@@ -352,19 +352,42 @@ def _compute_streamlines(case_id: str) -> dict | None:
     nz, ny, nx = speed.shape
     vmax = float(speed[d["airway"] > 0].max()) if d["airway"].any() else 1.0
 
+    # Paranasal-sinus mask (aligned to the flow grid) — the sinuses are near-
+    # closed dead-end cavities with negligible inspiratory flow, so streamline
+    # detours into them are unphysical display artifacts. Break streamlines
+    # where they enter a maxillary sinus so only nostril→pharynx flow shows.
+    sinus = None
+    lab_p = DATA_ROOT / "labels" / f"{case_id}_seg.nrrd"
+    if lab_p.is_file():
+        import SimpleITK as sitk
+
+        lab = sitk.GetArrayFromImage(sitk.ReadImage(str(lab_p)))
+        if lab.shape == speed.shape:
+            sinus = np.isin(lab, (4, 5))
+
     lines = json.loads(slj.read_text(encoding="utf-8")).get("lines", [])
     paths, speeds = [], []
     for ln in lines:
         p = np.asarray(ln, dtype=float)  # (N,3) physical mm
         if len(p) < 8:
             continue
-        # physical → voxel index to sample speed
         zi = np.clip((p[:, 2] - oz) / sz, 0, nz - 1)
         yi = np.clip((p[:, 1] - oy) / sy, 0, ny - 1)
         xi = np.clip((p[:, 0] - ox) / sx, 0, nx - 1)
-        sp = map_coordinates(speed, np.vstack([zi, yi, xi]), order=1)
-        paths.append(p)
-        speeds.append(np.asarray(sp, dtype=float))
+        sp = np.asarray(map_coordinates(speed, np.vstack([zi, yi, xi]), order=1), dtype=float)
+        if sinus is not None:
+            in_sinus = sinus[np.clip(np.round(zi).astype(int), 0, nz - 1),
+                             np.clip(np.round(yi).astype(int), 0, ny - 1),
+                             np.clip(np.round(xi).astype(int), 0, nx - 1)]
+            # Split into contiguous non-sinus runs; keep runs long enough to show.
+            idx = np.arange(len(p))
+            for run in np.split(idx, np.where(np.diff(in_sinus.astype(int)) != 0)[0] + 1):
+                if len(run) >= 8 and not in_sinus[run[0]]:
+                    paths.append(p[run])
+                    speeds.append(sp[run])
+        else:
+            paths.append(p)
+            speeds.append(sp)
     if not paths:
         return None
     return {"paths": paths, "speeds": speeds, "vmax": vmax}
