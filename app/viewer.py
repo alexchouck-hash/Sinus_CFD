@@ -330,79 +330,78 @@ def list_flow_cases() -> list[str]:
 
 
 @st.cache_data(show_spinner=False)
-def _compute_streamlines(case_id: str, n_seeds: int = 220) -> dict | None:
+def _compute_streamlines(case_id: str) -> dict | None:
     """
-    Integrate streamlines through the CFD velocity field, seeded across the
-    nostril inlets. Returns physical-mm paths + per-point speed.
+    Load the precomputed streamlines (scripts/import_openfoam_results.py, which
+    extends each path to the outlet through the region where the CFD velocity
+    weakens near the nasopharynx) so they span nostril → pharynx. Speed is
+    sampled from the velocity grid at each point, for colouring.
     """
+    import json
+
     from scipy.ndimage import map_coordinates
 
     npz = OUTPUTS / case_id / f"{case_id}_flow.npz"
-    if not npz.is_file():
+    slj = OUTPUTS / case_id / f"{case_id}_streamlines.json"
+    if not npz.is_file() or not slj.is_file():
         return None
     d = np.load(npz)
-    ux, uy, uz = d["ux"], d["uy"], d["uz"]
-    airway, inlet, speed = d["airway"], d["inlet_mask"], d["speed"]
+    speed = d["speed"]
     ox, oy, oz = d["origin_xyz_mm"]
     sx, sy, sz = d["spacing_xyz_mm"]
-    nz, ny, nx = airway.shape
-    vmax = float(speed[airway > 0].max()) if airway.any() else 1.0
+    nz, ny, nx = speed.shape
+    vmax = float(speed[d["airway"] > 0].max()) if d["airway"].any() else 1.0
 
-    def _one(seed):
-        p = np.array(seed, float)
-        path, sps = [p.copy()], []
-        for _ in range(900):
-            z, y, x = p
-            if not (1 <= z < nz - 2 and 1 <= y < ny - 2 and 1 <= x < nx - 2):
-                break
-            c = np.array([[z], [y], [x]])
-            vz = map_coordinates(uz, c, order=1)[0]
-            vy = map_coordinates(uy, c, order=1)[0]
-            vx = map_coordinates(ux, c, order=1)[0]
-            s = float((vx * vx + vy * vy + vz * vz) ** 0.5)
-            if s < 0.02:
-                break
-            p = p + 0.7 * np.array([vz, vy, vx]) / s
-            zi, yi, xi = np.clip(np.round(p).astype(int), 0, [nz - 1, ny - 1, nx - 1])
-            if airway[zi, yi, xi] == 0:
-                break
-            path.append(p.copy())
-            sps.append(s)
-        return np.array(path), np.array(sps + [sps[-1]] if sps else [0.0])
-
-    iz, iy, ix = np.where(inlet > 0)
-    if len(iz) == 0:
-        return None
-    rng = np.random.default_rng(0)
-    sel = rng.choice(len(iz), min(n_seeds, len(iz)), replace=False)
+    lines = json.loads(slj.read_text(encoding="utf-8")).get("lines", [])
     paths, speeds = [], []
-    for k in sel:
-        pa, sp = _one((iz[k], iy[k], ix[k]))
-        if len(pa) > 12:
-            paths.append(np.column_stack([pa[:, 2] * sx + ox, pa[:, 1] * sy + oy, pa[:, 0] * sz + oz]))
-            speeds.append(sp)
+    for ln in lines:
+        p = np.asarray(ln, dtype=float)  # (N,3) physical mm
+        if len(p) < 8:
+            continue
+        # physical → voxel index to sample speed
+        zi = np.clip((p[:, 2] - oz) / sz, 0, nz - 1)
+        yi = np.clip((p[:, 1] - oy) / sy, 0, ny - 1)
+        xi = np.clip((p[:, 0] - ox) / sx, 0, nx - 1)
+        sp = map_coordinates(speed, np.vstack([zi, yi, xi]), order=1)
+        paths.append(p)
+        speeds.append(np.asarray(sp, dtype=float))
+    if not paths:
+        return None
     return {"paths": paths, "speeds": speeds, "vmax": vmax}
 
 
 @st.cache_data(show_spinner=False)
 def _airway_surface_trace(case_id: str):
-    """Semi-transparent airway surface from the flow grid, aligned to streamlines."""
+    """
+    Semi-transparent airway surface aligned to the streamlines. Prefers the full
+    expert NasalSeg label (complete L/R cavities + nasopharynx) over the CFD
+    fluid-domain mask, and meshes at full detail so thin structures like the
+    right nasal valve aren't dropped.
+    """
     from skimage import measure
+    import SimpleITK as sitk
 
     npz = OUTPUTS / case_id / f"{case_id}_flow.npz"
     if not npz.is_file():
         return None
     d = np.load(npz)
-    airway = d["airway"].astype(np.float32)
     ox, oy, oz = d["origin_xyz_mm"]
     sx, sy, sz = d["spacing_xyz_mm"]
-    if airway.sum() < 50:
+
+    base = d["airway"].astype(np.float32)
+    lab_p = DATA_ROOT / "labels" / f"{case_id}_seg.nrrd"
+    if lab_p.is_file():
+        lab = sitk.GetArrayFromImage(sitk.ReadImage(str(lab_p)))
+        if lab.shape == base.shape:
+            base = np.isin(lab, (1, 2, 3)).astype(np.float32)  # complete anatomy
+    if base.sum() < 50:
         return None
-    v, f, _n, _val = measure.marching_cubes(airway, level=0.5, spacing=(sz, sy, sx), step_size=2)
+    # step_size=1 (full detail) so the thin valve region survives
+    v, f, _n, _val = measure.marching_cubes(base, level=0.5, spacing=(sz, sy, sx), step_size=1)
     return go.Mesh3d(
         x=v[:, 2] + ox, y=v[:, 1] + oy, z=v[:, 0] + oz,
         i=f[:, 0], j=f[:, 1], k=f[:, 2],
-        color="rgb(200,208,225)", opacity=0.18, name="airway", showlegend=False,
+        color="rgb(200,208,225)", opacity=0.22, name="airway", showlegend=False,
         hoverinfo="skip", lighting=dict(ambient=0.7, diffuse=0.6, specular=0.05))
 
 
