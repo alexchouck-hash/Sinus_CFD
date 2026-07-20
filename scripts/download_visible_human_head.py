@@ -27,17 +27,19 @@ import SimpleITK as sitk
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATASET_PID = "doi:10.7910/DVN/3JDZCT"
 API_BASE = "https://dataverse.harvard.edu/api"
-SERIES_PREFIX = "VHFCT1mm-Head"
+# Both Visible Human cadavers' head CT live on the same Dataverse record:
+#   VHFCT1mm-Head = Female (234 slices), VHMCT1mm-Head = Male (245 slices).
+SERIES_BY_SUBJECT = {"female": "VHFCT1mm-Head", "male": "VHMCT1mm-Head"}
 
 
 def _api_get_json(url: str) -> dict:
     ctx = ssl.create_default_context()
     req = urllib.request.Request(url, headers={"User-Agent": "Sinus_CFD/0.1"})
-    with urllib.request.urlopen(req, context=ctx, timeout=120) as r:
+    with urllib.request.urlopen(url=req, timeout=120, context=ctx) as r:
         return json.load(r)
 
 
-def list_head_files() -> list[dict]:
+def list_head_files(series_prefix: str) -> list[dict]:
     url = f"{API_BASE}/datasets/:persistentId/?persistentId={DATASET_PID}"
     data = _api_get_json(url)
     files = data["data"]["latestVersion"]["files"]
@@ -45,7 +47,7 @@ def list_head_files() -> list[dict]:
     for f in files:
         df = f["dataFile"]
         name = df["filename"]
-        if not name.startswith(SERIES_PREFIX):
+        if not name.startswith(series_prefix):
             continue
         m = re.search(r"\((\d+)\)", name)
         idx = int(m.group(1)) if m else -1
@@ -128,20 +130,32 @@ def write_preview(image: sitk.Image, out_png: Path) -> None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
+        "--subject",
+        choices=("female", "male"),
+        default="female",
+        help="Which Visible Human cadaver's head CT (both on the same Dataverse)",
+    )
+    p.add_argument(
         "--out-dir",
         type=Path,
-        default=REPO_ROOT / "data" / "VisibleHuman_Head",
+        default=None,
+        help="Default: data/VisibleHuman_Head (female) or data/VisibleHuman_Male_Head (male)",
     )
     p.add_argument("--max-slices", type=int, default=None, help="Debug: limit slice count")
     args = p.parse_args()
 
-    dicom_dir = args.out_dir / "dicom"
-    nrrd_path = args.out_dir / "VHFCT1mm_Head.nrrd"
-    preview_path = args.out_dir / "VHFCT1mm_Head_preview.png"
-    manifest_path = args.out_dir / "manifest.json"
+    series_prefix = SERIES_BY_SUBJECT[args.subject]
+    tag = "VHFCT1mm" if args.subject == "female" else "VHMCT1mm"
+    case_name = "VisibleHuman_Head" if args.subject == "female" else "VisibleHuman_Male_Head"
+    out_dir = args.out_dir or (REPO_ROOT / "data" / case_name)
 
-    print(f"Listing {SERIES_PREFIX} files from Harvard Dataverse…")
-    files = list_head_files()
+    dicom_dir = out_dir / "dicom"
+    nrrd_path = out_dir / f"{tag}_Head.nrrd"
+    preview_path = out_dir / f"{tag}_Head_preview.png"
+    manifest_path = out_dir / "manifest.json"
+
+    print(f"Listing {series_prefix} files from Harvard Dataverse…")
+    files = list_head_files(series_prefix)
     if args.max_slices:
         files = files[: args.max_slices]
     if not files:
@@ -157,9 +171,9 @@ def main() -> int:
     with manifest_path.open("w", encoding="utf-8") as fh:
         json.dump(
             {
-                "source": "NLM Visible Human Project — Female CT 1mm Head",
+                "source": f"NLM Visible Human Project — {args.subject.title()} CT 1mm Head",
                 "dataverse": f"https://dataverse.harvard.edu/dataset.xhtml?persistentId={DATASET_PID}",
-                "series": SERIES_PREFIX,
+                "series": series_prefix,
                 "n_slices": len(files),
                 "files": files,
                 "citation": (

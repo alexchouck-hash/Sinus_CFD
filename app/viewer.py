@@ -330,7 +330,7 @@ def list_flow_cases() -> list[str]:
 
 
 @st.cache_data(show_spinner=False)
-def _compute_streamlines(case_id: str) -> dict | None:
+def _compute_streamlines(case_id: str, confine_septum: bool = True) -> dict | None:
     """
     Load the precomputed streamlines (scripts/import_openfoam_results.py, which
     extends each path to the outlet through the region where the CFD velocity
@@ -358,14 +358,39 @@ def _compute_streamlines(case_id: str) -> dict | None:
     # because NasalSeg mislabels the nasopharynx (left-of-septum only) so the
     # right choana is never segmented. That's a fundamental segmentation
     # limitation (0/130 NasalSeg cases give a connected bilateral airway), not a
-    # display bug — see docs/airway_connectivity_limitation.md. We show the full
-    # bilateral streamlines and document the caveat rather than hide half the nose.
+    # display bug — see docs/airway_connectivity_limitation.md.
+
+    # Septum midplane (x): the nasal septum is a wall, so an inspiratory
+    # streamline should not cross it in the nasal cavity. From the L/R cavity
+    # centroids where labels exist, else the airway's median x.
+    septum_x = None
+    lab_p = DATA_ROOT / "labels" / f"{case_id}_seg.nrrd"
+    if lab_p.is_file():
+        import SimpleITK as sitk
+
+        lab = sitk.GetArrayFromImage(sitk.ReadImage(str(lab_p)))
+        if lab.shape == speed.shape and (lab == 1).any() and (lab == 2).any():
+            septum_x = float(0.5 * ((np.where(lab == 1)[2].mean() + np.where(lab == 2)[2].mean())) * sx + ox)
+    if septum_x is None:
+        aw = np.argwhere(d["airway"] > 0)
+        septum_x = float(np.median(aw[:, 2]) * sx + ox) if len(aw) else None
+
     lines = json.loads(slj.read_text(encoding="utf-8")).get("lines", [])
     paths, speeds = [], []
     for ln in lines:
         p = np.asarray(ln, dtype=float)  # (N,3) physical mm
         if len(p) < 8:
             continue
+        if confine_septum and septum_x is not None:
+            # Truncate at the first point that crosses to the other side of the
+            # septum from where the streamline started (its nostril side).
+            side = np.sign(p[:, 0] - septum_x)
+            seed_side = side[0] if side[0] != 0 else (side[side != 0][0] if (side != 0).any() else 1)
+            cross = np.where(side == -seed_side)[0]
+            if len(cross):
+                p = p[: cross[0]]
+                if len(p) < 8:
+                    continue
         zi = np.clip((p[:, 2] - oz) / sz, 0, nz - 1)
         yi = np.clip((p[:, 1] - oy) / sy, 0, ny - 1)
         xi = np.clip((p[:, 0] - ox) / sx, 0, nx - 1)
@@ -857,11 +882,15 @@ def render_nasal_airflow() -> None:
     # Prefer a physiological case (P001) over the cadaver VH for flow quality.
     default = cases.index("P001") if "P001" in cases else 0
     case_id = st.selectbox("Case", cases, index=default)
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     animate = c1.checkbox("Animate particles", value=True)
     show_anatomy = c2.checkbox("Show airway (semi-transparent)", value=True)
+    confine_septum = c3.checkbox("Confine to one side of septum", value=True,
+                                 help="Truncate each streamline where it would cross the "
+                                      "nasal septum (a wall) — physiologically air stays on "
+                                      "its own side until the nasopharynx.")
 
-    sl = _compute_streamlines(case_id)
+    sl = _compute_streamlines(case_id, confine_septum=confine_septum)
     if sl is None or not sl["paths"]:
         st.warning("Could not integrate streamlines for this case (weak/patchy "
                    "velocity field — try a case with a stronger, converged CFD).")

@@ -27,15 +27,39 @@ See **`docs/nnunet_nasal.md`**.
 
 ## Full head: Visible Human Project CT (recommended whole-head)
 
+**Two cadavers, both on the same Harvard Dataverse record**
+(doi:10.7910/DVN/3JDZCT): Female (`VHFCT1mm-Head`, 234 slices) and **Male
+(`VHMCT1mm-Head`, 245 slices)**.
+
 | | |
 |---|---|
-| **What** | NLM Visible Human Female 1 mm head CT (~234 slices) |
-| **Why** | Whole head: skull, sinuses, nasal airway, soft tissue, path toward trachea |
+| **Why** | Whole head: skull, sinuses, nasal airway, soft tissue, path toward trachea. Crucially, whole-head volumes give a **connected** airway (both choanae → nasopharynx), which the NasalSeg crops do **not** (see `docs/airway_connectivity_limitation.md`). |
 | **Harvard Dataverse** | https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/3JDZCT |
 | **Iowa notes** | https://mri.medicine.uiowa.edu/equipment-information/scanner-images/visible-human-project-ct-datasets |
-| **Local download** | `py -3.12 scripts/download_visible_human_head.py` → `data/VisibleHuman_Head/` |
+| **Download female** | `py -3.12 scripts/download_visible_human_head.py` → `data/VisibleHuman_Head/` |
+| **Download male** | `py -3.12 scripts/download_visible_human_head.py --subject male` → `data/VisibleHuman_Male_Head/` |
 
-NasalSeg is a **cropped nasal/sinus FOV with labels**. Visible Human is a **full head without nasal labels** — complementary.
+Both are **cadavers**, so their CFD is non-physiological (weak, wide/collapsed
+airways). Good for the whole-head *plumbing* (connected geometry, animations),
+not for validated flow numbers.
+
+## Living-subject whole-head CT (best for physiological CFD)
+
+For a whole head **and** correct airflow numbers, use a living-subject scan
+(cadavers have collapsed/artefactual airways). Public options:
+
+| Resource | Notes | Link |
+|----------|-------|------|
+| TCIA **HNSCC** | 215 patients, head-&-neck planning CT (often includes the full nasal airway) | https://www.cancerimagingarchive.net/collection/hnscc/ |
+| TCIA **Head-Neck-CT-Atlas** / Head-Neck-PET-CT | Head-&-neck CT collections | https://www.cancerimagingarchive.net/analysis-result/head-neck-ct-atlas/ |
+| **CQ500** | ~500 head CTs, varied pathology (non-commercial license) | http://headctstudy.qure.ai/dataset |
+| Stanford AIMI / Imaging Data Commons | Large browsable/bulk public head CT | https://portal.imaging.datacommons.cancer.gov/ |
+
+TCIA downloads use the **NBIA Data Retriever**; confirm the FOV covers
+nostrils → nasopharynx and that it's a true HU-calibrated CT (not CBCT).
+
+NasalSeg is a **cropped nasal/sinus FOV with labels**; the whole-head sources
+above are **full heads without nasal labels** — complementary.
 
 ## Which anatomy for the demo?
 
