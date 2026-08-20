@@ -164,22 +164,27 @@ def pressure_to_velocity(
 
     Returns ux, uy, uz, speed in *relative* units (before flux scaling).
     Arrays shaped (z,y,x); components in +x,+y,+z physical axes.
+
+    Fix 2 (verified): exterior p is nearest-filled from the airway before
+    np.gradient, so interior WALL voxels do not see a fake jump to exterior 0
+    (which inflated mucosa |u| ~70-130x). Velocity is zeroed off-airway after.
     """
     # np.gradient on z,y,x with spacing sz,sy,sx in mm
     sx, sy, sz = spacing_xyz_mm
-    # p is (z,y,x); gradient returns d/dz, d/dy, d/dx
-    # Replace nan with local fill for gradient stability
-    p_fill = np.where(np.isfinite(p), p, 0.0)
-    gz, gy, gx = np.gradient(p_fill, sz, sy, sx)
-    # u = -grad p  → (ux, uy, uz) corresponding to physical axes
-    ux = -gx
-    uy = -gy
-    uz = -gz
-    # Zero outside airway
     mask = airway.astype(bool)
-    ux = np.where(mask, ux, 0.0)
-    uy = np.where(mask, uy, 0.0)
-    uz = np.where(mask, uz, 0.0)
+    # Interior pressure only; then nearest-fill exterior from the closest airway
+    # voxel so the wall gradient is Neumann-like (no artificial cliff to 0).
+    p_air = np.where(mask & np.isfinite(p), p.astype(np.float64), 0.0)
+    if mask.any() and not mask.all():
+        _, nearest = ndi.distance_transform_edt(~mask, return_indices=True)
+        p_fill = p_air[tuple(nearest)]
+    else:
+        p_fill = p_air
+    # p is (z,y,x); gradient returns d/dz, d/dy, d/dx. u = -grad p.
+    gz, gy, gx = np.gradient(p_fill, sz, sy, sx)
+    ux = np.where(mask, -gx, 0.0)
+    uy = np.where(mask, -gy, 0.0)
+    uz = np.where(mask, -gz, 0.0)
     speed = np.sqrt(ux**2 + uy**2 + uz**2)
     return ux, uy, uz, speed
 
@@ -1086,57 +1091,55 @@ def compute_flow_field(
         inlet_area_mm2=inlet_area if inlet_area > 0 else None,
     )
 
-    # Streamline seeds: inlet face + optional centerline jitter (passage JSON)
+    # Streamline seeds: seed *inside* the moving airway, balanced across both nasal
+    # passages (left/right of the inlet midline). Seeding on the inlet-port boundary
+    # voxels alone fails — velocity there is ~0, so those streamlines die immediately
+    # and only the connected-side centerline gets traced, leaving the other passage
+    # empty. Stratified volume seeding gives the bilateral flow the airway actually
+    # carries.
     sx, sy, sz = spacing
     ox, oy, oz = origin
     seeds: list[np.ndarray] = []
     rng = np.random.default_rng(42)
-    zz, yy, xx = np.where(inlet_mask & airway)
-    if len(zz) > 0:
-        n_in = min(max(n_streamline_seeds // 2, 20), len(zz))
-        pick = rng.choice(len(zz), size=n_in, replace=False)
-        for i in pick:
-            seeds.append(
-                np.array(
-                    [ox + xx[i] * sx, oy + yy[i] * sy, oz + zz[i] * sz],
-                    dtype=float,
-                )
-            )
 
+    smax = float(speed[airway].max()) if airway.any() else 0.0
+    moving = airway & (speed > max(0.02 * smax, 1e-9))
+    if not moving.any():
+        moving = airway
+    zzm, yym, xxm = np.where(moving)
+    inlet_x = [float(p["center_mm"][0]) for p in ports.values() if p.get("role") == "inlet"]
+    x_mid = float(np.mean(inlet_x)) if inlet_x else None
+    if len(zzm):
+        xmm = ox + xxm * sx
+        groups = [xmm < x_mid, xmm >= x_mid] if x_mid is not None else [np.ones(len(xxm), bool)]
+        per_side = max(n_streamline_seeds // max(len(groups), 1), 12)
+        for g in groups:
+            idx = np.where(g)[0]
+            if len(idx):
+                pick = rng.choice(idx, size=min(per_side, len(idx)), replace=False)
+                for i in pick:
+                    seeds.append(np.array([ox + xxm[i] * sx, oy + yym[i] * sy, oz + zzm[i] * sz]))
+        notes.append(
+            "Streamlines seeded through the moving airway, balanced across both nasal "
+            "passages (inlet-boundary seeding alone leaves one side empty)."
+        )
+
+    # Supplement with centerline seeds — long, well-aligned lines on the main path.
     passage_path = output_dir / f"{case_id}_passage.json"
     if passage_path.is_file():
         try:
             with passage_path.open(encoding="utf-8") as f:
                 passage = json.load(f)
             cl = passage.get("centerline_mm") or []
-            # Seed along first third of centerline (near nares) with radial jitter
-            n_cl = min(max(n_streamline_seeds // 2, 20), max(len(cl) // 2, 1))
             if cl:
+                n_cl = max(n_streamline_seeds // 4, 10)
                 step = max(len(cl) // (n_cl + 1), 1)
-                for i in range(0, min(len(cl) // 2 + 1, len(cl)), step):
+                for i in range(0, min(len(cl) * 2 // 3 + 1, len(cl)), step):
                     base = np.array(cl[i], dtype=float)
                     for _ in range(2):
-                        jitter = rng.normal(0, 1.2, size=3)
-                        seeds.append(base + jitter)
-            notes.append(
-                "Streamlines seeded from inlet ports and nasal-passage centerline."
-            )
+                        seeds.append(base + rng.normal(0, 1.2, size=3))
         except Exception as exc:
             notes.append(f"Centerline seed skip: {exc}")
-
-    if not seeds:
-        # Fallback: random lumen seeds near high pressure
-        zz, yy, xx = np.where(airway)
-        if len(zz):
-            n_take = min(n_streamline_seeds, len(zz))
-            pick = rng.choice(len(zz), size=n_take, replace=False)
-            for i in pick:
-                seeds.append(
-                    np.array(
-                        [ox + xx[i] * sx, oy + yy[i] * sy, oz + zz[i] * sz],
-                        dtype=float,
-                    )
-                )
 
     seed_arr = np.array(seeds, dtype=float) if seeds else np.zeros((0, 3))
     streamlines = compute_streamlines(

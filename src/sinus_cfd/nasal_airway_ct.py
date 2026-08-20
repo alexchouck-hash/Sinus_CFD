@@ -21,6 +21,27 @@ import numpy as np
 from scipy import ndimage as ndi
 from skimage import morphology
 
+# --- Naris-pair geometry, in physical millimetres -------------------------
+# These are spacing-aware by contract (docs/segmentation_strategy.md): never
+# express a naris threshold in voxels, because living CT is anisotropic
+# (THCA is 0.977 / 0.977 / 1.5 mm) while Visible Human is 1 mm isotropic.
+
+# Two nostril centres closer than this laterally are not two nostrils.
+MIN_NARIS_SEPARATION_MM = 5.0
+# Wider than this is not one pair of nostrils (e.g. seeds on opposite cheeks).
+MAX_NARIS_SEPARATION_MM = 50.0
+# Nostrils sit at roughly the same depth and height; a pair that does not is a
+# collapsed or relocated detection, not anatomy.
+NARIS_PAIR_PLANE_TOL_MM = 20.0
+# Confidence bar for the x-histogram two-peak search. 15 mm reproduces the old
+# hard-coded ``sep >= 15`` exactly on 1 mm isotropic data (Visible Human) while
+# becoming correct on anisotropic living CT.
+MIN_NARIS_PEAK_SEPARATION_MM = 15.0
+# The air-HU preference filter can silently relocate the naris shell backwards
+# into the mid-cavity when the anterior airway is a painted geodesic tube rather
+# than resolved air. Note it when it moves the shell more than this.
+NARIS_HU_FILTER_SHIFT_WARN_MM = 5.0
+
 
 @dataclass
 class CTNasalAirwayResult:
@@ -39,6 +60,9 @@ class CTNasalAirwayResult:
     right_naris_center_mm: list[float] | None
     method: str = "ct_topology_hu_edge"
     notes: list[str] = field(default_factory=list)
+    merge_zone: np.ndarray | None = None
+    choanal_landmark: np.ndarray | None = None
+    sinus_detour: np.ndarray | None = None
 
     def to_meta(self) -> dict[str, Any]:
         return {
@@ -56,6 +80,10 @@ class CTNasalAirwayResult:
             "passage_voxels": int(self.passage_lumen.sum()),
             "septum_voxels": int(self.septum.sum()),
             "naris_opening_voxels": int(self.naris_opening.sum()),
+            "merge_zone_voxels": int(self.merge_zone.sum()) if self.merge_zone is not None else 0,
+            "sinus_detour_voxels": int(self.sinus_detour.sum())
+            if self.sinus_detour is not None
+            else 0,
             "notes": self.notes,
         }
 
@@ -71,6 +99,45 @@ def _zyx_to_mm(
     return [float(ox + x * sx), float(oy + y * sy), float(oz + z * sz)]
 
 
+def validate_naris_pair(
+    left_zyx: tuple[int, int, int] | None,
+    right_zyx: tuple[int, int, int] | None,
+    spacing_xyz: tuple[float, float, float],
+) -> tuple[bool, str]:
+    """Is this a plausible pair of two *distinct* nostril seeds?
+
+    Every predicate is in physical millimetres so the verdict holds on
+    anisotropic CT. A pair that fails here must **not** be repaired by inventing
+    a seed (the old 2-voxel x nudge put both seeds on the same side of the
+    septum). The caller falls back to the whole-head prior, then HARD-fails.
+
+    Returns ``(ok, reason)``; ``reason`` describes the pair when ok.
+    """
+    if left_zyx is None or right_zyx is None:
+        return False, "missing seed"
+    sx, sy, sz = (float(spacing_xyz[0]), float(spacing_xyz[1]), float(spacing_xyz[2]))
+    dx = abs(int(left_zyx[2]) - int(right_zyx[2])) * sx
+    dy = abs(int(left_zyx[1]) - int(right_zyx[1])) * sy
+    dz = abs(int(left_zyx[0]) - int(right_zyx[0])) * sz
+    sep = float(np.sqrt(dx * dx + dy * dy + dz * dz))
+    if dx < MIN_NARIS_SEPARATION_MM:
+        return False, f"lateral separation {dx:.2f} mm < {MIN_NARIS_SEPARATION_MM:.1f} mm"
+    if sep > MAX_NARIS_SEPARATION_MM:
+        return False, f"separation {sep:.2f} mm > {MAX_NARIS_SEPARATION_MM:.1f} mm"
+    if dy > NARIS_PAIR_PLANE_TOL_MM:
+        return False, (
+            f"anterior-posterior offset {dy:.2f} mm > {NARIS_PAIR_PLANE_TOL_MM:.1f} mm"
+        )
+    if dz > NARIS_PAIR_PLANE_TOL_MM:
+        return False, (
+            f"superior-inferior offset {dz:.2f} mm > {NARIS_PAIR_PLANE_TOL_MM:.1f} mm"
+        )
+    # Repo convention (AGENTS.md): high x is patient left.
+    if int(left_zyx[2]) <= int(right_zyx[2]):
+        return False, "left seed is not lateral of right (high x is patient left)"
+    return True, f"sep {sep:.2f} mm (dx {dx:.2f}, dy {dy:.2f}, dz {dz:.2f})"
+
+
 def detect_nares_from_ct_air(
     hu: np.ndarray,
     body: np.ndarray,
@@ -78,6 +145,7 @@ def detect_nares_from_ct_air(
     y_anterior_is_low: bool = True,
     air_hu_max: float = -150.0,
     z_hint: int | None = None,
+    spacing_xyz: tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> tuple[
     np.ndarray,
     tuple[int, int, int] | None,
@@ -146,9 +214,21 @@ def detect_nares_from_ct_air(
         y_cut = float(np.percentile(yy, 55))
         opening = opening & (np.arange(ny)[None, :, None] >= y_cut)
 
-    # Prefer air-like HU
+    # Prefer air-like HU. When the anterior airway is a painted geodesic tube
+    # through soft tissue (living CT with unresolved vestibule air), every tube
+    # voxel fails this test and the "nostril" shell silently jumps backwards
+    # into the mid-cavity. That is not recoverable here, but it must be visible.
     opening_hu = opening & (hu <= air_hu_max)
     if int(opening_hu.sum()) >= 40:
+        y_before = float(np.asarray(np.where(opening)[1]).mean())
+        y_after = float(np.asarray(np.where(opening_hu)[1]).mean())
+        shift_mm = abs(y_after - y_before) * float(spacing_xyz[1])
+        if shift_mm > NARIS_HU_FILTER_SHIFT_WARN_MM:
+            notes.append(
+                f"WARN: air-HU filter moved the naris shell {shift_mm:.1f} mm "
+                f"posteriorly (mean y {y_before:.1f} to {y_after:.1f}); the anterior "
+                f"airway is likely a painted tube, not resolved air."
+            )
         opening = opening_hu
 
     zz, yy, xx = np.where(opening)
@@ -169,11 +249,15 @@ def detect_nares_from_ct_air(
     peaks.sort(reverse=True)
     chosen: list[int] | None = None
     best_sep = 0
+    # Spacing-aware confidence bar. At 1 mm isotropic this is 15 voxels, i.e.
+    # byte-identical to the old hard-coded threshold; on 1.5 mm or sub-mm CT it
+    # now means the same physical distance instead of a different one.
+    min_peak_sep_vox = max(int(round(MIN_NARIS_PEAK_SEPARATION_MM / max(float(spacing_xyz[0]), 1e-6))), 1)
     top = [p for p in peaks if p[0] >= peaks[0][0] * 0.2][:12]
     for i in range(len(top)):
         for j in range(i + 1, len(top)):
             sep = abs(top[i][1] - top[j][1])
-            if sep >= 15 and sep > best_sep:
+            if sep >= min_peak_sep_vox and sep > best_sep:
                 best_sep = sep
                 chosen = sorted([top[i][1], top[j][1]])
     if chosen is None:
@@ -234,6 +318,7 @@ def detect_ct_naris_openings(
     min_component: int = 5,
     prior_left_zyx: tuple[int, int, int] | None = None,
     prior_right_zyx: tuple[int, int, int] | None = None,
+    spacing_xyz: tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> tuple[np.ndarray, list[str]]:
     """
     Compatibility wrapper: CT anterior-air naris shell (preferred method).
@@ -248,6 +333,7 @@ def detect_ct_naris_openings(
         y_anterior_is_low=y_anterior_is_low,
         air_hu_max=air_hu_max,
         z_hint=z_hint,
+        spacing_xyz=spacing_xyz,
     )
     return opening, notes
 
@@ -541,9 +627,17 @@ def extract_ct_nasal_airway(
     air_hu_max: float = -300.0,
     prior_left_mm: list[float] | None = None,
     prior_right_mm: list[float] | None = None,
+    *,
+    legacy_midplane_split: bool = True,
+    superior_is_high_z: bool = True,
+    flood_domain: np.ndarray | None = None,
 ) -> CTNasalAirwayResult:
     """
     Full CT-native nasal airway package for a cropped head volume.
+
+    ``legacy_midplane_split=True`` (default until Visible Human --strict-septum)
+    keeps ``split_left_right_by_septum_plane``. False uses competing geodesic
+    flood (docs/segmentation_strategy.md).
     """
     notes: list[str] = []
     body = body.astype(bool)
@@ -576,6 +670,7 @@ def extract_ct_nasal_airway(
         y_anterior_is_low=y_anterior_is_low,
         air_hu_max=max(air_hu_max, -150.0),
         z_hint=z_hint,
+        spacing_xyz=spacing_xyz,
     )
     notes.extend(n1)
     notes.append("Naris method: CT anterior air shell (not geometric skin tunnels).")
@@ -588,8 +683,28 @@ def extract_ct_nasal_airway(
         right_zyx = prior_r_zyx
         notes.append("Right naris fell back to prior landmark.")
 
+    # Two distinct seeds or HARD-fail (docs/handoff.md §9 item 1). The detector
+    # can return a collapsed or relocated pair without returning None — on THCA
+    # it returned the *same voxel twice* — so validate the pair rather than
+    # trusting non-None. Never invent a seed: the old repair nudged x by two
+    # voxels, which left both seeds on the same side of the septum.
+    ct_ok, ct_why = validate_naris_pair(left_zyx, right_zyx, spacing_xyz)
+    if ct_ok:
+        notes.append(f"Naris pair from CT air shell accepted: {ct_why}.")
+    else:
+        notes.append(f"WARN: CT naris pair rejected: {ct_why}.")
+        prior_ok, prior_why = validate_naris_pair(prior_l_zyx, prior_r_zyx, spacing_xyz)
+        if prior_ok:
+            left_zyx, right_zyx = prior_l_zyx, prior_r_zyx
+            notes.append(
+                f"Naris pair from whole-head prior landmarks: {prior_why}."
+            )
+        else:
+            notes.append(f"ERROR: prior naris pair also rejected: {prior_why}.")
+            left_zyx = right_zyx = None
+
     if left_zyx is None or right_zyx is None:
-        notes.append("ERROR: need both naris landmarks for septum-plane model.")
+        notes.append("ERROR: need two distinct naris landmarks; HARD fail.")
         empty = np.zeros_like(body)
         return CTNasalAirwayResult(
             interior_air=interior_air,
@@ -607,17 +722,21 @@ def extract_ct_nasal_airway(
             right_naris_center_mm=_zyx_to_mm(right_zyx, spacing_xyz, origin_xyz)
             if right_zyx
             else None,
+            method="naris_detection_HARD_fail",
             notes=notes,
         )
 
-    # Septum plane centered between nostrils (axial: straight vertical line)
     x_sep = int(round(0.5 * (left_zyx[2] + right_zyx[2])))
-    notes.append(
-        f"Septum plane x={x_sep} centered between nares "
-        f"L_x={left_zyx[2]} R_x={right_zyx[2]}."
-    )
+    paint_sep = x_sep if legacy_midplane_split else None
+    if not legacy_midplane_split:
+        notes.append("legacy_midplane_split=False: competing geodesic flood (no x_sep paint)")
+    else:
+        notes.append(
+            f"Septum plane x={x_sep} centered between nares "
+            f"L_x={left_zyx[2]} R_x={right_zyx[2]}."
+        )
 
-    # Build both vestibules (patient left AND right) as CT-guided corridors
+    # Teacher 3b: vestibule paint. No x_sep on the new path (sealed 1 mm nares).
     if openings.any():
         bridge = morphology.dilation(openings, footprint=morphology.ball(3)) & body
         vestibule = bridge & (hu <= air_hu_max + 100)
@@ -635,41 +754,138 @@ def extract_ct_nasal_airway(
             radius=3,
             air_hu_max=air_hu_max + 100,
             side=side,
-            x_sep=x_sep,
+            x_sep=paint_sep,
         )
         notes.append(
             f"Vestibule {side}: +{int(interior_air.sum()) - before} voxels "
             f"from naris {seed}."
         )
 
-    # L/R split by naris-centered septum plane (not volume midpoint)
-    left, right, x_sep, n3 = split_left_right_by_septum_plane(
-        interior_air,
-        left_zyx,
-        right_zyx,
-        y_anterior_is_low=y_anterior_is_low,
-    )
-    notes.extend(n3)
+    merge_zone = None
+    choanal_landmark = None
+    sinus_detour = None
+    method = "ct_topology_hu_edge"
 
-    # Passage = L∪R nasal domain
-    passage = left | right
-    if not passage.any():
+    if legacy_midplane_split:
+        left, right, x_sep, n3 = split_left_right_by_septum_plane(
+            interior_air,
+            left_zyx,
+            right_zyx,
+            y_anterior_is_low=y_anterior_is_low,
+        )
+        notes.extend(n3)
+        passage = left | right
+        septum, mucosa, n4 = extract_septum_and_walls(
+            body,
+            left,
+            right,
+            interior_air,
+            soft_or_tissue=soft_tissue,
+            x_sep=x_sep,
+            left_naris_zyx=left_zyx,
+            right_naris_zyx=right_zyx,
+            y_anterior_is_low=y_anterior_is_low,
+            half_width=3,
+        )
+        notes.extend(n4)
+    else:
+        from .auto_airway import (
+            choanal_landmark_from_bone,
+            competing_naris_flood,
+            meeting_set,
+            nasal_box_mask,
+            posterior_air_seed,
+            septum_ridge_from_cavities,
+            snap_seed_to_air,
+            through_path_passage,
+        )
+
+        domain = interior_air.copy()
+        if flood_domain is not None:
+            domain = domain | flood_domain.astype(bool)
+        box = nasal_box_mask(
+            domain.shape, left_zyx, right_zyx, spacing_xyz, y_anterior_is_low
+        )
+        domain = domain & box
+        snap_l = snap_seed_to_air(domain, left_zyx, spacing_xyz)
+        snap_r = snap_seed_to_air(domain, right_zyx, spacing_xyz)
+        if snap_l is None or snap_r is None:
+            notes.append("ERROR: naris seed did not snap onto flood-domain air.")
+            empty = np.zeros_like(body)
+            return CTNasalAirwayResult(
+                interior_air=interior_air,
+                left_cavity=empty,
+                right_cavity=empty,
+                passage_lumen=interior_air,
+                septum=empty,
+                mucosa_wall=empty,
+                naris_opening=openings,
+                left_naris_center_zyx=left_zyx,
+                right_naris_center_zyx=right_zyx,
+                left_naris_center_mm=_zyx_to_mm(left_zyx, spacing_xyz, origin_xyz),
+                right_naris_center_mm=_zyx_to_mm(right_zyx, spacing_xyz, origin_xyz),
+                method="competing_geodesic_HARD_fail",
+                notes=notes,
+            )
+        left_zyx, right_zyx = snap_l, snap_r
+        left, right, d_l, d_r, n3 = competing_naris_flood(
+            domain, left_zyx, right_zyx, spacing_xyz
+        )
+        notes.extend(n3)
+        meet = meeting_set(left, right, d_l, d_r)
+        choanal_landmark, merge_zone, gate_meta = choanal_landmark_from_bone(
+            hu,
+            domain,
+            left_zyx,
+            right_zyx,
+            y_anterior_is_low=y_anterior_is_low,
+            superior_is_high_z=superior_is_high_z,
+            spacing_xyz=spacing_xyz,
+            meeting_set=meet,
+        )
+        notes.extend(gate_meta.get("notes") or [])
+        if merge_zone is not None and merge_zone.any():
+            left_ant = left & ~merge_zone
+            right_ant = right & ~merge_zone
+        else:
+            left_ant, right_ant = left, right
+        flooded = left | right
+        outlet = posterior_air_seed(flooded, y_anterior_is_low)
+        if outlet is not None:
+            passage, sinus_detour, n_tp = through_path_passage(
+                flooded, [left_zyx, right_zyx], outlet, spacing_xyz
+            )
+            notes.extend(n_tp)
+            # A bad outlet (box edge) treats one whole cavity as a detour.
+            left_keep = int((left_ant & passage).sum())
+            right_keep = int((right_ant & passage).sum())
+            if left_keep == 0 or right_keep == 0 or int(sinus_detour.sum()) > 0.6 * int(flooded.sum()):
+                notes.append(
+                    "WARN: through-path dropped a cavity; keeping competing assignment"
+                )
+                passage = flooded
+                sinus_detour = np.zeros_like(flooded)
+        else:
+            passage = flooded
+            sinus_detour = np.zeros_like(flooded)
+        left = left_ant & passage
+        right = right_ant & passage
+        if merge_zone is not None:
+            passage = left | right | merge_zone
+        else:
+            passage = left | right
+        septum, _, _ = septum_ridge_from_cavities(body, left, right, spacing_xyz)
+        mucosa = body & morphology.dilation(passage, footprint=morphology.ball(1))
+        mucosa = mucosa & ~passage
+        method = "competing_geodesic_flood"
+        notes.append(
+            f"anterior cavities L={int(left.sum())} R={int(right.sum())} "
+            f"passage={int(np.asarray(passage).sum())}"
+        )
+
+    if not np.asarray(passage).any():
         passage = interior_air
         notes.append("WARNING: L/R empty — using full interior air as passage.")
-
-    septum, mucosa, n4 = extract_septum_and_walls(
-        body,
-        left,
-        right,
-        interior_air,
-        soft_or_tissue=soft_tissue,
-        x_sep=x_sep,
-        left_naris_zyx=left_zyx,
-        right_naris_zyx=right_zyx,
-        y_anterior_is_low=y_anterior_is_low,
-        half_width=3,
-    )
-    notes.extend(n4)
 
     left_mm = _zyx_to_mm(left_zyx, spacing_xyz, origin_xyz) if left_zyx else None
     right_mm = _zyx_to_mm(right_zyx, spacing_xyz, origin_xyz) if right_zyx else None
@@ -678,7 +894,7 @@ def extract_ct_nasal_airway(
         interior_air=interior_air,
         left_cavity=left,
         right_cavity=right,
-        passage_lumen=passage,
+        passage_lumen=np.asarray(passage).astype(bool),
         septum=septum,
         mucosa_wall=mucosa,
         naris_opening=openings,
@@ -686,5 +902,9 @@ def extract_ct_nasal_airway(
         right_naris_center_zyx=right_zyx,
         left_naris_center_mm=left_mm,
         right_naris_center_mm=right_mm,
+        method=method,
         notes=notes,
+        merge_zone=merge_zone,
+        choanal_landmark=choanal_landmark,
+        sinus_detour=sinus_detour,
     )
