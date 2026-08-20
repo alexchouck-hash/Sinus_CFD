@@ -40,7 +40,10 @@ MIN_NARIS_PEAK_SEPARATION_MM = 15.0
 # The air-HU preference filter can silently relocate the naris shell backwards
 # into the mid-cavity when the anterior airway is a painted geodesic tube rather
 # than resolved air. Note it when it moves the shell more than this.
-NARIS_HU_FILTER_SHIFT_WARN_MM = 5.0
+# Measured signed-median shift: Visible Human Female +1.0 mm, Male -3.0 mm,
+# THCA +32.2 mm. (The *mean* would put VH Female at +4.4 mm, i.e. 0.6 mm from a
+# 5 mm bar — which is why this is a median against a 10 mm bar, not a mean.)
+NARIS_HU_FILTER_SHIFT_WARN_MM = 10.0
 
 
 @dataclass
@@ -59,6 +62,9 @@ class CTNasalAirwayResult:
     left_naris_center_mm: list[float] | None
     right_naris_center_mm: list[float] | None
     method: str = "ct_topology_hu_edge"
+    # Where the accepted naris seeds actually came from: "ct_air_shell",
+    # "prior", "mixed(...)" or "none". Never infer this from the method string.
+    naris_source: str = "ct_air_shell"
     notes: list[str] = field(default_factory=list)
     merge_zone: np.ndarray | None = None
     choanal_landmark: np.ndarray | None = None
@@ -67,6 +73,7 @@ class CTNasalAirwayResult:
     def to_meta(self) -> dict[str, Any]:
         return {
             "method": self.method,
+            "naris_source": self.naris_source,
             "left_naris_center_zyx": list(self.left_naris_center_zyx)
             if self.left_naris_center_zyx
             else None,
@@ -219,16 +226,24 @@ def detect_nares_from_ct_air(
     # voxel fails this test and the "nostril" shell silently jumps backwards
     # into the mid-cavity. That is not recoverable here, but it must be visible.
     opening_hu = opening & (hu <= air_hu_max)
-    if int(opening_hu.sum()) >= 40:
-        y_before = float(np.asarray(np.where(opening)[1]).mean())
-        y_after = float(np.asarray(np.where(opening_hu)[1]).mean())
-        shift_mm = abs(y_after - y_before) * float(spacing_xyz[1])
+    # Measure the relocation *independently* of whether the filter is applied: a
+    # guard nested inside the apply-branch goes dead on exactly the cases that
+    # starve that branch. Signed median, not abs(mean) — only a POSTERIOR shift
+    # is the failure mode, and the median separates the cases an order of
+    # magnitude better than the mean (see NARIS_HU_FILTER_SHIFT_WARN_MM).
+    if int(opening_hu.sum()) > 0 and int(opening.sum()) > 0:
+        y_before = float(np.median(np.where(opening)[1]))
+        y_after = float(np.median(np.where(opening_hu)[1]))
+        shift_mm = (y_after - y_before) * float(spacing_xyz[1])
+        if not y_anterior_is_low:
+            shift_mm = -shift_mm
         if shift_mm > NARIS_HU_FILTER_SHIFT_WARN_MM:
             notes.append(
-                f"WARN: air-HU filter moved the naris shell {shift_mm:.1f} mm "
-                f"posteriorly (mean y {y_before:.1f} to {y_after:.1f}); the anterior "
-                f"airway is likely a painted tube, not resolved air."
+                f"WARN: air-HU filter moves the naris shell {shift_mm:.1f} mm "
+                f"posteriorly (median y {y_before:.1f} to {y_after:.1f}); the "
+                f"anterior airway is likely a painted tube, not resolved air."
             )
+    if int(opening_hu.sum()) >= 40:
         opening = opening_hu
 
     zz, yy, xx = np.where(opening)
@@ -275,8 +290,20 @@ def detect_nares_from_ct_air(
         band = band & (hu <= air_hu_max + 50)
         bz, by, bx = np.where(band)
         if len(bz) < 5:
+            # Widen the lateral band but KEEP the HU constraint.
+            band = opening & (np.abs(np.arange(nx)[None, None, :] - peak_x) <= 14)
+            band = band & (hu <= air_hu_max + 50)
+            bz, by, bx = np.where(band)
+        if len(bz) < 5:
+            # Last resort: drop the HU constraint. Say so — this is precisely
+            # how a painted-tube voxel gets promoted to a "naris".
             band = opening & (np.abs(np.arange(nx)[None, None, :] - peak_x) <= 14)
             bz, by, bx = np.where(band)
+            if len(bz):
+                notes.append(
+                    f"WARN: {side} naris band relaxed off the HU constraint "
+                    f"(n={len(bz)})."
+                )
         if len(bz) == 0:
             return None
         # Prefer more anterior points
@@ -293,10 +320,16 @@ def detect_nares_from_ct_air(
         zc = int(round(np.average(bz, weights=w)))
         yc = int(round(np.average(by, weights=w)))
         xc = int(round(np.average(bx, weights=w)))
-        # Snap to air
+        # Snap to air, in physical millimetres — an unweighted index norm makes
+        # a 1.5 mm z step look the same as a 0.98 mm x step on anisotropic CT.
         if not air[zc, yc, xc]:
-            pts = np.column_stack([bz, by, bx])
-            d = np.linalg.norm(pts.astype(float) - np.array([zc, yc, xc]), axis=1)
+            pts = np.column_stack([bz, by, bx]).astype(float)
+            sx, sy, sz = (float(spacing_xyz[0]), float(spacing_xyz[1]), float(spacing_xyz[2]))
+            d = np.sqrt(
+                ((pts[:, 0] - zc) * sz) ** 2
+                + ((pts[:, 1] - yc) * sy) ** 2
+                + ((pts[:, 2] - xc) * sx) ** 2
+            )
             zc, yc, xc = map(int, pts[int(np.argmin(d))])
         notes.append(
             f"CT {side} naris zyx=({zc},{yc},{xc}) HU={float(hu[zc, yc, xc]):.0f} "
@@ -675,12 +708,16 @@ def extract_ct_nasal_airway(
     notes.extend(n1)
     notes.append("Naris method: CT anterior air shell (not geometric skin tunnels).")
 
-    # Fallback only if CT clustering failed
+    # Fallback only if CT clustering failed. Track provenance per side: a seed
+    # spliced in here is NOT a CT-shell seed, and must not be reported as one.
+    src_l = src_r = "ct_air_shell"
     if left_zyx is None and prior_l_zyx is not None:
         left_zyx = prior_l_zyx
+        src_l = "prior"
         notes.append("Left naris fell back to prior landmark.")
     if right_zyx is None and prior_r_zyx is not None:
         right_zyx = prior_r_zyx
+        src_r = "prior"
         notes.append("Right naris fell back to prior landmark.")
 
     # Two distinct seeds or HARD-fail (docs/handoff.md §9 item 1). The detector
@@ -690,18 +727,21 @@ def extract_ct_nasal_airway(
     # voxels, which left both seeds on the same side of the septum.
     ct_ok, ct_why = validate_naris_pair(left_zyx, right_zyx, spacing_xyz)
     if ct_ok:
-        notes.append(f"Naris pair from CT air shell accepted: {ct_why}.")
+        naris_source = src_l if src_l == src_r else f"mixed(L={src_l},R={src_r})"
+        notes.append(f"Naris pair accepted [{naris_source}]: {ct_why}.")
     else:
-        notes.append(f"WARN: CT naris pair rejected: {ct_why}.")
+        notes.append(f"WARN: naris pair rejected [{src_l}/{src_r}]: {ct_why}.")
         prior_ok, prior_why = validate_naris_pair(prior_l_zyx, prior_r_zyx, spacing_xyz)
         if prior_ok:
             left_zyx, right_zyx = prior_l_zyx, prior_r_zyx
+            naris_source = "prior"
             notes.append(
                 f"Naris pair from whole-head prior landmarks: {prior_why}."
             )
         else:
             notes.append(f"ERROR: prior naris pair also rejected: {prior_why}.")
             left_zyx = right_zyx = None
+            naris_source = "none"
 
     if left_zyx is None or right_zyx is None:
         notes.append("ERROR: need two distinct naris landmarks; HARD fail.")
@@ -723,6 +763,7 @@ def extract_ct_nasal_airway(
             if right_zyx
             else None,
             method="naris_detection_HARD_fail",
+            naris_source="none",
             notes=notes,
         )
 
@@ -825,6 +866,7 @@ def extract_ct_nasal_airway(
                 left_naris_center_mm=_zyx_to_mm(left_zyx, spacing_xyz, origin_xyz),
                 right_naris_center_mm=_zyx_to_mm(right_zyx, spacing_xyz, origin_xyz),
                 method="competing_geodesic_HARD_fail",
+                naris_source=naris_source,
                 notes=notes,
             )
         left_zyx, right_zyx = snap_l, snap_r
@@ -903,6 +945,7 @@ def extract_ct_nasal_airway(
         left_naris_center_mm=left_mm,
         right_naris_center_mm=right_mm,
         method=method,
+        naris_source=naris_source,
         notes=notes,
         merge_zone=merge_zone,
         choanal_landmark=choanal_landmark,

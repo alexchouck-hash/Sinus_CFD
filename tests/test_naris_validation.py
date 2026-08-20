@@ -156,9 +156,11 @@ def test_collapsed_detection_falls_back_to_the_prior():
     )
     assert res.left_naris_center_zyx == (15, 11, 19)
     assert res.right_naris_center_zyx == (15, 11, 11)
-    assert any("CT naris pair rejected" in n for n in res.notes)
+    assert any("naris pair rejected" in n for n in res.notes)
     assert any("whole-head prior landmarks" in n for n in res.notes)
     assert "HARD_fail" not in res.method
+    assert res.naris_source == "prior"
+    assert res.to_meta()["naris_source"] == "prior"
 
 
 def test_collapsed_detection_without_a_prior_hard_fails():
@@ -177,6 +179,7 @@ def test_collapsed_detection_without_a_prior_hard_fails():
     assert any("HARD fail" in n for n in res.notes)
     assert int(res.left_cavity.sum()) == 0
     assert int(res.right_cavity.sum()) == 0
+    assert res.naris_source == "none"
 
 
 def test_invalid_prior_does_not_rescue_a_collapsed_detection():
@@ -194,3 +197,36 @@ def test_invalid_prior_does_not_rescue_a_collapsed_detection():
     )
     assert res.method == "naris_detection_HARD_fail"
     assert any("prior naris pair also rejected" in n for n in res.notes)
+    assert res.naris_source == "none"
+
+
+def test_prior_spliced_in_for_a_none_seed_is_not_reported_as_ct_detected():
+    """Provenance: a seed taken from the prior must never be labelled CT-detected.
+
+    The `None`-seed fallback runs before pair validation, so a prior-sourced pair
+    that then validates was previously reported as "from CT air shell accepted".
+    """
+    shape = (30, 40, 30)
+    body = np.zeros(shape, dtype=bool)
+    body[5:25, 5:35, 5:25] = True
+    air = np.zeros(shape, dtype=bool)
+    air[14:16, 12:14, 15] = True  # far too small a shell to cluster
+    hu = np.zeros(shape, dtype=np.float32)
+    hu[air] = -1000.0
+    hu[~body] = -1000.0
+
+    res = extract_ct_nasal_airway(
+        hu=hu,
+        body=body,
+        interior_air=air,
+        soft_tissue=body & ~air,
+        spacing_xyz=(1.0, 1.0, 1.0),
+        origin_xyz=(0.0, 0.0, 0.0),
+        prior_left_mm=[19.0, 11.0, 15.0],
+        prior_right_mm=[11.0, 11.0, 15.0],
+        legacy_midplane_split=True,
+    )
+    assert res.left_naris_center_zyx == (15, 11, 19)
+    assert res.right_naris_center_zyx == (15, 11, 11)
+    assert res.naris_source == "prior"
+    assert not any("from CT air shell accepted" in n for n in res.notes)

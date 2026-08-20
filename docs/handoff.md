@@ -215,9 +215,24 @@ being passed in and was always correct — it was only ever used when the detect
 returned `None`, which a collapsed pair does not.
 
 The HU filter still relocates the shell; it now says so
-(`WARN: air-HU filter moved the naris shell ... mm posteriorly`). That WARN fires
-on THCA (23.7 mm), CQ500 (19.3 mm) **and Visible Human Male** (8.2 mm) — treat it
-as the marker for "the anterior airway here is painted, not imaged."
+(`WARN: air-HU filter moves the naris shell ... mm posteriorly`). The statistic is
+the **signed median**, measured *before* the apply-decision, against a 10 mm bar:
+
+| Case | signed median shift | WARN |
+|---|---|---|
+| Visible Human Female | +1.0 mm | silent |
+| Visible Human Male | −3.0 mm (anterior, not the failure mode) | silent |
+| THCA | **+32.2 mm** | fires |
+| CQ500CT100 | below bar | silent (it HARD-fails on the pair instead) |
+
+Do **not** revert this to `abs(mean)` inside the `>= 40` branch. The mean puts VH
+Female at +4.4 mm against a 5 mm bar — 0.6 mm from a false alarm on the one case
+that works — and it fired spuriously on VH Male. Nesting the measurement inside
+the apply-branch also makes it dead code on any case that starves that branch.
+
+Treat a firing WARN as the marker for "the anterior airway here is painted, not
+imaged." `naris_source` in `<case>_ct_nasal_meta.json` records where the accepted
+seeds actually came from: `ct_air_shell` (VH F/M), `prior` (THCA), `none` (CQ500).
 
 Sealed 1 mm nares are why vestibule paint exists (`extend_nasal_to_tip.py`).
 
