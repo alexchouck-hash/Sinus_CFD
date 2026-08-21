@@ -372,6 +372,7 @@ def run_edge_segmentation(
     superior_is_high_z: bool,
     body_hu_min: float = -200.0,
     air_hu_max: float = -300.0,
+    y_anterior_is_low: bool | None = None,
 ) -> EdgeSegResult:
     notes: list[str] = []
     edge = gradient_magnitude(hu, sigma=1.0)
@@ -389,7 +390,15 @@ def run_edge_segmentation(
     body = ndi.binary_fill_holes(body)
 
     air = segment_air_edge_aware(hu, body, edge, air_hu_max=air_hu_max)
-    y_ant_low = infer_y_anterior_is_low(body, air)
+    # Geometry wins. The anatomy heuristic below reads the air centroid, which
+    # inverts when the enclosed-air mask has collapsed (open-nares living scan);
+    # it survives only for oblique/degenerate direction matrices, where the
+    # caller passes None.
+    if y_anterior_is_low is None:
+        y_ant_low = infer_y_anterior_is_low(body, air)
+        notes.append("y_anterior_is_low from anatomy (air centroid)")
+    else:
+        y_ant_low = bool(y_anterior_is_low)
     notes.append(f"y_anterior_is_low={y_ant_low}")
 
     nose = find_nose_tip(body, y_ant_low, superior_is_high_z, z0 if superior_is_high_z else 0, z1)

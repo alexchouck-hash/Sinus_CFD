@@ -21,6 +21,7 @@ import SimpleITK as sitk
 import trimesh
 from scipy import ndimage as ndi
 from skimage import morphology
+from skimage.morphology import convex_hull_image
 
 from .boundary_conditions import (
     BoundarySetup,
@@ -76,6 +77,50 @@ def _bbox(mask: np.ndarray, margin: int = 4) -> tuple[slice, slice, slice]:
     return slice(z0, z1), slice(y0, y1), slice(x0, x1)
 
 
+def interior_air_within_hull(
+    hu: np.ndarray,
+    body: np.ndarray,
+    air_hu_max: float,
+    voxel_ml: float,
+    min_speck_ml: float = 0.02,
+) -> np.ndarray:
+    """
+    Recover interior (nasal / sinus / pharyngeal) air on OPEN-NARES living scans.
+
+    On a living head CT the nasal lumen is 26-connected to the ambient FOV air
+    through the nostrils (and to the exterior through the caudal FOV cut at the
+    neck), so ``binary_fill_holes`` cannot reclaim it and ``body & (hu<=air)``
+    collapses to a handful of sealed-sinus voxels (~1e3). This mirrors the
+    body-hull method proven in ``scripts/assess_dicom_incoming.internal_air_ml``:
+    take the per-axial-slice convex hull of the body silhouette (which seals the
+    in-plane nostril gap and the neck outline), then keep low-HU voxels inside
+    that hull. Works at any spacing because the hull is silhouette-geometric and
+    the speck filter is expressed in mL, not voxels.
+    """
+    hull = np.zeros_like(body)
+    for z in range(body.shape[0]):
+        sl = body[z]
+        if int(sl.sum()) < 50:  # too little tissue to define a head silhouette
+            continue
+        try:
+            hull[z] = convex_hull_image(sl)
+        except Exception:
+            hull[z] = sl  # degenerate slice: fall back to raw body silhouette
+
+    interior = (hu <= air_hu_max) & hull
+    # Light closing to reconnect thin passages without bridging tissue walls
+    interior = morphology.closing(interior, footprint=morphology.ball(1))
+    labeled, n = ndi.label(interior)
+    if n == 0:
+        return interior.astype(bool)
+    counts = np.bincount(labeled.ravel())
+    counts[0] = 0
+    min_speck = max(int(round(min_speck_ml / max(voxel_ml, 1e-9))), 8)
+    keep = counts >= min_speck
+    keep[0] = False
+    return keep[labeled].astype(bool)
+
+
 def infer_superior_is_high_z(
     image: sitk.Image,
     body: np.ndarray | None = None,
@@ -124,42 +169,95 @@ def infer_superior_is_high_z(
     return True, "default superior_is_high_z=True"
 
 
+# Below this, the array-y axis is treated as degenerate (oblique or coronal
+# acquisition) and the anatomy heuristic is used instead. Matches the z-axis
+# test above.
+Y_AXIS_DEGENERATE_TOL = 1e-6
+
+
+def infer_y_anterior_is_low_from_image(
+    image: sitk.Image,
+) -> tuple[bool | None, str]:
+    """Array-y anterior/posterior polarity from the direction matrix.
+
+    The sibling z-axis flag has always been derived from image geometry
+    (``infer_superior_is_high_z``); the A-P flag was derived from *anatomy* —
+    "the body y-extreme nearer the air centroid is the face". That heuristic
+    inverts whenever the interior-air mask is unrepresentative, which is
+    exactly what happens on an open-nares living scan where the enclosed-air
+    mask collapses to a handful of sealed mastoid cells (CQ500CT105: 0.15 mL,
+    median y=275 of a head spanning y[19,482] -> "anterior is high y", wrong).
+
+    This reads direction COLUMN 1 (the array-y axis). In LPS, +y is POSTERIOR,
+    so array-y increasing toward +y means anterior is LOW array-y.
+
+    Returns ``None`` when the matrix is oblique or degenerate, so "geometry
+    could not decide" stays distinguishable from "geometry said True" and the
+    caller can fall back rather than silently defaulting.
+    """
+    direction = image.GetDirection()  # 3x3 row-major
+    y_axis = np.array([direction[1], direction[4], direction[7]], dtype=float)
+    j_sign = float(y_axis[1] * image.GetSpacing()[1])
+    if abs(j_sign) <= Y_AXIS_DEGENERATE_TOL:
+        return None, "image_y_axis degenerate (oblique/coronal); anatomy fallback"
+    y_anterior_is_low = j_sign > 0
+    return y_anterior_is_low, (
+        f"image_y_axis LPS: y_axis={tuple(round(float(v), 3) for v in y_axis)} "
+        f"j_sign={j_sign:+.3f} -> y_anterior_is_low={y_anterior_is_low}"
+    )
+
+
 def _orient_face_and_neck(
     body: np.ndarray,
-    air: np.ndarray,
     superior_is_high_z: bool,
+    y_anterior_is_low: bool,
+    spacing_xyz: tuple[float, float, float],
+    neck_mm: float = 40.0,
+    crown_mm: float = 30.0,
+    anterior_depth_mm: float = 45.0,
 ) -> dict[str, Any]:
     """
-    Face (nostrils) vs neck (trachea) slice bands given superior direction.
+    Face (nostrils) vs neck (trachea) bands in PHYSICAL mm.
 
-    Nostrils: mid-face band (not the cranial crown).
-    Trachea: most caudal 15–20% of the body FOV.
+    Orientation is supplied by the single upstream inference (``y_anterior_is_low``
+    from ``edge_segment`` and ``superior_is_high_z`` from the DICOM direction) — this
+    function no longer runs its own A–P heuristic, so the seed bands can never
+    disagree with the nares / trachea ports. All band widths are converted from mm
+    using the image spacing so they behave identically at 0.5 mm and 1.5 mm.
+
+    Nostrils: anterior mid-face band (not the cranial crown, not the neck).
+    Trachea: most caudal ``neck_mm`` of the head.
     """
+    sy = float(spacing_xyz[1])  # array axis 1 (y) spacing
+    sz = float(spacing_xyz[2])  # array axis 0 (z) spacing
     n_z = body.shape[0]
+    n_y = body.shape[1]
+
+    # Anchor bands to the body's actual z-extent (crop already trims to bbox).
+    zb = np.where(body.any(axis=(1, 2)))[0]
+    z0b, z1b = (int(zb.min()), int(zb.max())) if len(zb) else (0, n_z - 1)
+    neck_sl = max(int(round(neck_mm / sz)), 8)
+    crown_sl = max(int(round(crown_mm / sz)), 8)
+
     if superior_is_high_z:
         # high z = superior (crown), low z = inferior (neck)
-        z_neck = slice(0, max(int(n_z * 0.18), 8))
-        # mid-face: avoid crown (top 20%) and neck (bottom 25%)
-        z_face = slice(int(n_z * 0.25), int(n_z * 0.75))
-        z_crown = slice(int(n_z * 0.80), n_z)
+        z_neck = slice(z0b, min(z0b + neck_sl, n_z))
+        z_crown = slice(max(z1b - crown_sl + 1, 0), n_z)
+        z_face = slice(min(z0b + neck_sl, n_z), max(z1b - crown_sl + 1, 0))
     else:
-        # low z = superior
-        z_neck = slice(min(int(n_z * 0.82), n_z - 8), n_z)
-        z_face = slice(int(n_z * 0.25), int(n_z * 0.75))
-        z_crown = slice(0, int(n_z * 0.20))
+        # low z = superior (crown), high z = inferior (neck)
+        z_neck = slice(max(z1b - neck_sl + 1, 0), n_z)
+        z_crown = slice(z0b, min(z0b + crown_sl, n_z))
+        z_face = slice(min(z0b + crown_sl, n_z), max(z1b - neck_sl + 1, 0))
 
-    # Anterior: more air openings on face half in mid-face slices
-    face_air = air[z_face]
-    air_by_y = face_air.sum(axis=(0, 2))
-    y_len = max(int(air_by_y.shape[0]), 1)
-    score_low = float(air_by_y[: max(y_len // 5, 1)].sum())
-    score_high = float(air_by_y[-max(y_len // 5, 1) :].sum())
-    y_anterior_is_low = score_low >= score_high
-
+    # Anterior face band anchored to the body's anterior y-extreme, width in mm.
+    yb = np.where(body.any(axis=(0, 2)))[0]
+    y0b, y1b = (int(yb.min()), int(yb.max())) if len(yb) else (0, n_y - 1)
+    ant_sl = max(int(round(anterior_depth_mm / sy)), 12)
     if y_anterior_is_low:
-        y_ant = slice(0, max(int(y_len * 0.28), 12))
+        y_ant = slice(y0b, min(y0b + ant_sl, n_y))
     else:
-        y_ant = slice(min(int(y_len * 0.72), y_len - 12), y_len)
+        y_ant = slice(max(y1b - ant_sl + 1, 0), min(y1b + 1, n_y))
 
     return {
         "superior_is_high_z": superior_is_high_z,
@@ -168,7 +266,6 @@ def _orient_face_and_neck(
         "z_crown": z_crown,
         "y_anterior_is_low": y_anterior_is_low,
         "y_ant": y_ant,
-        "air_y_scores": {"low": score_low, "high": score_high},
     }
 
 
@@ -232,22 +329,34 @@ def select_nasal_to_trachea_path(
     hu: np.ndarray,
     bone: np.ndarray,
     superior_is_high_z: bool,
+    y_anterior_is_low: bool,
+    spacing_xyz: tuple[float, float, float],
+    trachea_half_width_mm: float = 22.0,
+    min_component_ml: float = 0.5,
+    min_airway_ml: float = 0.5,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """
     Build fluid domain: nostrils (anterior mid-face) → caudal to trachea.
 
     Direction is constrained inferiorly (down the neck), not into the cranial vault.
+    Orientation ``(y_anterior_is_low, superior_is_high_z)`` is passed in from the
+    single upstream inference so seed placement matches the nares / trachea ports.
+    All seed bands and size filters are physical (mm / mL) via ``spacing_xyz``.
     """
-    info: dict[str, Any] = {"superior_is_high_z": superior_is_high_z}
+    info: dict[str, Any] = {
+        "superior_is_high_z": superior_is_high_z,
+        "y_anterior_is_low": y_anterior_is_low,
+    }
     if not air.any():
         raise ValueError("Empty air mask")
 
-    orient = _orient_face_and_neck(body, air, superior_is_high_z)
-    info.update(
-        {
-            "y_anterior_is_low": orient["y_anterior_is_low"],
-            "air_y_scores": orient["air_y_scores"],
-        }
+    voxel_ml = float(np.prod(spacing_xyz)) / 1000.0
+    sx = float(spacing_xyz[0])  # array axis 2 (x) spacing
+    x_half = max(int(round(trachea_half_width_mm / sx)), 6)
+    min_component_vox = max(int(round(min_component_ml / max(voxel_ml, 1e-9))), 30)
+
+    orient = _orient_face_and_neck(
+        body, superior_is_high_z, y_anterior_is_low, spacing_xyz
     )
     z_face, z_neck, z_crown = orient["z_face"], orient["z_neck"], orient["z_crown"]
     y_ant = orient["y_ant"]
@@ -263,22 +372,31 @@ def select_nasal_to_trachea_path(
     crown_air = np.zeros_like(air)
     crown_air[z_crown] = True
     nostril_region &= ~crown_air
-    # Also drop air deep posterior (brain cavity)
-    if orient["y_anterior_is_low"]:
-        # posterior is high y — keep anterior half of face band
-        pass
     info["nostril_seed_voxels"] = int(nostril_region.sum())
+    if not nostril_region.any():
+        raise ValueError(
+            "Empty nostril seed region: no anterior mid-face air found for "
+            f"orientation y_anterior_is_low={y_anterior_is_low}, "
+            f"superior_is_high_z={superior_is_high_z}. Check orientation inference "
+            "and interior-air recovery (would otherwise fall back to a ~0 mL airway)."
+        )
 
     # --- Trachea seeds: inferior neck, midline, air or very low HU ---
-    x0, x1 = max(x_mid - 40, 0), min(x_mid + 40, air.shape[2])
+    x0, x1 = max(x_mid - x_half, 0), min(x_mid + x_half, air.shape[2])
     trachea_region = np.zeros_like(air)
     trachea_region[z_neck, :, x0:x1] = True
     trachea_region &= body & (hu <= -80)
-    if trachea_region.sum() < 25:
+    if int(trachea_region.sum()) < min_component_vox // 20:
         trachea_region = np.zeros_like(air)
         trachea_region[z_neck, :, x0:x1] = True
         trachea_region &= air
     info["trachea_seed_voxels"] = int(trachea_region.sum())
+    if not trachea_region.any():
+        raise ValueError(
+            "Empty trachea seed region: no caudal midline neck air found for "
+            f"orientation superior_is_high_z={superior_is_high_z} "
+            f"(neck band {z_neck}, x±{x_half} vox). Check orientation / FOV extent."
+        )
 
     labeled, n = ndi.label(air)
     counts = np.bincount(labeled.ravel())
@@ -286,7 +404,7 @@ def select_nasal_to_trachea_path(
 
     both, nose_only = [], []
     for lab_id in range(1, n + 1):
-        if counts[lab_id] < 120:
+        if counts[lab_id] < min_component_vox:
             continue
         comp = labeled == lab_id
         # Exclude pure crown components
@@ -391,6 +509,7 @@ def select_nasal_to_trachea_path(
         if best_k is not None:
             out = labk == best_k
             out = _clip_superior_to_start(out, nostril_region, superior_is_high_z)
+            _assert_airway_plausible(out, voxel_ml, min_airway_ml, "geodesic_nose_to_neck_caudal")
             info["selection"] = "geodesic_nose_to_neck_caudal"
             info["note"] = (
                 "Path constrained caudally to trachea/neck. "
@@ -407,9 +526,24 @@ def select_nasal_to_trachea_path(
         best = int(np.argmax(counts))
     keep = labeled == best
     keep = _clip_superior_to_start(keep, nostril_region if nostril_region.any() else keep, superior_is_high_z)
+    _assert_airway_plausible(keep, voxel_ml, min_airway_ml, "fallback_largest_nasal_caudal_clip")
     info["selection"] = "fallback_largest_nasal_caudal_clip"
     info["warning"] = "Limited nose–trachea connection; outlet at caudal tip of path."
     return keep.astype(bool), info
+
+
+def _assert_airway_plausible(
+    mask: np.ndarray, voxel_ml: float, min_airway_ml: float, selection: str
+) -> None:
+    """Fail loudly if a non-connected selection path collapsed to a ~0 mL airway."""
+    vol_ml = float(int(mask.sum()) * voxel_ml)
+    if vol_ml < min_airway_ml:
+        raise ValueError(
+            f"Airway selection '{selection}' produced only {int(mask.sum())} voxels "
+            f"({vol_ml:.3f} mL), below the {min_airway_ml:.2f} mL plausibility floor. "
+            "This is the silent-failure mode (orientation / seed placement / empty "
+            "interior air) — refusing to emit a degenerate airway."
+        )
 
 
 def _mostly_crown(comp: np.ndarray, z_crown: slice) -> np.ndarray:
@@ -667,12 +801,17 @@ def process_whole_head(
     notes.append(f"Orientation: {orient_method}")
     print(f"[{case_id}] {orient_method}")
 
+    y_ant_low_img, ap_method = infer_y_anterior_is_low_from_image(image)
+    notes.append(f"Orientation: {ap_method}")
+    print(f"[{case_id}] {ap_method}")
+
     print(f"[{case_id}] edge-aware tissue + air segmentation (crop shoulders)…")
     seg = run_edge_segmentation(
         hu_full,
         superior_is_high_z=superior_is_high_z,
         body_hu_min=body_hu_min,
         air_hu_max=air_hu_max,
+        y_anterior_is_low=y_ant_low_img,  # None -> keep the anatomy inference
     )
     notes.extend(seg.notes)
 
@@ -681,10 +820,50 @@ def process_whole_head(
     crop_origin_zyx = [bb[0].start, bb[1].start, bb[2].start]
     hu = hu_full[bb]
     body = seg.body[bb]
-    air_all = seg.air[bb]
     bone = seg.bone[bb]
-    labels_crop = seg.labels[bb]
+    labels_crop = seg.labels[bb].copy()
     edge_crop = seg.edge_magnitude[bb]
+
+    # Interior (nasal / sinus / pharyngeal) air. The enclosed-air segmentation
+    # (body & low-HU on the hole-filled body) works when the airway is enclosed
+    # (e.g. VH cadaver, closed nares). On an OPEN-NARES living scan the nasal lumen
+    # is 26-connected to the ambient FOV air through the nostrils (and vents to the
+    # FOV cut via the nasopharynx), so it is neither enclosed nor hole-fillable and
+    # the mask collapses to a few sealed-sinus voxels (~1e3 → ~0 mL). Detect that
+    # collapse in physical mL and recover interior air via the per-axial body-hull
+    # method (proven in assess_dicom_incoming.internal_air_ml). Using enclosed air
+    # when healthy keeps VH byte-for-byte identical to the prior pipeline.
+    voxel_ml = float(np.prod(spacing)) / 1000.0
+    air_enclosed = seg.air[bb]
+    air_enclosed_ml = float(int(air_enclosed.sum()) * voxel_ml)
+    open_nares_min_ml = 5.0
+    if air_enclosed_ml >= open_nares_min_ml:
+        air_all = air_enclosed
+        notes.append(
+            f"Interior air from enclosed-air segmentation ({air_enclosed_ml:.1f} mL)."
+        )
+        print(f"[{case_id}] interior air (enclosed) = {air_enclosed_ml:.1f} mL")
+    else:
+        air_all = interior_air_within_hull(hu, body, air_hu_max, voxel_ml)
+        air_hull_ml = float(int(air_all.sum()) * voxel_ml)
+        if not air_all.any():
+            raise ValueError(
+                f"[{case_id}] Enclosed-air segmentation collapsed to "
+                f"{air_enclosed_ml:.2f} mL (open nares?) AND body-hull recovery found "
+                f"no interior air (air_hu_max={air_hu_max}). Refusing to emit an empty "
+                "airway."
+            )
+        notes.append(
+            f"Enclosed-air segmentation collapsed to {air_enclosed_ml:.2f} mL "
+            f"(open-nares living scan); recovered {air_hull_ml:.1f} mL via body-hull."
+        )
+        print(
+            f"[{case_id}] interior air (enclosed={air_enclosed_ml:.2f} mL collapsed) "
+            f"→ body-hull recovery = {air_hull_ml:.1f} mL"
+        )
+    # Keep tissue labels consistent with the interior air actually used.
+    labels_crop[labels_crop == 1] = 2  # old AIR label → SOFT
+    labels_crop[air_all] = 1  # AIR
 
     # Remap landmark coords into crop space
     def _to_crop(zyx: tuple[int, int, int] | None) -> tuple[int, int, int] | None:
@@ -714,7 +893,13 @@ def process_whole_head(
     print(f"[{case_id}] nose_tip={nose_tip_c} naris_L={naris_L_c} naris_R={naris_R_c}")
     print(f"[{case_id}] selecting nasal→trachea path (caudal)…")
     airway, path_info = select_nasal_to_trachea_path(
-        air_all, body, hu, bone, superior_is_high_z=superior_is_high_z
+        air_all,
+        body,
+        hu,
+        bone,
+        superior_is_high_z=superior_is_high_z,
+        y_anterior_is_low=seg.y_anterior_is_low,
+        spacing_xyz=spacing,
     )
     notes.append(f"Airway selection: {path_info.get('selection')}")
     if path_info.get("note"):
@@ -863,7 +1048,6 @@ def process_whole_head(
                 "WARNING: airway still extends more cranially than caudally — check seeds."
             )
 
-    voxel_ml = float(np.prod(spacing)) / 1000.0
     result = WholeHeadResult(
         case_id=case_id,
         image_path=str(image_path),
