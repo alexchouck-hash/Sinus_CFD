@@ -19,6 +19,10 @@ AIR_HU_MAX_FLOOD = -300.0
 AIR_HU_MAX_VESTIBULE = -120.0
 NARIS_SNAP_RADIUS_MM = 10.0
 NASAL_BOX_POSTERIOR_MM = 90.0
+# The box must extend ANTERIOR of the CT-air-shell naris all the way to the skin
+# nares, or passage_lumen stops short of the boundary-condition inlet and there
+# is no flow path to solve (VH: BC inlet at y=4, box started at y=36).
+NASAL_BOX_ANTERIOR_MM = 45.0
 NASAL_BOX_Z_HALF_MM = 35.0
 RIDGE_DILATE_MM = 3.0
 MIDSURFACE_TAU_MM = 0.5
@@ -174,11 +178,12 @@ def nasal_box_mask(
     y_face = 0.5 * (left_seed[1] + right_seed[1])
     z_half = max(int(round(NASAL_BOX_Z_HALF_MM / max(sz, 1e-6))), 4)
     y_post = max(int(round(NASAL_BOX_POSTERIOR_MM / max(sy, 1e-6))), 8)
+    y_ant = max(int(round(NASAL_BOX_ANTERIOR_MM / max(sy, 1e-6))), 4)
     z0, z1 = max(0, int(z_mid) - z_half), min(nz, int(z_mid) + z_half + 1)
     if y_anterior_is_low:
-        y0, y1 = max(0, int(y_face) - 2), min(ny, int(y_face) + y_post)
+        y0, y1 = max(0, int(y_face) - y_ant), min(ny, int(y_face) + y_post)
     else:
-        y0, y1 = max(0, int(y_face) - y_post), min(ny, int(y_face) + 3)
+        y0, y1 = max(0, int(y_face) - y_post), min(ny, int(y_face) + y_ant)
     box = np.zeros(shape, dtype=bool)
     box[z0:z1, y0:y1, :] = True
     return box

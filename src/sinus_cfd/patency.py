@@ -1,0 +1,256 @@
+"""Patency assurance: is there a flow path, and can each sinus drain?
+
+Two questions this module answers numerically, because "the segmentation looks
+right" is not an answer (docs/handoff.md records several cases that looked right
+and were not):
+
+1. **Flow path** -- does a connected route exist inside the CFD domain from each
+   naris to the outlet, and how tight is it at its narrowest?
+2. **Drainage** -- for each named sinus, where is its ostium, how wide is it, and
+   does it reach the nasal passage?
+
+Both are prerequisites for CLAUDE.md goals 2, 3 and 4. Neither is a Dice score.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+from scipy import ndimage as ndi
+
+from .auto_airway import _spacing_zyx, geodesic_distance_mm, widest_path_bottleneck_mm
+
+# Snap radius when resolving a boundary-condition port onto a mask. Generous on
+# purpose: the point is to MEASURE the gap, not to hide it.
+PORT_SNAP_MM = 10.0
+# An ostium narrower than this reads as obstructed. Balloon dilation targets
+# 3-4 mm (CLAUDE.md goal 5), so this is the clinically interesting bar.
+OSTIUM_PATENT_MM = 2.0
+STRUCT26 = np.ones((3, 3, 3), dtype=bool)
+
+
+def _snap(mask, zyx, spacing_xyz, radius_mm=PORT_SNAP_MM):
+    """Nearest ``mask`` voxel to ``zyx`` within a physical ball; (None, dist) if none."""
+    z, y, x = (int(zyx[0]), int(zyx[1]), int(zyx[2]))
+    nz, ny, nx = mask.shape
+    if 0 <= z < nz and 0 <= y < ny and 0 <= x < nx and mask[z, y, x]:
+        return (z, y, x), 0.0
+    sz, sy, sx = _spacing_zyx(spacing_xyz)
+    rz = max(int(np.ceil(radius_mm / max(sz, 1e-6))), 1)
+    ry = max(int(np.ceil(radius_mm / max(sy, 1e-6))), 1)
+    rx = max(int(np.ceil(radius_mm / max(sx, 1e-6))), 1)
+    z0, z1 = max(0, z - rz), min(nz, z + rz + 1)
+    y0, y1 = max(0, y - ry), min(ny, y + ry + 1)
+    x0, x1 = max(0, x - rx), min(nx, x + rx + 1)
+    sub = mask[z0:z1, y0:y1, x0:x1]
+    if not sub.any():
+        return None, float("inf")
+    zz, yy, xx = np.where(sub)
+    d = np.sqrt(
+        ((zz + z0 - z) * sz) ** 2 + ((yy + y0 - y) * sy) ** 2 + ((xx + x0 - x) * sx) ** 2
+    )
+    i = int(np.argmin(d))
+    if float(d[i]) > radius_mm:
+        return None, float(d[i])
+    return (int(zz[i] + z0), int(yy[i] + y0), int(xx[i] + x0)), float(d[i])
+
+
+def flow_path(passage, inlets_zyx, outlet_zyx, spacing_xyz):
+    """Is there a route from each naris to the outlet inside ``passage``?
+
+    Reports, per inlet: whether the port resolves onto the domain and how far it
+    had to snap (a large snap means the CFD domain does not reach the boundary
+    condition), whether it is connected to the outlet, the route length, and the
+    tightest radius along that route.
+
+    The tight-radius figure is a **proxy for minimum cross-sectional area**: the
+    smallest wall-distance on the route, not a true perpendicular cross-section.
+    Reported as a radius, never converted into an area that could be mistaken for
+    a measured MCA.
+    """
+    passage = passage.astype(bool)
+    sz, sy, sx = _spacing_zyx(spacing_xyz)
+    out: dict[str, Any] = {"inlets": {}, "ok": False, "notes": []}
+    if not passage.any():
+        out["notes"].append("empty passage")
+        return out
+    edt = ndi.distance_transform_edt(passage, sampling=(sz, sy, sx)).astype(np.float32)
+    o_snap, o_dist = _snap(passage, outlet_zyx, spacing_xyz)
+    out["outlet_snap_mm"] = round(o_dist, 2)
+    if o_snap is None:
+        out["notes"].append(
+            f"outlet does not resolve onto the passage (nearest {o_dist:.1f} mm)"
+        )
+        return out
+    d_out = geodesic_distance_mm(passage, o_snap, spacing_xyz)
+    all_ok = True
+    for name, zyx in inlets_zyx.items():
+        rec: dict[str, Any] = {}
+        snap, dist = _snap(passage, zyx, spacing_xyz)
+        rec["snap_mm"] = round(dist, 2) if np.isfinite(dist) else None
+        if snap is None:
+            rec["connected"] = False
+            rec["reason"] = f"port does not resolve onto the passage (nearest {dist:.1f} mm)"
+            all_ok = False
+            out["inlets"][name] = rec
+            continue
+        length = float(d_out[snap])
+        rec["connected"] = bool(np.isfinite(length))
+        rec["path_len_mm"] = round(length, 1) if np.isfinite(length) else None
+        if not rec["connected"]:
+            rec["reason"] = "no connected route to the outlet inside the passage"
+            all_ok = False
+        else:
+            d_in = geodesic_distance_mm(passage, snap, spacing_xyz)
+            corridor = passage & np.isfinite(d_in) & np.isfinite(d_out)
+            corridor &= (d_in + d_out) <= (length + 2.0 * max(sz, sy, sx))
+            rec["min_radius_mm"] = (
+                round(float(edt[corridor].min()), 2) if corridor.any() else None
+            )
+        out["inlets"][name] = rec
+    out["ok"] = bool(all_ok and out["inlets"])
+    return out
+
+
+def _frame(mask):
+    zz, yy, xx = np.where(mask)
+    return {
+        "z0": int(zz.min()),
+        "z1": int(zz.max()),
+        "y0": int(yy.min()),
+        "y1": int(yy.max()),
+        "xmid": float(xx.mean()),
+    }
+
+
+def name_sinus_bodies(
+    sinus,
+    airway,
+    spacing_xyz,
+    y_anterior_is_low=True,
+    superior_is_high_z=True,
+    x_midline=None,
+):
+    """Label each sinus body maxillary / frontal / sphenoid / ethmoid.
+
+    Heuristic anatomy in the airway's own frame, not a trained classifier:
+
+    * maxillary -- lateral, inferior, mid anterior-posterior
+    * frontal   -- superior AND anterior
+    * sphenoid  -- posterior, near midline
+    * ethmoid   -- paramedian, superior-ish (between the orbits)
+
+    Ambiguous bodies are named ``unknown`` rather than forced into a class.
+    """
+    sinus = sinus.astype(bool)
+    sz, sy, sx = _spacing_zyx(spacing_xyz)
+    vox_ml = (sz * sy * sx) / 1000.0
+    fr = _frame(airway)
+    xmid = float(x_midline) if x_midline is not None else fr["xmid"]
+    dy = max(fr["y1"] - fr["y0"], 1)
+    dz = max(fr["z1"] - fr["z0"], 1)
+    lab, n = ndi.label(sinus, STRUCT26)
+    out = []
+    for i in range(1, n + 1):
+        b = lab == i
+        v = float(b.sum()) * vox_ml
+        if v < 0.05:
+            continue
+        zz, yy, xx = np.where(b)
+        off = (float(xx.mean()) - xmid) * sx
+        fy = (float(yy.mean()) - fr["y0"]) / dy
+        fz = (float(zz.mean()) - fr["z0"]) / dz
+        if not y_anterior_is_low:
+            fy = 1.0 - fy
+        if not superior_is_high_z:
+            fz = 1.0 - fz
+        lateral = abs(off)
+        if lateral > 12.0 and fz < 0.78 and 0.10 < fy < 0.80:
+            name = "maxillary"
+        elif fz > 0.72 and fy < 0.42:
+            name = "frontal"
+        elif fy > 0.62 and lateral <= 14.0:
+            name = "sphenoid"
+        elif 3.0 < lateral <= 20.0 and fz >= 0.42:
+            name = "ethmoid"
+        else:
+            name = "unknown"
+        side = "L" if off > 3.0 else ("R" if off < -3.0 else "midline")
+        out.append(
+            {
+                "name": name,
+                "side": side,
+                "volume_ml": round(v, 2),
+                "off_midline_mm": round(off, 1),
+                "frac_posterior": round(fy, 2),
+                "frac_superior": round(fz, 2),
+                "_label": i,
+            }
+        )
+    out.sort(key=lambda r: -r["volume_ml"])
+    return out
+
+
+def drainage(
+    airway,
+    sinus,
+    passage,
+    spacing_xyz,
+    y_anterior_is_low=True,
+    superior_is_high_z=True,
+):
+    """Per-sinus ostium location and calibre, and whether it reaches the passage.
+
+    Calibre is the **widest-path radius** from the passage into the sinus: the
+    radius of the tightest point drainage must pass through. Diameter (2x) is
+    what an antrostomy or a balloon changes, so both are reported. A sinus below
+    ``OSTIUM_PATENT_MM`` diameter is flagged obstructed.
+    """
+    airway = airway.astype(bool)
+    sinus = sinus.astype(bool) & airway
+    passage = passage.astype(bool) & airway
+    sz, sy, sx = _spacing_zyx(spacing_xyz)
+    res: dict[str, Any] = {"sinuses": [], "notes": []}
+    if not sinus.any():
+        res["notes"].append("no sinus bodies segmented")
+        return res
+    if not passage.any():
+        res["notes"].append("empty passage; cannot measure drainage")
+        return res
+    edt = ndi.distance_transform_edt(airway, sampling=(sz, sy, sx)).astype(np.float32)
+    bodies = name_sinus_bodies(
+        sinus, airway, spacing_xyz, y_anterior_is_low, superior_is_high_z
+    )
+    lab, _ = ndi.label(sinus, STRUCT26)
+    bott = widest_path_bottleneck_mm(airway, passage, edt, spacing_xyz)
+    for rec in bodies:
+        b = lab == rec.pop("_label")
+        interface = ndi.binary_dilation(b, STRUCT26) & passage
+        # Calibre is measured ON THE INTERFACE -- the actual connection between
+        # this sinus and the passage -- not by a bottleneck through the airway.
+        # A broad interface is a real finding: on 1 mm data a maxillary wall
+        # perforated by partial volume genuinely IS broadly connected, and
+        # reporting a narrow "ostium" there would be fiction.
+        if interface.any():
+            calibre = float(edt[interface].max())
+        else:
+            vals = bott[b]
+            vals = vals[np.isfinite(vals) & (vals > 0)]
+            calibre = float(vals.max()) if vals.size else 0.0
+        rec["ostium_radius_mm"] = round(calibre, 2)
+        rec["ostium_diameter_mm"] = round(2.0 * calibre, 2)
+        rec["touches_passage"] = bool(interface.any())
+        rec["drains"] = bool(interface.any() and calibre > 0.0)
+        rec["patent"] = bool(2.0 * calibre >= OSTIUM_PATENT_MM)
+        if interface.any():
+            zz, yy, xx = np.where(interface)
+            rec["ostium_zyx"] = [int(zz.mean()), int(yy.mean()), int(xx.mean())]
+        else:
+            rec["ostium_zyx"] = None
+        res["sinuses"].append(rec)
+    have = {r["name"] for r in res["sinuses"] if r["name"] != "unknown"}
+    for want in ("maxillary", "frontal", "sphenoid"):
+        if want not in have:
+            res["notes"].append(f"no {want} sinus found")
+    return res

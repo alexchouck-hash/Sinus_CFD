@@ -300,6 +300,52 @@ trustworthy passage + septum.
 
 ---
 
+## 9b. Patency assurance (2026-08-22)
+
+`scripts/qa_patency.py` answers the two questions that gate CLAUDE.md goals 2-4.
+It imports from `src/` (unlike `qa_connectivity.py`, which is import-free by contract).
+
+```powershell
+py -3.12 scripts\qa_patency.py --case CQ500CT105
+py -3.12 scripts\qa_patency.py --all --json outputs\patency.json
+```
+
+**[1] Flow path** — is each naris connected to the outlet *inside `passage_lumen`*, how far
+did the BC port have to snap, how long is the route, and how tight is it at its narrowest?
+Exit non-zero if any case lacks a bilateral path. **[2] Drainage** — per sinus: anatomical
+name, side, volume, ostium diameter, whether it reaches the passage, whether it is patent.
+Drainage is reported, not gated: an obstructed ostium is a clinical finding, not a bug.
+
+| case | flow path | maxillary L / R (mL, ostium mm) | frontal | sphenoid |
+|---|---|---|---|---|
+| VisibleHuman_Head | **PASS** 117.5 / 109.7 mm, tightest r=1.0 mm | 7.70 @14.0 / 7.01 @4.9 | none | none |
+| VisibleHuman_Male_Head | **PASS** 126.4 / 121.1 mm | 4.54 @20.4 / 1.67 @19.8 | none | none |
+| THCA_HeadNeck | **PASS** 155.4 / 155.9 mm | none | none | none |
+| CQ500CT105 | **FAIL** — BC inlets do not resolve | 0.73 @2.5 / 0.60 @3.1 | none | none |
+
+Two defects it found and that are now fixed: the nasal box began *at* the CT-air-shell
+naris, so `passage_lumen` stopped 32.8 mm short of the BC inlet
+(`NASAL_BOX_ANTERIOR_MM = 45.0`); and the box cropped away the trachea, so the outlet port
+did not resolve either (outlet glue — whole-head airway outside the box, connected to the
+passage, is unioned back on; sinuses are inside the box and stay stripped).
+
+**Still failing, and worth knowing why each is different:**
+
+- **CQ500CT105** — its BC ports are wrong at source: `whole_head`'s edge naris detector put
+  the left naris at x=304 when the airway spans x[124,298]. The diagnostic line says
+  `on airway_mask (pre-strip) 0/2 inlet(s) connect`, i.e. the ports miss the anatomy
+  entirely. This is a `_ports_from_edge_nares` bug, **not** a segmentation bug — the
+  segmentation of that case is the best in the repo.
+- **No frontal or sphenoid sinus is found on any case.** On VH/THCA that is largely honest
+  (1 mm cadaver data, and THCA has no resolved sinus air at all), but it is unverified on
+  CQ500CT105, whose FOV clips inferiorly. Goal 3 needs these, so this is the next gap.
+- **Ostium calibre is only trustworthy on sub-millimetre data.** VH reports 14-20 mm
+  "ostia" because its maxillary wall is perforated by partial volume (19 connections) —
+  broad connection is the truth for that scan. CQ500CT105 at 0.39 mm reports **2.5 and
+  3.1 mm**, which is anatomically correct for a maxillary ostium. Do not compare the two.
+
+---
+
 ## 10. Conventions and landmines
 
 - Arrays `(z, y, x)`; spacing/origin from SimpleITK. **High x ≈ patient left** on Visible Human.

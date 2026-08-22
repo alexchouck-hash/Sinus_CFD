@@ -921,6 +921,27 @@ def extract_ct_nasal_airway(
             passage = left | right | merge_zone
         else:
             passage = left | right
+        # Glue the whole-head nasopharynx/trachea continuation back on. The
+        # nasal box crops the flood domain for speed, but the CFD outlet BC
+        # lives at the trachea, outside that box: without this the outlet port
+        # does not resolve onto passage_lumen and there is no flow path to
+        # solve (VH Male and THCA both failed exactly here). Only air OUTSIDE
+        # the box and connected to the passage is added, so the sinuses --
+        # which are inside the box -- stay stripped.
+        if flood_domain is not None:
+            outside = flood_domain.astype(bool) & ~box
+            if outside.any():
+                s26 = np.ones((3, 3, 3), dtype=bool)
+                lab_g, _n = ndi.label(passage | outside, s26)
+                ids = [int(v) for v in np.unique(lab_g[passage]) if v]
+                if ids:
+                    grown = np.isin(lab_g, ids)
+                    added = int(grown.sum()) - int(np.asarray(passage).sum())
+                    passage = grown
+                    notes.append(
+                        f"outlet glue: +{added} voxels of whole-head airway "
+                        f"posterior of the nasal box (nasopharynx/trachea)"
+                    )
         septum, _, _ = septum_ridge_from_cavities(body, left, right, spacing_xyz)
         mucosa = body & morphology.dilation(passage, footprint=morphology.ball(1))
         mucosa = mucosa & ~passage
