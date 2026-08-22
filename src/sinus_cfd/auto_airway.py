@@ -32,6 +32,21 @@ PALATE_RIDGE_DISAGREE_MM = 15.0
 THROUGH_PATH_SLACK_MM = 4.0
 BONE_HU_MIN = 300.0
 
+# --- Dead-end sinus strip (supersedes the corridor test; see the docstring of
+# dead_end_sinus_strip and docs/segmentation_strategy.md K9).
+# Thickness of the anterior/posterior opening slabs used as flow terminals.
+NARIS_TERMINAL_SLAB_MM = 1.5
+# A chamber whose local radius exceeds this multiple of its widest-path radius
+# to any opening is "roomy space reached only through a neck" -> sinus seed.
+# Measured stable over 1.15-2.0 on both Visible Human and CQ500CT105; the
+# lateral (maxillary) basins do not move across that range.
+SINUS_SEED_RATIO = 2.0
+# Local radius within this multiple of the widest-path radius means open
+# corridor -> passage marker. Raising it erodes the sinuses (VH 8.9 -> 4.8 mL
+# at 1.6), so it stays tight.
+SINUS_CORRIDOR_RATIO = 1.05
+SINUS_MIN_BODY_ML = 0.3
+
 
 def _spacing_zyx(spacing_xyz: tuple[float, float, float]) -> tuple[float, float, float]:
     sx, sy, sz = (float(spacing_xyz[0]), float(spacing_xyz[1]), float(spacing_xyz[2]))
@@ -337,6 +352,198 @@ def through_path_passage(
         f"passage={int(through.sum())} sinus_detour={int(sinus.sum())}"
     )
     return through, sinus, notes
+
+
+def widest_path_bottleneck_mm(
+    air: np.ndarray,
+    terminal: np.ndarray,
+    edt_mm: np.ndarray,
+    spacing_xyz: tuple[float, float, float],
+) -> np.ndarray:
+    """Widest-path (maximin) radius from ``terminal`` to every air voxel.
+
+    ``bottleneck[v]`` is the largest, over all paths from the terminal to ``v``,
+    of the smallest wall-distance along that path — i.e. the radius of the
+    tightest constriction you must squeeze through to reach ``v``.
+
+    Terminals are **openings, not constrictions**. Seeding the terminal with its
+    own ``edt`` caps every downstream bottleneck by it: the outlet slab sits on
+    the FOV cut where ``edt`` is small, which made the nasopharynx (2.50 mm wide,
+    directly behind the outlet) report a 1.18 mm bottleneck and get classified as
+    sinus. Seeding at effectively infinite width makes the first constraint the
+    first genuine constriction inside the airway.
+    """
+    air = air.astype(bool)
+    nz, ny, nx = air.shape
+    bott = np.zeros(air.shape, dtype=np.float32)
+    big = np.float32(1e6)
+    heap: list[tuple[float, int, int, int]] = []
+    for z, y, x in zip(*np.where(terminal & air)):
+        z, y, x = int(z), int(y), int(x)
+        if big > bott[z, y, x]:
+            bott[z, y, x] = big
+            heap.append((-float(big), z, y, x))
+    heapq.heapify(heap)
+    offsets = [
+        (dz, dy, dx)
+        for dz in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        for dx in (-1, 0, 1)
+        if (dz, dy, dx) != (0, 0, 0)
+    ]
+    while heap:
+        neg, z, y, x = heapq.heappop(heap)
+        cur = -neg
+        if cur < bott[z, y, x]:
+            continue
+        for dz, dy, dx in offsets:
+            z2, y2, x2 = z + dz, y + dy, x + dx
+            if not (0 <= z2 < nz and 0 <= y2 < ny and 0 <= x2 < nx):
+                continue
+            if not air[z2, y2, x2]:
+                continue
+            w = min(cur, float(edt_mm[z2, y2, x2]))
+            if w > bott[z2, y2, x2]:
+                bott[z2, y2, x2] = w
+                heapq.heappush(heap, (-w, z2, y2, x2))
+    bott[bott >= 1e5] = 0.0  # terminal voxels themselves carry no bottleneck
+    return bott
+
+
+def _opening_slabs(
+    air: np.ndarray,
+    spacing_xyz: tuple[float, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Anterior and posterior opening slabs of the airway, in physical mm."""
+    ny = air.shape[1]
+    sy = float(spacing_xyz[1])
+    yy = np.where(air)[1]
+    y0, y1 = int(yy.min()), int(yy.max())
+    t = max(int(round(NARIS_TERMINAL_SLAB_MM / max(sy, 1e-6))), 1)
+    idx = np.arange(ny)[None, :, None]
+    return air & (idx <= y0 + t), air & (idx >= y1 - t)
+
+
+def dead_end_sinus_strip(
+    air: np.ndarray,
+    spacing_xyz: tuple[float, float, float],
+    merge_zone: np.ndarray | None = None,
+    naris_seeds: list[tuple[int, int, int]] | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Split the flooded airway into (passage, sinus) by a dead-end test.
+
+    A sinus is a **roomy chamber whose only route to any opening squeezes
+    through a neck**. Because openings sit at both ends of the airway (nares and
+    nasopharynx/outlet), cavity behind a tight nasal valve still has a wide route
+    to the posterior opening and is kept — the discriminator the strategy doc
+    says caliber alone cannot provide falls out of the geometry rather than
+    needing a special case.
+
+    Supersedes ``through_path_passage``, which kept only voxels within a slack of
+    *the single shortest* naris→outlet geodesic. A nasal cavity is a broad
+    volume, and the second nostril's route is longer than "shortest", so the
+    contralateral cavity always read as a detour ("WARN: through-path dropped a
+    cavity") and the strip was disabled on every real head.
+
+    ``merge_zone`` — air posterior of the choanal landmark — is the nasopharynx
+    and is passage by definition (strategy K5). It is never seeded as sinus and
+    any basin touching it is rejected. Without it the nasopharynx, a wide chamber
+    behind the relatively narrow choanae, is misread as a dead end.
+
+    Returns ``(passage, sinus, notes)``.
+    """
+    notes: list[str] = []
+    air = air.astype(bool)
+    if not air.any():
+        return air.copy(), np.zeros_like(air), ["dead-end strip: empty airway"]
+    sz, sy, sx = _spacing_zyx(spacing_xyz)
+    vox_ml = (sz * sy * sx) / 1000.0
+    edt = ndi.distance_transform_edt(air, sampling=(sz, sy, sx)).astype(np.float32)
+    if merge_zone is not None:
+        merge_zone = merge_zone.astype(bool) & air
+    else:
+        merge_zone = np.zeros_like(air)
+    # Terminals must be the ANATOMICAL openings. Deriving them from the array
+    # extent works on a whole airway but not on a box-cropped flood domain,
+    # where the extent faces are artificial cuts (CQ500CT105: 6358 voxels of
+    # fake "opening" vs 240 at the real nares) and nothing then reads as being
+    # behind a neck.
+    ant_slab, post_slab = _opening_slabs(air, spacing_xyz)
+    if naris_seeds:
+        ant = np.zeros_like(air)
+        rz = max(int(round(NARIS_TERMINAL_SLAB_MM / max(sz, 1e-6))), 1)
+        ry = max(int(round(NARIS_TERMINAL_SLAB_MM / max(sy, 1e-6))), 1)
+        rx = max(int(round(NARIS_TERMINAL_SLAB_MM / max(sx, 1e-6))), 1)
+        nz_, ny_, nx_ = air.shape
+        for s in naris_seeds:
+            z, y, x = int(s[0]), int(s[1]), int(s[2])
+            ant[
+                max(0, z - rz) : z + rz + 1,
+                max(0, y - ry) : y + ry + 1,
+                max(0, x - rx) : x + rx + 1,
+            ] = True
+        ant &= air
+        if not ant.any():
+            ant = ant_slab
+    else:
+        ant = ant_slab
+    # The merge zone is a passage MARKER and a rejection test, not a bottleneck
+    # source. Seeding the widest-path from it makes the maxillary sinuses
+    # reachable widely from behind and they stop looking like dead ends
+    # (Visible Human dropped from two maxillary bodies to one).
+    post = post_slab
+    terminal = ant | post
+    bott = np.maximum(
+        widest_path_bottleneck_mm(air, ant, edt, spacing_xyz),
+        widest_path_bottleneck_mm(air, post, edt, spacing_xyz),
+    )
+    # A basin must also survive the extent slabs: on a full airway those ARE the
+    # openings, and a sinus must not touch them either.
+    terminal = terminal | ant_slab | post_slab
+    behind = air & (bott > 0) & (edt > SINUS_SEED_RATIO * bott) & ~merge_zone
+    struct = np.ones((3, 3, 3), dtype=bool)
+    lab, n = ndi.label(behind, struct)
+    if n == 0:
+        notes.append("dead-end strip: no sinus seed; whole airway is passage")
+        return air.copy(), np.zeros_like(air), notes
+    sizes = ndi.sum(behind, lab, range(1, n + 1))
+    keep = [i + 1 for i in range(n) if sizes[i] * vox_ml >= SINUS_MIN_BODY_ML]
+    if not keep:
+        notes.append("dead-end strip: all sinus seeds below the volume floor")
+        return air.copy(), np.zeros_like(air), notes
+    corridor = air & (bott > 0) & (edt <= SINUS_CORRIDOR_RATIO * bott)
+    markers = np.zeros(air.shape, dtype=np.int32)
+    markers[corridor | terminal | merge_zone] = 1
+    for k, old in enumerate(keep, start=2):
+        markers[lab == old] = k
+    try:
+        from skimage.segmentation import watershed
+    except Exception as exc:  # pragma: no cover
+        notes.append(f"dead-end strip unavailable ({exc}); keeping whole airway")
+        return air.copy(), np.zeros_like(air), notes
+    ws = watershed(-edt, markers, mask=air)
+    sinus = np.zeros_like(air)
+    n_kept = n_rej = 0
+    for k in range(2, 2 + len(keep)):
+        basin = air & (ws == k)
+        if not basin.any() or basin.sum() * vox_ml < SINUS_MIN_BODY_ML:
+            continue
+        if (basin & terminal).any() or (basin & merge_zone).any():
+            n_rej += 1  # reaches an opening or the nasopharynx -> passage
+            continue
+        sinus |= basin
+        n_kept += 1
+    passage = air & ~sinus
+    # Never let the strip delete a whole side or the openings.
+    if not (passage & ant).any() or not (passage & post).any():
+        notes.append("WARN: dead-end strip would drop an opening; keeping whole airway")
+        return air.copy(), np.zeros_like(air), notes
+    notes.append(
+        f"dead-end strip: {len(keep)} seeds, {n_kept} sinus / {n_rej} rejected; "
+        f"sinus={sinus.sum() * vox_ml:.1f} mL passage={passage.sum() * vox_ml:.1f} mL "
+        f"(merge_zone={merge_zone.sum() * vox_ml:.1f} mL)"
+    )
+    return passage, sinus, notes
 
 
 def septum_ridge_from_cavities(

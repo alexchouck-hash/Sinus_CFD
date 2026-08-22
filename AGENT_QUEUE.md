@@ -57,6 +57,31 @@ Concurrency note: A2, A3, A5 (subagents) + A4, A6 (grok) can run alongside A1
 
 ## Change log
 
+- 2026-08-22 — **Dead-end sinus strip: DONE** (handoff item 3; decision **K9 -> K9a**).
+  `through_path_passage` kept only voxels within 4 mm of *the single shortest* naris->outlet
+  geodesic; a nasal cavity is a broad volume and the second nostril's route is longer than
+  "shortest", so the contralateral cavity always read as a detour and the strip disabled
+  itself on every real head. Replaced by `auto_airway.dead_end_sinus_strip`: sinus = a
+  chamber whose local radius exceeds `SINUS_SEED_RATIO` x its widest-path (maximin) radius
+  to any opening, extent recovered by watershed on -EDT with per-body markers, and any
+  basin touching an opening or the merge zone rejected as passage. Openings at BOTH ends
+  are what keep the nasal valve: cavity behind a tight valve still has a wide route to the
+  posterior opening. Measured sinus: VH Female **15.1 mL** (8.9 + 7.0 bilateral maxillary),
+  VH Male 27.5 mL, CQ500CT105 **3.3 mL** vs **4.1 mL** measured independently in-FOV,
+  THCA none (it has no resolved sinus air). **A12 closed as a side effect**: `passage_lumen`
+  is now distinct from `airway_mask` on `--no-legacy` (VH 34.9 vs 55.3 mL), so
+  `qa_connectivity` check 3 is no longer vacuous. 47 pytest green (+7 in
+  `tests/test_sinus_strip.py`).
+  Three things measured the hard way and worth not re-learning: the literal neck-cut of K9
+  **cannot work** (231 candidate necks on VH isolated 0 pockets; VH's maxillary is fused to
+  the cavity through **19** partial-volume perforations, so there is no neck); the strip must
+  run on the **whole-head airway**, not the nasal-box flood domain, whose faces are artificial
+  cuts that read as wide openings (CQ500: 6358 fake "opening" voxels vs 240 at the real
+  nares); and the merge zone is a passage **marker/rejection test**, never a bottleneck
+  source (seeding widest-path from it cost VH one maxillary).
+  **Still open:** ~1.2 mL of nasopharynx reads as sinus on CQ500CT105 because its merge zone
+  came from the `air p75` fallback rather than a bone landmark - bounded by handoff item 2.
+
 - 2026-08-20 — **Naris detector on living CT: DONE** (handoff §9 item 1). Root cause was
   not the detector's clustering but a silent contract failure: on THCA there is no resolved
   air anterior of y=43, `whole_head` paints a synthetic geodesic tube through soft tissue,

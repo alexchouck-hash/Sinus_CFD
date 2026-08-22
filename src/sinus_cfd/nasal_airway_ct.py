@@ -833,12 +833,11 @@ def extract_ct_nasal_airway(
         from .auto_airway import (
             choanal_landmark_from_bone,
             competing_naris_flood,
+            dead_end_sinus_strip,
             meeting_set,
             nasal_box_mask,
-            posterior_air_seed,
             septum_ridge_from_cavities,
             snap_seed_to_air,
-            through_path_passage,
         )
 
         domain = interior_air.copy()
@@ -892,22 +891,28 @@ def extract_ct_nasal_airway(
         else:
             left_ant, right_ant = left, right
         flooded = left | right
-        outlet = posterior_air_seed(flooded, y_anterior_is_low)
-        if outlet is not None:
-            passage, sinus_detour, n_tp = through_path_passage(
-                flooded, [left_zyx, right_zyx], outlet, spacing_xyz
+        # Run the strip on the ANATOMICAL airway, not on the nasal-box-cropped
+        # flood domain: the box's faces are artificial cuts that read as wide
+        # openings, so nothing there looks like it sits behind a neck. Then
+        # apply the verdict to the flooded region.
+        strip_domain = (
+            flood_domain.astype(bool) if flood_domain is not None else flooded
+        )
+        _strip_passage, sinus_full, n_tp = dead_end_sinus_strip(
+            strip_domain, spacing_xyz, merge_zone=merge_zone
+        )
+        notes.extend(n_tp)
+        sinus_detour = sinus_full & flooded
+        passage = flooded & ~sinus_detour
+        # The strip must never delete a cavity. It cannot by construction (a
+        # basin reaching an opening is rejected), but keep the guard so a future
+        # change cannot silently ship a one-sided domain.
+        left_keep = int((left_ant & passage).sum())
+        right_keep = int((right_ant & passage).sum())
+        if left_keep == 0 or right_keep == 0:
+            notes.append(
+                "WARN: sinus strip emptied a cavity; keeping competing assignment"
             )
-            notes.extend(n_tp)
-            # A bad outlet (box edge) treats one whole cavity as a detour.
-            left_keep = int((left_ant & passage).sum())
-            right_keep = int((right_ant & passage).sum())
-            if left_keep == 0 or right_keep == 0 or int(sinus_detour.sum()) > 0.6 * int(flooded.sum()):
-                notes.append(
-                    "WARN: through-path dropped a cavity; keeping competing assignment"
-                )
-                passage = flooded
-                sinus_detour = np.zeros_like(flooded)
-        else:
             passage = flooded
             sinus_detour = np.zeros_like(flooded)
         left = left_ant & passage
