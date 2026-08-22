@@ -198,6 +198,7 @@ def detect_nares_at_nose_tip(
     superior_is_high_z: bool,
     search_half_z: int = 12,
     anterior_depth: int = 28,
+    spacing_xyz: tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> tuple[tuple[int, int, int] | None, tuple[int, int, int] | None, dict[str, Any]]:
     """
     External L/R nares near the nose tip on the skin, NOT eyes.
@@ -301,9 +302,71 @@ def detect_nares_at_nose_tip(
     if left is not None and right is not None and left == right:
         left = _snap_skin(zt, yt, min(xt + 12, nx - 1), skin, y_anterior_is_low)
         right = _snap_skin(zt, yt, max(xt - 12, 0), skin, y_anterior_is_low)
+    # A real naris pair straddles the nose tip. If the midpoint drifts off it,
+    # the pick has wandered (on CQ500CT105 the left naris landed 37.7 mm lateral
+    # of the tip, outside the airway) -- repair symmetrically about the tip,
+    # which is the reliable landmark, and land on real air.
+    sx = float(spacing_xyz[0])
+    if left is not None and right is not None:
+        asym = abs(0.5 * (left[2] + right[2]) - xt) * sx
+        info["tip_asymmetry_mm"] = round(asym, 2)
+        if asym > NARIS_TIP_ASYMMETRY_MAX_MM:
+            info["naris_repaired"] = (
+                f"pair midpoint {asym:.1f} mm off the nose tip "
+                f"(> {NARIS_TIP_ASYMMETRY_MAX_MM:.1f} mm); rebuilt symmetric about the tip"
+            )
+            left = _naris_from_tip(nose_tip, +1, air, body, spacing_xyz, y_anterior_is_low)
+            right = _naris_from_tip(nose_tip, -1, air, body, spacing_xyz, y_anterior_is_low)
+            info["tip_asymmetry_mm_after"] = round(
+                abs(0.5 * (left[2] + right[2]) - xt) * sx, 2
+            )
     info["naris_left"] = list(left) if left else None
     info["naris_right"] = list(right) if right else None
     return left, right, info
+
+
+# --- External naris geometry, in physical millimetres ---------------------
+# The nose tip is reliable; the L/R naris pick is not. A real naris pair
+# STRADDLES the tip, so the midpoint of the pair must sit near it. Measured
+# asymmetry: VH Female 0.5 mm, THCA 0.0 mm, VH Male 9.5 mm -- and CQ500CT105
+# 17.7 mm, where the left naris landed at x=304 with the airway spanning
+# x[124,298], i.e. outside the airway entirely.
+NARIS_TIP_ASYMMETRY_MAX_MM = 12.0
+# Repair: half-separation each side of the tip when the pick is rejected.
+NARIS_FALLBACK_HALF_SEP_MM = 7.0
+# How far posteriorly to march from the tip to land on real air.
+NARIS_TIP_MARCH_MAX_MM = 30.0
+NARIS_TIP_WINDOW_MM = 5.0
+
+
+def _naris_from_tip(nose_tip, sign, air, body, spacing_xyz, y_anterior_is_low):
+    """A naris placed symmetrically about the nose tip, marched onto real air.
+
+    Used when the L/R pick fails the tip-symmetry test. The tip itself is skin,
+    anterior of any lumen, so a port left there would not resolve onto the CFD
+    domain; marching posteriorly to the first air voxel puts it at the actual
+    nostril opening.
+    """
+    sx, sy, sz = (float(spacing_xyz[0]), float(spacing_xyz[1]), float(spacing_xyz[2]))
+    zt, yt, xt = (int(nose_tip[0]), int(nose_tip[1]), int(nose_tip[2]))
+    nz, ny, nx = body.shape
+    dx = max(int(round(NARIS_FALLBACK_HALF_SEP_MM / max(sx, 1e-6))), 1)
+    x = int(np.clip(xt + sign * dx, 0, nx - 1))
+    rz = max(int(round(NARIS_TIP_WINDOW_MM / max(sz, 1e-6))), 1)
+    rx = max(int(round(NARIS_TIP_WINDOW_MM / max(sx, 1e-6))), 1)
+    ny_march = max(int(round(NARIS_TIP_MARCH_MAX_MM / max(sy, 1e-6))), 1)
+    z0, z1 = max(0, zt - rz), min(nz, zt + rz + 1)
+    x0, x1 = max(0, x - rx), min(nx, x + rx + 1)
+    if y_anterior_is_low:
+        y0, y1 = yt, min(ny, yt + ny_march)
+    else:
+        y0, y1 = max(0, yt - ny_march), min(ny, yt + 1)
+    sub = air[z0:z1, y0:y1, x0:x1]
+    if not sub.any():
+        return (zt, yt, x)
+    zz, yy, xx = np.where(sub)
+    j = int(np.argmin(yy)) if y_anterior_is_low else int(np.argmax(yy))
+    return (int(zz[j] + z0), int(yy[j] + y0), int(xx[j] + x0))
 
 
 def _snap_skin(
@@ -373,6 +436,7 @@ def run_edge_segmentation(
     body_hu_min: float = -200.0,
     air_hu_max: float = -300.0,
     y_anterior_is_low: bool | None = None,
+    spacing_xyz: tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> EdgeSegResult:
     notes: list[str] = []
     edge = gradient_magnitude(hu, sigma=1.0)
@@ -405,9 +469,12 @@ def run_edge_segmentation(
     notes.append(f"nose_tip_zyx={list(nose)}")
 
     nL, nR, ninfo = detect_nares_at_nose_tip(
-        hu, body, air, edge, nose, y_ant_low, superior_is_high_z
+        hu, body, air, edge, nose, y_ant_low, superior_is_high_z,
+        spacing_xyz=spacing_xyz,
     )
     notes.append(f"nares L={nL} R={nR}")
+    if ninfo.get("naris_repaired"):
+        notes.append(f"WARN: naris pick rejected -- {ninfo['naris_repaired']}")
 
     # Multi-class labels
     labels = np.zeros(hu.shape, dtype=np.int16)

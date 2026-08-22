@@ -152,7 +152,7 @@ def infer_superior_is_high_z(
         z1 = origin[2] + (size[2] - 1) * spacing[2] * z_axis[2]
         method = (
             f"image_z_axis LPS: physical_z first={z0:.1f} last={z1:.1f} "
-            f"→ superior_is_high_z={superior_is_high_z}"
+            f"-> superior_is_high_z={superior_is_high_z}"
         )
         return superior_is_high_z, method
 
@@ -323,6 +323,12 @@ def _geodesic_airway_bridge(
     return path
 
 
+# A component that touches both the nostril and trachea seed bands is only the
+# airway if it is comparable in size to the largest nostril-touching component.
+# Below this fraction it is a stray pocket (VH Female: 0.89 mL against 49.9 mL).
+AIRWAY_CONNECTED_MIN_FRACTION = 0.5
+
+
 def select_nasal_to_trachea_path(
     air: np.ndarray,
     body: np.ndarray,
@@ -419,11 +425,31 @@ def select_nasal_to_trachea_path(
 
     if both:
         best = max(both, key=lambda i: counts[i])
-        keep = labeled == best
-        # Strip residual superior vault blobs
-        keep = _clip_superior_to_start(keep, nostril_region, superior_is_high_z)
-        info["selection"] = "connected_nose_to_trachea"
-        return keep.astype(bool), info
+        # This branch used to return unconditionally, with no plausibility check
+        # (every LATER branch calls _assert_airway_plausible). On a head-only scan
+        # there is no trachea, the neck band catches a few stray voxels, and a
+        # tiny pocket that happens to touch both bands short-circuits the geodesic
+        # conduit that builds the real airway: Visible Human Female selected a
+        # 0.89 mL pocket over a 49.9 mL nasal airway. Judge the candidate against
+        # the largest nostril-touching component rather than an absolute floor, so
+        # the test does not need per-case tuning.
+        nose_pool = both + nose_only
+        nose_best = max(nose_pool, key=lambda i: counts[i]) if nose_pool else best
+        frac = float(counts[best]) / float(max(counts[nose_best], 1))
+        if frac >= AIRWAY_CONNECTED_MIN_FRACTION:
+            keep = labeled == best
+            # Strip residual superior vault blobs
+            keep = _clip_superior_to_start(keep, nostril_region, superior_is_high_z)
+            _assert_airway_plausible(
+                keep, voxel_ml, min_airway_ml, "connected_nose_to_trachea"
+            )
+            info["selection"] = "connected_nose_to_trachea"
+            return keep.astype(bool), info
+        info["connected_rejected"] = (
+            f"component touching both seed bands is {counts[best] * voxel_ml:.2f} mL, "
+            f"only {frac:.1%} of the largest nostril component "
+            f"({counts[nose_best] * voxel_ml:.1f} mL); falling through to the conduit"
+        )
 
     # Closing bridge (still constrained)
     for radius in (2, 3, 4):
@@ -438,12 +464,29 @@ def select_nasal_to_trachea_path(
                 both2.append(i)
         if both2:
             best = max(both2, key=lambda i: counts2[i])
-            keep = (labeled2 == best) & (
-                air | morphology.dilation(air, footprint=morphology.ball(2))
+            # Same guard as the connected branch: morphological closing does not
+            # bridge a 9-voxel gap between the airway and the neck band, so this
+            # branch would otherwise re-select the same stray pocket.
+            nose_pool2 = [
+                i for i in range(1, n2 + 1)
+                if ((labeled2 == i) & nostril_region).any()
+            ]
+            nose_best2 = max(nose_pool2, key=lambda i: counts2[i]) if nose_pool2 else best
+            frac2 = float(counts2[best]) / float(max(counts2[nose_best2], 1))
+            if frac2 >= AIRWAY_CONNECTED_MIN_FRACTION:
+                keep = (labeled2 == best) & (
+                    air | morphology.dilation(air, footprint=morphology.ball(2))
+                )
+                keep = _clip_superior_to_start(keep, nostril_region, superior_is_high_z)
+                _assert_airway_plausible(
+                    keep, voxel_ml, min_airway_ml, f"bridged_closing_r{radius}"
+                )
+                info["selection"] = f"bridged_closing_r{radius}"
+                return keep.astype(bool), info
+            info.setdefault("bridged_rejected", []).append(
+                f"r{radius}: {counts2[best] * voxel_ml:.2f} mL, {frac2:.1%} of the "
+                f"largest nostril component"
             )
-            keep = _clip_superior_to_start(keep, nostril_region, superior_is_high_z)
-            info["selection"] = f"bridged_closing_r{radius}"
-            return keep.astype(bool), info
 
     # Geodesic conduit nostrils → neck (caudal only)
     if nostril_region.any():
@@ -587,6 +630,53 @@ def _clip_superior_to_start(
     return out
 
 
+# A boundary-condition inlet is only useful if it sits ON the fluid domain.
+# The geometric nose tip does not guarantee that: on CQ500CT105 the body's
+# anterior extent is a 47-slice plateau (the nasal bridge), the tip landed at
+# z=90, and the airway ends at z=68 -- so a port placed at the tip was 22 slices
+# above any lumen. These bound the repair that grounds the port on the airway.
+NARIS_PORT_MAX_OFFSET_MM = 6.0     # accept the supplied naris if it is this close to air
+NARIS_PORT_HALF_SEP_MM = 7.0       # fallback half-separation about the tip
+NARIS_PORT_ANTERIOR_BAND_MM = 6.0  # depth of the anterior slab used as the opening
+
+
+def _naris_on_airway(
+    airway: np.ndarray,
+    nose_tip: tuple[int, int, int] | None,
+    side_sign: int,
+    spacing_xyz: tuple[float, float, float],
+    y_anterior_is_low: bool,
+) -> tuple[int, int, int] | None:
+    """Anterior opening of the airway on one side -- a port that is ON the domain.
+
+    ``side_sign`` +1 = patient left (higher x). Takes the most anterior slab of
+    the airway on that side of the midline and returns its centroid, so the port
+    lands in the middle of the nostril rather than on its rim.
+    """
+    airway = airway.astype(bool)
+    if not airway.any():
+        return None
+    zz, yy, xx = np.where(airway)
+    x_mid = float(nose_tip[2]) if nose_tip is not None else float(np.median(xx))
+    side = (xx > x_mid) if side_sign > 0 else (xx < x_mid)
+    if not np.any(side):
+        return None
+    zs, ys, xs = zz[side], yy[side], xx[side]
+    sy = float(spacing_xyz[1])
+    band = max(int(round(NARIS_PORT_ANTERIOR_BAND_MM / max(sy, 1e-6))), 1)
+    if y_anterior_is_low:
+        keep = ys <= int(ys.min()) + band
+    else:
+        keep = ys >= int(ys.max()) - band
+    if not np.any(keep):
+        return None
+    return (
+        int(round(float(zs[keep].mean()))),
+        int(round(float(ys[keep].mean()))),
+        int(round(float(xs[keep].mean()))),
+    )
+
+
 def _ports_from_edge_nares(
     airway: np.ndarray,
     spacing_xyz: tuple[float, float, float],
@@ -654,8 +744,36 @@ def _ports_from_edge_nares(
             }
         )
 
-    _add_naris("left_nostril", naris_L)
-    _add_naris("right_nostril", naris_R)
+    # Ground each inlet on the airway. A port that does not resolve onto the
+    # fluid domain cannot be a boundary condition, however good the landmark is.
+    sxs, sys_, szs = (float(spacing_xyz[0]), float(spacing_xyz[1]), float(spacing_xyz[2]))
+    def _on_airway(zyx) -> bool:
+        if zyx is None:
+            return False
+        z, y, x = (int(zyx[0]), int(zyx[1]), int(zyx[2]))
+        nzz, nyy, nxx = airway.shape
+        rz = max(int(round(NARIS_PORT_MAX_OFFSET_MM / max(szs, 1e-6))), 1)
+        ry = max(int(round(NARIS_PORT_MAX_OFFSET_MM / max(sys_, 1e-6))), 1)
+        rx = max(int(round(NARIS_PORT_MAX_OFFSET_MM / max(sxs, 1e-6))), 1)
+        sub = airway[max(0, z - rz):z + rz + 1,
+                     max(0, y - ry):y + ry + 1,
+                     max(0, x - rx):x + rx + 1]
+        return bool(sub.any())
+
+    for nm, zyx, sign in (("left_nostril", naris_L, +1), ("right_nostril", naris_R, -1)):
+        use = zyx
+        if not _on_airway(use):
+            repl = _naris_on_airway(
+                airway, nose_tip, sign, spacing_xyz, y_anterior_is_low
+            )
+            if repl is not None:
+                warnings.append(
+                    f"{nm}: landmark {list(zyx) if zyx else None} is not on the airway "
+                    f"(> {NARIS_PORT_MAX_OFFSET_MM:.0f} mm); using the airway's anterior "
+                    f"opening {list(repl)}"
+                )
+                use = repl
+        _add_naris(nm, use)
     if len([p for p in ports if p.role == "inlet"]) < 2 and nose_tip is not None:
         # Split tip left/right by a few mm in x
         iz, iy, ix = nose_tip
@@ -812,6 +930,7 @@ def process_whole_head(
         body_hu_min=body_hu_min,
         air_hu_max=air_hu_max,
         y_anterior_is_low=y_ant_low_img,  # None -> keep the anatomy inference
+        spacing_xyz=spacing,
     )
     notes.extend(seg.notes)
 
