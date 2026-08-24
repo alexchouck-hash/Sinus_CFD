@@ -41,6 +41,8 @@ APP_VERSION_LABEL = (
 DATA_ROOT = REPO_ROOT / "data"
 LEFT_COLOR = "#2b8cbe"   # blue = left cavity
 RIGHT_COLOR = "#d6604d"  # red = right cavity
+NASOPHARYNX_COLOR = "#8cc9e8"  # pale blue = shared posterior airway
+SINUS_COLOR = "#f28e2b"        # orange = sinus air (outside the CFD domain)
 
 DEFAULT_CASE = "P001"
 OUTPUTS = REPO_ROOT / "outputs"
@@ -464,6 +466,70 @@ def _resolve_case_ct_label(case_id: str) -> tuple[Path | None, Path | None]:
     return None, None
 
 
+def list_segmented_cases() -> list[str]:
+    """Whole-head cases with an automatic L/R segmentation on disk."""
+    if not OUTPUTS.is_dir():
+        return []
+    return [
+        d.name for d in sorted(OUTPUTS.iterdir())
+        if d.is_dir() and (d / f"{d.name}_cavity_left.nrrd").is_file()
+    ]
+
+
+def _load_wholehead_ct_label(case_id: str) -> dict | None:
+    """Compose a viewer label map for a whole-head case.
+
+    The NasalSeg path has one ``*_seg.nrrd`` beside the CT. Whole-head cases keep
+    the CT at its original path and the segmentation as SEPARATE masks under
+    ``outputs/<case>/``, in a CROPPED frame -- so the CT has to be cut to the mask
+    frame before the two can be shown together.
+
+    Values follow the NasalSeg convention the scrubber already understands:
+    1 = left cavity, 2 = right cavity, 3 = nasopharynx, 4 = sinus air.
+    """
+    import SimpleITK as sitk
+
+    cd = OUTPUTS / case_id
+    stats_p = cd / f"{case_id}_stats.json"
+    left_p = cd / f"{case_id}_cavity_left.nrrd"
+    if not (stats_p.is_file() and left_p.is_file()):
+        return None
+    stats = json.loads(stats_p.read_text(encoding="utf-8"))
+    ref = sitk.ReadImage(str(left_p))
+    read = lambda n: (
+        sitk.GetArrayFromImage(sitk.ReadImage(str(cd / f"{case_id}_{n}.nrrd"))).astype(bool)
+        if (cd / f"{case_id}_{n}.nrrd").is_file() else None
+    )
+    left = sitk.GetArrayFromImage(ref).astype(bool)
+    right = read("cavity_right")
+    merge = read("merge_zone")
+    sinus = read("sinus_detour")
+    label = np.zeros(left.shape, dtype=np.uint8)
+    if merge is not None:
+        label[merge] = 3
+    if sinus is not None:
+        label[sinus] = 4
+    label[left] = 1
+    if right is not None:
+        label[right] = 2
+
+    img_p = Path(stats.get("image_path") or "")
+    if not img_p.is_file():
+        return None
+    full = sitk.GetArrayFromImage(sitk.ReadImage(str(img_p))).astype(np.float32)
+    cz, cy, cx = (stats.get("crop_origin_zyx") or [0, 0, 0])
+    nz, ny, nx = label.shape
+    ct = np.full(label.shape, -1024.0, dtype=np.float32)
+    z1 = min(nz, full.shape[0] - cz); y1 = min(ny, full.shape[1] - cy)
+    x1 = min(nx, full.shape[2] - cx)
+    ct[:z1, :y1, :x1] = full[cz:cz + z1, cy:cy + y1, cx:cx + x1]
+    return {
+        "ct": ct,
+        "label": label,
+        "spacing_xyz": tuple(float(v) for v in ref.GetSpacing()),
+    }
+
+
 @st.cache_data(show_spinner=False)
 def _load_ct_label(case_id: str) -> dict | None:
     """Load CT + label arrays (z,y,x) and spacing for a case, or None."""
@@ -471,7 +537,9 @@ def _load_ct_label(case_id: str) -> dict | None:
 
     img_p, lab_p = _resolve_case_ct_label(case_id)
     if img_p is None or lab_p is None:
-        return None
+        # Whole-head case: CT at its original path, segmentation split across
+        # several cropped masks under outputs/<case>/.
+        return _load_wholehead_ct_label(case_id)
     img = sitk.ReadImage(str(img_p))
     lab_img = sitk.ReadImage(str(lab_p))
     ct = sitk.GetArrayFromImage(img)
@@ -549,8 +617,9 @@ def _scrubber_fig(case_id: str, axis: int, default_idx: int, spacing_xyz: tuple)
     # vertical/horizontal physical spacing per plane → aspect ratio
     vratio = {0: sy / sx, 1: sz / sx, 2: sz / sy}[axis]
     n = ct.shape[axis]
-    left_rgb = tuple(int(LEFT_COLOR[k:k + 2], 16) for k in (1, 3, 5))
-    right_rgb = tuple(int(RIGHT_COLOR[k:k + 2], 16) for k in (1, 3, 5))
+    _rgb = lambda h: tuple(int(h[k:k + 2], 16) for k in (1, 3, 5))
+    left_rgb, right_rgb = _rgb(LEFT_COLOR), _rgb(RIGHT_COLOR)
+    np_rgb, sinus_rgb = _rgb(NASOPHARYNX_COLOR), _rgb(SINUS_COLOR)
 
     def _png_uri(i: int) -> str:
         # Full-resolution slice, PNG-compressed to a data URI. PNG shrinks CT
@@ -560,7 +629,7 @@ def _scrubber_fig(case_id: str, axis: int, default_idx: int, spacing_xyz: tuple)
         l = np.take(label, i, axis=axis)
         g = ((np.clip(c, -1000, 400) + 1000) / 1400 * 255).astype(np.float32)
         rgb = np.stack([g, g, g], axis=-1)
-        for lid, col in ((1, left_rgb), (2, right_rgb)):
+        for lid, col in ((3, np_rgb), (4, sinus_rgb), (1, left_rgb), (2, right_rgb)):
             m = l == lid
             rgb[m] = 0.55 * rgb[m] + 0.45 * np.array(col, dtype=np.float32)
         buf = io.BytesIO()
@@ -1017,6 +1086,74 @@ def _wall_flux_trace(case_id: str):
         facecolor=facecolor, opacity=1.0, name="wall heat flux",
         lighting=dict(ambient=0.7, diffuse=0.7, specular=0.1),
     )
+
+
+def render_segmentation() -> None:
+    """Slice viewer for the automatic whole-head segmentation.
+
+    Shows the cropped CT with the segmentation overlaid -- L/R cavity,
+    nasopharynx and sinus air -- on a live tri-planar scrubber, plus the same
+    classes as transparent 3D surfaces.
+    """
+    st.title("Sinus_CFD — Segmentation")
+    st.caption("Automatic whole-head segmentation · CT + label overlay · no manual labelling")
+
+    cases = list_segmented_cases()
+    if not cases:
+        st.info(
+            "No segmented whole-head cases under `outputs/`. Produce one with "
+            "scripts/auto_process_head.py (geometry) then "
+            "scripts/autosegment_ct.py --no-legacy."
+        )
+        return
+    pref = [c for c in ("CQ500CT390", "CQ500CT105") if c in cases]
+    case_id = st.selectbox("Case", cases, index=cases.index(pref[0]) if pref else 0)
+
+    data = _load_ct_label(case_id)
+    if data is None or data.get("label") is None:
+        st.error(f"Could not load CT + segmentation for {case_id}.")
+        return
+    label, sp = data["label"], data["spacing_xyz"]
+    vml = float(np.prod(sp)) / 1000.0
+
+    cols = st.columns(4)
+    for col, (lid, name, colour) in zip(cols, (
+            (1, "Left cavity", LEFT_COLOR), (2, "Right cavity", RIGHT_COLOR),
+            (3, "Nasopharynx", NASOPHARYNX_COLOR), (4, "Sinus air", SINUS_COLOR))):
+        with col:
+            st.markdown(
+                f"<span style='color:{colour};font-size:1.6em'>&#9632;</span> "
+                f"**{name}**<br>{int((label == lid).sum()) * vml:.1f} mL",
+                unsafe_allow_html=True)
+    nL = int((label == 1).sum()); nR = int((label == 2).sum())
+    if nL and nR:
+        bal = min(nL, nR) / max(nL, nR)
+        st.caption(
+            f"L/R balance {bal:.2f} — a healthy airway is near-symmetric; a very low "
+            "value usually means the naris seeds are wrong, not that the patient is.")
+
+    tab_ct, tab_3d = st.tabs(["Slices", "3D"])
+    with tab_ct:
+        dz, dy, dx = _airway_center(label)
+        c3 = st.columns(3)
+        for col, (axis, default, title) in zip(
+                c3, ((0, dz, "Axial"), (1, dy, "Coronal"), (2, dx, "Sagittal"))):
+            with col:
+                st.markdown(f"**{title}**")
+                st.plotly_chart(_scrubber_fig(case_id, axis, default, sp),
+                                use_container_width=True,
+                                key=f"segscrub_{case_id}_{axis}")
+        st.caption("Drag each slider — the slice updates live as you scrub.")
+    with tab_3d:
+        traces = _airway_3d_traces(case_id, sp)
+        if not traces:
+            st.info("Could not build 3D surfaces for this case.")
+        else:
+            fig = go.Figure(data=traces)
+            fig.update_layout(height=680, margin=dict(l=0, r=0, t=0, b=0),
+                              scene=dict(aspectmode="data"))
+            st.plotly_chart(fig, use_container_width=True,
+                            key=f"seg3d_{case_id}")
 
 
 def render_geometry_report() -> None:
@@ -2017,14 +2154,18 @@ def main() -> None:
 
     mode = st.sidebar.radio(
         "View",
-        ("Geometry (MVP)", "Whole airway (zones)", "Nasal airflow",
+        ("Segmentation", "Geometry (MVP)", "Whole airway (zones)", "Nasal airflow",
          "Virtual surgery", "Airflow demo"),
-        help="Geometry: per-side airway metrics + 3D/CT + wall-flux (Stages 2-3). "
+        help="Segmentation: automatic whole-head CT segmentation, slice + 3D. "
+             "Geometry: per-side airway metrics + 3D/CT + wall-flux (Stages 2-3). "
              "Whole airway: full nares→trachea airway coloured by anatomical zone. "
              "Nasal airflow: animated CFD streamlines through the nose. "
              "Virtual surgery: pre/post edit comparison (Stage 4). "
              "Airflow demo: legacy full-head Visible Human view.",
     )
+    if mode == "Segmentation":
+        render_segmentation()
+        return
     if mode == "Geometry (MVP)":
         render_geometry_report()
         return

@@ -1,0 +1,13 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "viewer",
+      "runtimeExecutable": "py",
+      "runtimeArgs": ["-3.12", "-m", "streamlit", "run", "app/viewer.py",
+                      "--server.address", "127.0.0.1", "--server.port", "8501",
+                      "--server.headless", "true"],
+      "port": 8501
+    }
+  ]
+}
