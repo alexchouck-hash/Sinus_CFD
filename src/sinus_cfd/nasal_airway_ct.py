@@ -44,6 +44,11 @@ MIN_NARIS_PEAK_SEPARATION_MM = 15.0
 # THCA +32.2 mm. (The *mean* would put VH Female at +4.4 mm, i.e. 0.6 mm from a
 # 5 mm bar — which is why this is a median against a 10 mm bar, not a mean.)
 NARIS_HU_FILTER_SHIFT_WARN_MM = 10.0
+# Separation alone does not make a pair bilateral: on CQ500CT390 the two-peak
+# search failed, the percentile fallback drew BOTH seeds from one blob 16.5 mm
+# apart and both on the patient-left side of the midline, and the competing flood
+# came out 12:1. A valid pair must straddle the midline, not merely be apart.
+NARIS_MIDLINE_TOL_MM = 5.0
 
 
 @dataclass
@@ -110,6 +115,7 @@ def validate_naris_pair(
     left_zyx: tuple[int, int, int] | None,
     right_zyx: tuple[int, int, int] | None,
     spacing_xyz: tuple[float, float, float],
+    x_midline: float | None = None,
 ) -> tuple[bool, str]:
     """Is this a plausible pair of two *distinct* nostril seeds?
 
@@ -142,6 +148,16 @@ def validate_naris_pair(
     # Repo convention (AGENTS.md): high x is patient left.
     if int(left_zyx[2]) <= int(right_zyx[2]):
         return False, "left seed is not lateral of right (high x is patient left)"
+    # Straddle: each seed must be on its OWN side of the midline. Without this a
+    # pair can sit 16 mm apart with both seeds in the same cavity and pass.
+    if x_midline is not None:
+        tol = NARIS_MIDLINE_TOL_MM / max(sx, 1e-6)
+        if not (int(left_zyx[2]) > x_midline - tol and int(right_zyx[2]) < x_midline + tol):
+            return False, (
+                f"pair does not straddle the midline x={x_midline:.0f} "
+                f"(L x={int(left_zyx[2])}, R x={int(right_zyx[2])}); both seeds are "
+                f"on the same side"
+            )
     return True, f"sep {sep:.2f} mm (dx {dx:.2f}, dy {dy:.2f}, dz {dz:.2f})"
 
 
@@ -725,13 +741,26 @@ def extract_ct_nasal_airway(
     # it returned the *same voxel twice* — so validate the pair rather than
     # trusting non-None. Never invent a seed: the old repair nudged x by two
     # voxels, which left both seeds on the same side of the septum.
-    ct_ok, ct_why = validate_naris_pair(left_zyx, right_zyx, spacing_xyz)
+    # Midline reference for the straddle test. The prior naris midpoint is the
+    # right anchor; the body centroid is skewed on an off-centre head (CQ500CT390:
+    # centroid x=221 against a true midline of ~189) so it is only a fallback.
+    if prior_l_zyx is not None and prior_r_zyx is not None:
+        x_midline = 0.5 * (float(prior_l_zyx[2]) + float(prior_r_zyx[2]))
+    elif body.any():
+        x_midline = float(np.where(body)[2].mean())
+    else:
+        x_midline = None
+    ct_ok, ct_why = validate_naris_pair(
+        left_zyx, right_zyx, spacing_xyz, x_midline=x_midline
+    )
     if ct_ok:
         naris_source = src_l if src_l == src_r else f"mixed(L={src_l},R={src_r})"
         notes.append(f"Naris pair accepted [{naris_source}]: {ct_why}.")
     else:
         notes.append(f"WARN: naris pair rejected [{src_l}/{src_r}]: {ct_why}.")
-        prior_ok, prior_why = validate_naris_pair(prior_l_zyx, prior_r_zyx, spacing_xyz)
+        prior_ok, prior_why = validate_naris_pair(
+            prior_l_zyx, prior_r_zyx, spacing_xyz, x_midline=x_midline
+        )
         if prior_ok:
             left_zyx, right_zyx = prior_l_zyx, prior_r_zyx
             naris_source = "prior"

@@ -309,11 +309,28 @@ def detect_nares_at_nose_tip(
     sx = float(spacing_xyz[0])
     if left is not None and right is not None:
         asym = abs(0.5 * (left[2] + right[2]) - xt) * sx
+        l_off = abs(left[2] - xt) * sx
+        r_off = abs(right[2] - xt) * sx
+        imbalance = max(l_off, r_off) / max(min(l_off, r_off), 1e-6)
         info["tip_asymmetry_mm"] = round(asym, 2)
-        if asym > NARIS_TIP_ASYMMETRY_MAX_MM:
+        info["side_offsets_mm"] = [round(l_off, 2), round(r_off, 2)]
+        info["side_imbalance"] = round(imbalance, 2)
+        bad_mid = asym > NARIS_TIP_ASYMMETRY_MAX_MM
+        bad_side = imbalance > NARIS_SIDE_IMBALANCE_MAX
+        if bad_mid or bad_side:
+            why = []
+            if bad_mid:
+                why.append(
+                    f"pair midpoint {asym:.1f} mm off the nose tip "
+                    f"(> {NARIS_TIP_ASYMMETRY_MAX_MM:.1f} mm)"
+                )
+            if bad_side:
+                why.append(
+                    f"per-side offsets {l_off:.1f} / {r_off:.1f} mm are imbalanced "
+                    f"{imbalance:.1f}x (> {NARIS_SIDE_IMBALANCE_MAX:.1f}x)"
+                )
             info["naris_repaired"] = (
-                f"pair midpoint {asym:.1f} mm off the nose tip "
-                f"(> {NARIS_TIP_ASYMMETRY_MAX_MM:.1f} mm); rebuilt symmetric about the tip"
+                "; ".join(why) + "; rebuilt symmetric about the tip"
             )
             left = _naris_from_tip(nose_tip, +1, air, body, spacing_xyz, y_anterior_is_low)
             right = _naris_from_tip(nose_tip, -1, air, body, spacing_xyz, y_anterior_is_low)
@@ -332,6 +349,12 @@ def detect_nares_at_nose_tip(
 # 17.7 mm, where the left naris landed at x=304 with the airway spanning
 # x[124,298], i.e. outside the airway entirely.
 NARIS_TIP_ASYMMETRY_MAX_MM = 12.0
+# Midpoint symmetry alone is not enough: a pair can straddle the tip on average
+# while ONE seed sits far more lateral than the other. Measured per-side offset
+# imbalance max(L,R)/min(L,R) -- VH Female 1.1, VH Male 1.3, THCA 1.0,
+# CQ500CT105 (repaired) 1.2, but CQ500CT390 5.7 with a 19.4 mm / 3.4 mm split
+# that starved the left cavity to a 12:1 L/R flood.
+NARIS_SIDE_IMBALANCE_MAX = 2.5
 # Repair: half-separation each side of the tip when the pick is rejected.
 NARIS_FALLBACK_HALF_SEP_MM = 7.0
 # How far posteriorly to march from the tip to land on real air.

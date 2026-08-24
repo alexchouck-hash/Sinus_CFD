@@ -230,3 +230,43 @@ def test_prior_spliced_in_for_a_none_seed_is_not_reported_as_ct_detected():
     assert res.right_naris_center_zyx == (15, 11, 11)
     assert res.naris_source == "prior"
     assert not any("from CT air shell accepted" in n for n in res.notes)
+
+
+def test_rejects_pair_that_does_not_straddle_the_midline():
+    """CQ500CT390: two seeds 16.5 mm apart but BOTH patient-left of the midline.
+
+    Separation alone passed every other predicate; the competing flood then came
+    out 12:1 because neither seed was in the right cavity.
+    """
+    left, right = (73, 32, 257), (67, 29, 215)
+    sp = (0.38, 0.38, 0.625)
+    ok_no_mid, _ = validate_naris_pair(left, right, sp)
+    assert ok_no_mid, "without a midline this pair looks fine -- that was the bug"
+    ok, why = validate_naris_pair(left, right, sp, x_midline=189.0)
+    assert not ok
+    assert "straddle" in why
+
+
+def test_accepts_a_straddling_pair():
+    """CQ500CT105: seeds on opposite sides of the midline."""
+    ok, why = validate_naris_pair((61, 48, 260), (66, 32, 161), (0.393, 0.393, 0.625),
+                                  x_midline=206.0)
+    assert ok, why
+
+
+def test_midline_tolerance_is_applied_in_mm():
+    """The straddle test tolerates a seed slightly past the midline, in mm.
+
+    A right seed 3 mm past the midline is inside NARIS_MIDLINE_TOL_MM and passes;
+    7 mm past is outside and fails. Both pairs are otherwise identical and valid,
+    so only the straddle predicate can be deciding.
+    """
+    ok_near, _ = validate_naris_pair(
+        (40, 20, 80), (40, 20, 53), VH_SPACING, x_midline=50.0
+    )
+    ok_far, why_far = validate_naris_pair(
+        (40, 20, 80), (40, 20, 57), VH_SPACING, x_midline=50.0
+    )
+    assert ok_near
+    assert not ok_far
+    assert "straddle" in why_far
