@@ -98,9 +98,11 @@ def audit(case: str, outputs: Path) -> dict:
     sinus_p = cd / f"{case}_sinus_detour.nrrd"
     if sinus_p.is_file():
         y_ant, sup_hi = _orientation(stats)
+        air_p = cd / f"{case}_all_interior_air.nrrd"
         rec["drainage"] = drainage(
             airway, _read(sinus_p), passage, spacing,
             y_anterior_is_low=y_ant, superior_is_high_z=sup_hi,
+            interior_air=_read(air_p) if air_p.is_file() else None,
         )
     else:
         rec["drainage"] = {"sinuses": [], "notes": ["no <case>_sinus_detour.nrrd"]}
@@ -140,10 +142,11 @@ def render(rec: dict) -> bool:
     sins = dr.get("sinuses") or []
     print(f"\n  [2] DRAINAGE PATHWAYS                  {len(sins)} sinus body(ies)")
     if sins:
-        print(f"      {'sinus':<12}{'side':<8}{'vol mL':>8}{'ostium mm':>11}{'drains':>8}{'patent':>8}")
+        print(f"      {'sinus':<12}{'side':<8}{'vol mL':>8}{'ostium mm':>11}{'drains':>8}  connection")
         for s in sins:
+            ost = f"{s['ostium_diameter_mm']:.2f}" if s["drains"] else "-"
             print(f"      {s['name']:<12}{s['side']:<8}{s['volume_ml']:>8.2f}"
-                  f"{s['ostium_diameter_mm']:>11.2f}{str(s['drains']):>8}{str(s['patent']):>8}")
+                  f"{ost:>11}{str(s['drains']):>8}  {s.get('connection','')}")
     for n in dr.get("notes") or []:
         print(f"      note: {n}")
     return ok

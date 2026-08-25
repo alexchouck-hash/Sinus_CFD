@@ -657,10 +657,17 @@ def _scrubber_fig(case_id: str, axis: int, default_idx: int, spacing_xyz: tuple)
     fig = go.Figure(data=base, frames=frames)
     # Extra bottom margin reserves room for the slider so it isn't clipped on
     # first render (the "disappears until you double-click" glitch).
+    # Pin the axis ranges to the image extent. go.Image with dy=vratio spans
+    # y in [0, rows*vratio]; without an explicit range the scaleanchor +
+    # constrain='domain' pair lets Plotly settle on a window SHORTER than the
+    # stretched image, which clipped the coronal and sagittal panels (vratio 1.64
+    # on 0.625 mm slices) while leaving the near-square axial view intact.
+    rows, cols = np.take(ct, 0, axis=axis).shape
     fig.update_layout(
         height=400, margin=dict(l=6, r=6, t=6, b=70), sliders=[slider],
-        xaxis=dict(visible=False, constrain="domain"),
-        yaxis=dict(visible=False, scaleanchor="x", scaleratio=1, constrain="domain"),
+        xaxis=dict(visible=False, constrain="domain", range=[0, cols]),
+        yaxis=dict(visible=False, scaleanchor="x", scaleratio=1,
+                   constrain="domain", range=[rows * vratio, 0]),
     )
     return fig
 

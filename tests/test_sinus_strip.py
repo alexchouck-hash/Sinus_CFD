@@ -123,3 +123,44 @@ def test_strip_is_spacing_aware():
     passage, sinus, _ = dead_end_sinus_strip(air, (0.5, 0.5, 1.5))
     assert np.array_equal(passage | sinus, air)
     assert not (passage & sinus).any()
+
+
+def test_drainage_finds_sinuses_disconnected_from_the_airway():
+    """A sinus whose ostium is not resolved is a SEPARATE air component.
+
+    The dead-end strip only searches inside the airway, so it cannot see those.
+    On CQ500CT390 both maxillary antra and a sphenoid sit entirely outside
+    airway_mask; drainage() must pick them up from the leftover interior air and
+    report them as found-but-not-drained.
+    """
+    from sinus_cfd.patency import drainage
+
+    shape = (30, 60, 60)
+    airway = np.zeros(shape, dtype=bool)
+    airway[10:20, 6:54, 26:34] = True          # the nasal passage
+    detached = np.zeros(shape, dtype=bool)
+    detached[10:20, 10:24, 6:20] = True        # a roomy chamber, NOT touching it
+    interior = airway | detached
+    passage = airway.copy()
+    sinus_from_strip = np.zeros(shape, dtype=bool)
+
+    res = drainage(airway, sinus_from_strip, passage, ISO, interior_air=interior)
+    names = [r["name"] for r in res["sinuses"]]
+    assert names, f"leftover sinus not detected: {res}"
+    rec = res["sinuses"][0]
+    assert rec["drains"] is False
+    assert rec["ostium_diameter_mm"] == 0.0
+    assert "no ostium resolved" in rec["connection"]
+    assert rec["volume_ml"] > 1.0
+
+
+def test_drainage_without_interior_air_is_unchanged():
+    """Passing no interior air must keep the old behaviour exactly."""
+    from sinus_cfd.patency import drainage
+
+    shape = (24, 50, 40)
+    airway = np.zeros(shape, dtype=bool)
+    airway[8:16, 4:46, 16:24] = True
+    res = drainage(airway, np.zeros(shape, dtype=bool), airway, ISO)
+    assert res["sinuses"] == []
+    assert any("no sinus bodies" in n for n in res["notes"])

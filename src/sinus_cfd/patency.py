@@ -27,6 +27,14 @@ PORT_SNAP_MM = 10.0
 # An ostium narrower than this reads as obstructed. Balloon dilation targets
 # 3-4 mm (CLAUDE.md goal 5), so this is the clinically interesting bar.
 OSTIUM_PATENT_MM = 2.0
+# Anatomically there is ONE of these per side, so two bodies sharing a name and a
+# side are one sinus split by a partly-resolved ostium (CQ500CT390 reported
+# maxillary L twice: 3.01 mL disconnected + 1.36 mL draining). Ethmoid is
+# deliberately absent -- it is a cluster of separate cells and must not be fused.
+MERGE_SINGLETON_SINUSES = ("maxillary", "frontal", "sphenoid")
+# Only fuse bodies whose centroids are this close; guards against welding two
+# genuinely different structures that happened to get the same label.
+MERGE_MAX_CENTROID_MM = 40.0
 STRUCT26 = np.ones((3, 3, 3), dtype=bool)
 
 
@@ -192,6 +200,65 @@ def name_sinus_bodies(
     return out
 
 
+def _merge_split_sinuses(recs, spacing_xyz, notes):
+    """Fuse bodies that are one sinus split by a partly-resolved ostium.
+
+    A maxillary antrum whose ostium is only half-resolved appears twice: the part
+    the strip carved out of the airway (draining, with a calibre) and the part
+    that stayed a separate air component (not draining). They are one sinus. The
+    merged record keeps the BEST evidence -- if any part drains, the sinus drains,
+    at the widest calibre measured.
+    """
+    if not recs:
+        return recs
+    out, used = [], set()
+    for i, r in enumerate(recs):
+        if i in used:
+            continue
+        if r["name"] not in MERGE_SINGLETON_SINUSES:
+            out.append(r)
+            continue
+        group = [r]
+        for j in range(i + 1, len(recs)):
+            if j in used:
+                continue
+            o = recs[j]
+            if o["name"] != r["name"] or o["side"] != r["side"]:
+                continue
+            if abs(o["off_midline_mm"] - r["off_midline_mm"]) > MERGE_MAX_CENTROID_MM:
+                continue
+            group.append(o)
+            used.add(j)
+        if len(group) == 1:
+            out.append(r)
+            continue
+        vol = sum(g["volume_ml"] for g in group)
+        drains = any(g["drains"] for g in group)
+        best = max(group, key=lambda g: g["ostium_diameter_mm"])
+        merged = dict(r)
+        merged["volume_ml"] = round(vol, 2)
+        merged["off_midline_mm"] = round(
+            sum(g["off_midline_mm"] * g["volume_ml"] for g in group) / max(vol, 1e-9), 1
+        )
+        merged["drains"] = drains
+        merged["ostium_radius_mm"] = best["ostium_radius_mm"]
+        merged["ostium_diameter_mm"] = best["ostium_diameter_mm"]
+        merged["patent"] = bool(best["ostium_diameter_mm"] >= OSTIUM_PATENT_MM) and drains
+        merged["ostium_zyx"] = best.get("ostium_zyx")
+        merged["merged_from"] = len(group)
+        merged["connection"] = (
+            best.get("connection", "") if drains
+            else "no ostium resolved at this resolution"
+        )
+        parts = " + ".join(f"{g['volume_ml']:.2f}" for g in group)
+        notes.append(
+            f"merged {len(group)} {r['name']} {r['side']} bodies "
+            f"({parts} mL) -- one sinus split by a partly-resolved ostium"
+        )
+        out.append(merged)
+    return out
+
+
 def drainage(
     airway,
     sinus,
@@ -199,6 +266,8 @@ def drainage(
     spacing_xyz,
     y_anterior_is_low=True,
     superior_is_high_z=True,
+    interior_air=None,
+    min_leftover_ml=0.25,
 ):
     """Per-sinus ostium location and calibre, and whether it reaches the passage.
 
@@ -211,8 +280,9 @@ def drainage(
     sinus = sinus.astype(bool) & airway
     passage = passage.astype(bool) & airway
     sz, sy, sx = _spacing_zyx(spacing_xyz)
+    vox_ml = (sz * sy * sx) / 1000.0
     res: dict[str, Any] = {"sinuses": [], "notes": []}
-    if not sinus.any():
+    if not sinus.any() and interior_air is None:
         res["notes"].append("no sinus bodies segmented")
         return res
     if not passage.any():
@@ -223,6 +293,35 @@ def drainage(
         sinus, airway, spacing_xyz, y_anterior_is_low, superior_is_high_z
     )
     lab, _ = ndi.label(sinus, STRUCT26)
+    # Sinuses whose ostium is not resolved at this HU/resolution are SEPARATE air
+    # components, never part of the nares->trachea path, so the dead-end strip
+    # cannot see them. On CQ500CT390 both maxillary antra (3.0 / 2.8 mL) and a
+    # sphenoid (0.4 mL) sit entirely outside airway_mask. Pick them up from the
+    # leftover interior air and report them as found-but-not-drained -- NOT as
+    # "obstructed", because an ostium below the threshold looks the same here.
+    leftover_recs = []
+    if interior_air is not None:
+        left = interior_air.astype(bool) & ~airway
+        if left.any():
+            llab, ln = ndi.label(left, STRUCT26)
+            lsz = ndi.sum(left, llab, range(1, ln + 1))
+            big = np.zeros_like(left)
+            for i in range(ln):
+                if lsz[i] * vox_ml >= min_leftover_ml:
+                    big |= llab == i + 1
+            if big.any():
+                for rec in name_sinus_bodies(
+                    big, airway, spacing_xyz, y_anterior_is_low, superior_is_high_z
+                ):
+                    rec.pop("_label", None)
+                    rec["ostium_radius_mm"] = 0.0
+                    rec["ostium_diameter_mm"] = 0.0
+                    rec["touches_passage"] = False
+                    rec["drains"] = False
+                    rec["patent"] = False
+                    rec["ostium_zyx"] = None
+                    rec["connection"] = "no ostium resolved at this resolution"
+                    leftover_recs.append(rec)
     bott = widest_path_bottleneck_mm(airway, passage, edt, spacing_xyz)
     for rec in bodies:
         b = lab == rec.pop("_label")
@@ -248,7 +347,13 @@ def drainage(
             rec["ostium_zyx"] = [int(zz.mean()), int(yy.mean()), int(xx.mean())]
         else:
             rec["ostium_zyx"] = None
+        rec["connection"] = "drains through a resolved ostium"
         res["sinuses"].append(rec)
+    # Keep only anatomically named leftovers; unnamed blobs at this stage are
+    # mastoid / orbital air, not sinuses.
+    res["sinuses"].extend(r for r in leftover_recs if r["name"] != "unknown")
+    res["sinuses"] = _merge_split_sinuses(res["sinuses"], spacing_xyz, res["notes"])
+    res["sinuses"].sort(key=lambda r: -r["volume_ml"])
     have = {r["name"] for r in res["sinuses"] if r["name"] != "unknown"}
     for want in ("maxillary", "frontal", "sphenoid"):
         if want not in have:
