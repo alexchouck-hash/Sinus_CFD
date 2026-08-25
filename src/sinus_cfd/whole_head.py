@@ -710,7 +710,16 @@ def _ports_from_edge_nares(
     else:
         tip_idx = zz >= np.percentile(zz, 92)
         trach_normal = [0.0, 0.0, 1.0]
-    trach_center = pts[tip_idx].mean(axis=0)
+    # The MEAN of the caudal slab need not lie on the airway: where that slab
+    # is curved or branched the centroid falls in the lumen's hollow. On
+    # Visible Human Female it landed 15.0 mm off the mask, so the outlet BC
+    # never resolved onto the fluid domain and there was no flow path to
+    # solve. Use the medoid -- the real airway voxel nearest that centroid --
+    # which is on the mask by construction. Cases whose centroid already sat
+    # on the airway (THCA, CQ500) are unaffected.
+    _caudal = pts[tip_idx]
+    _mean = _caudal.mean(axis=0)
+    trach_center = _caudal[int(np.argmin(np.linalg.norm(_caudal - _mean, axis=1)))]
     trach_area = float(max(int(tip_idx.sum()), 1) ** (2 / 3) * face)
 
     ports: list[Port] = []
@@ -833,7 +842,16 @@ def detect_ports_whole_head(
         z_thr = np.percentile(zz, 92)
         tip_idx = zz >= z_thr
         trach_normal = np.array([0.0, 0.0, 1.0])
-    trach_center = pts[tip_idx].mean(axis=0)
+    # The MEAN of the caudal slab need not lie on the airway: where that slab
+    # is curved or branched the centroid falls in the lumen's hollow. On
+    # Visible Human Female it landed 15.0 mm off the mask, so the outlet BC
+    # never resolved onto the fluid domain and there was no flow path to
+    # solve. Use the medoid -- the real airway voxel nearest that centroid --
+    # which is on the mask by construction. Cases whose centroid already sat
+    # on the airway (THCA, CQ500) are unaffected.
+    _caudal = pts[tip_idx]
+    _mean = _caudal.mean(axis=0)
+    trach_center = _caudal[int(np.argmin(np.linalg.norm(_caudal - _mean, axis=1)))]
     trach_area = float(max(int(tip_idx.sum()), 1) ** (2 / 3) * face)
 
     # External nares on skin
