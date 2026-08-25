@@ -164,3 +164,50 @@ def test_drainage_without_interior_air_is_unchanged():
     res = drainage(airway, np.zeros(shape, dtype=bool), airway, ISO)
     assert res["sinuses"] == []
     assert any("no sinus bodies" in n for n in res["notes"])
+
+
+def test_ostium_calibre_uses_the_median_not_the_widest_point():
+    """The interface is the whole sinus-passage contact surface, so its widest
+    single voxel sits wherever the lumen is roomiest and is not the ostium.
+
+    A chamber joined to a tube by a narrow neck, where the tube is much wider
+    than the neck: the max would report the tube's half-width, the median must
+    report something near the neck.
+    """
+    from sinus_cfd.patency import OSTIUM_MAX_DIAMETER_MM, drainage
+
+    shape = (30, 60, 60)
+    air = np.zeros(shape, dtype=bool)
+    air[8:22, 4:56, 22:38] = True            # wide tube (16 voxels across)
+    air[12:18, 30:46, 8:22] = True           # chamber off to -x
+    air[8:22, 30:46, 20:22] = False          # wall between them
+    air[14:16, 38, 20:22] = True             # 2-voxel neck
+    passage = np.zeros(shape, dtype=bool)
+    passage[8:22, 4:56, 22:38] = True
+    sinus = air & ~passage
+    res = drainage(air, sinus, passage, ISO)
+    assert res["sinuses"], res
+    rec = res["sinuses"][0]
+    assert rec["ostium_diameter_mm"] < rec["interface_max_mm"], rec
+    assert rec["ostium_diameter_mm"] <= OSTIUM_MAX_DIAMETER_MM, rec
+
+
+def test_out_of_range_connection_is_not_called_an_ostium():
+    """A body joined to the passage across a broad front is not bounded at an
+    ostium; report that rather than quoting an impossible diameter."""
+    from sinus_cfd.patency import OSTIUM_MAX_DIAMETER_MM, drainage
+
+    shape = (40, 40, 40)
+    air = np.zeros(shape, dtype=bool)
+    air[6:34, 6:20, 6:34] = True             # big block A
+    air[6:34, 20:34, 6:34] = True            # big block B, fused across a whole face
+    passage = np.zeros(shape, dtype=bool)
+    passage[6:34, 6:20, 6:34] = True
+    sinus = air & ~passage
+    res = drainage(air, sinus, passage, ISO)
+    assert res["sinuses"], res
+    rec = res["sinuses"][0]
+    if rec["ostium_diameter_mm"] > OSTIUM_MAX_DIAMETER_MM:
+        assert rec["ostium_valid"] is False
+        assert rec["patent"] is False
+        assert "not bounded at an ostium" in rec["ostium_note"]

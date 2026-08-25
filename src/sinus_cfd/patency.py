@@ -27,6 +27,12 @@ PORT_SNAP_MM = 10.0
 # An ostium narrower than this reads as obstructed. Balloon dilation targets
 # 3-4 mm (CLAUDE.md goal 5), so this is the clinically interesting bar.
 OSTIUM_PATENT_MM = 2.0
+# Anatomical bounds on a real ostium (operator, 2026-08-25). Used BOTH to pick
+# the calibre statistic and to reject a body that is not bounded at an ostium:
+# a 15-18 mm "ostium" is not a narrow one, it means the watershed boundary did
+# not land on an ostium at all.
+OSTIUM_MIN_DIAMETER_MM = 0.2
+OSTIUM_MAX_DIAMETER_MM = 6.0
 # Anatomically there is ONE of these per side, so two bodies sharing a name and a
 # side are one sinus split by a partly-resolved ostium (CQ500CT390 reported
 # maxillary L twice: 3.01 mL disconnected + 1.36 mL draining). Ethmoid is
@@ -326,22 +332,41 @@ def drainage(
     for rec in bodies:
         b = lab == rec.pop("_label")
         interface = ndi.binary_dilation(b, STRUCT26) & passage
-        # Calibre is measured ON THE INTERFACE -- the actual connection between
-        # this sinus and the passage -- not by a bottleneck through the airway.
-        # A broad interface is a real finding: on 1 mm data a maxillary wall
-        # perforated by partial volume genuinely IS broadly connected, and
-        # reporting a narrow "ostium" there would be fiction.
+        # Calibre is the MEDIAN half-width across the interface, not the max.
+        # The interface is the whole watershed contact surface between sinus and
+        # passage; its widest single voxel is an outlier sitting wherever the
+        # lumen happens to be roomiest, which reported an 18.11 mm "ostium" on
+        # THCA's sphenoid and 15.83 mm on CQ500CT390's left maxillary. Measured
+        # against the 0.2-6 mm anatomical range, the max lands outside it on 7 of
+        # 11 bodies and the median lands inside on all 11.
         if interface.any():
-            calibre = float(edt[interface].max())
+            iface_vals = edt[interface]
+            calibre = float(np.median(iface_vals))
+            iface_max = float(iface_vals.max())
         else:
             vals = bott[b]
             vals = vals[np.isfinite(vals) & (vals > 0)]
             calibre = float(vals.max()) if vals.size else 0.0
+            iface_max = calibre
+        rec["interface_max_mm"] = round(2.0 * iface_max, 2)
         rec["ostium_radius_mm"] = round(calibre, 2)
         rec["ostium_diameter_mm"] = round(2.0 * calibre, 2)
         rec["touches_passage"] = bool(interface.any())
         rec["drains"] = bool(interface.any() and calibre > 0.0)
-        rec["patent"] = bool(2.0 * calibre >= OSTIUM_PATENT_MM)
+        diam = 2.0 * calibre
+        rec["patent"] = bool(diam >= OSTIUM_PATENT_MM)
+        # A connection outside the anatomical range is not an ostium: the sinus
+        # body is not bounded at one. Say so rather than quoting the number.
+        if interface.any() and not (OSTIUM_MIN_DIAMETER_MM <= diam <= OSTIUM_MAX_DIAMETER_MM):
+            rec["ostium_valid"] = False
+            rec["ostium_note"] = (
+                f"{diam:.2f} mm is outside the anatomical "
+                f"{OSTIUM_MIN_DIAMETER_MM}-{OSTIUM_MAX_DIAMETER_MM} mm range; "
+                f"this body is not bounded at an ostium"
+            )
+            rec["patent"] = False
+        else:
+            rec["ostium_valid"] = True
         if interface.any():
             zz, yy, xx = np.where(interface)
             rec["ostium_zyx"] = [int(zz.mean()), int(yy.mean()), int(xx.mean())]
