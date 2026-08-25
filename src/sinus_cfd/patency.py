@@ -33,6 +33,13 @@ OSTIUM_PATENT_MM = 2.0
 # not land on an ostium at all.
 OSTIUM_MIN_DIAMETER_MM = 0.2
 OSTIUM_MAX_DIAMETER_MM = 6.0
+# No single sinus straddles the midline: maxillary, frontal and ethmoid are
+# paired, and the sphenoid is midline but small. A large body with substantial
+# volume on BOTH sides is therefore several sinuses fused by 26-connectivity --
+# on THCA both antra came out as one 43.2 mL "unknown" mass 74 mm wide.
+SPLIT_MIN_VOLUME_ML = 5.0
+SPLIT_MIN_SIDE_FRACTION = 0.25
+SPLIT_ERODE_MAX_MM = 4.0
 # Anatomically there is ONE of these per side, so two bodies sharing a name and a
 # side are one sinus split by a partly-resolved ostium (CQ500CT390 reported
 # maxillary L twice: 3.01 mL disconnected + 1.36 mL draining). Ethmoid is
@@ -138,6 +145,71 @@ def _frame(mask):
     }
 
 
+def _split_midline_straddlers(mask, spacing_xyz, x_midline):
+    """Separate sinuses that 26-connectivity fused into one component.
+
+    The strip's watershed already knew these as distinct basins, but that
+    identity is lost when the basins are OR-ed into a boolean mask and written
+    out. Rather than re-plumb the file format, recover the lobes here: erode
+    until the body falls apart, then hand the pieces back their territory by
+    watershed, which puts the boundary at the narrowest link between them.
+
+    Returns a labelled array. Only bodies that straddle the midline are split,
+    so a genuinely single sinus and a cluster of ethmoid cells are left alone.
+    """
+    lab, n = ndi.label(mask, STRUCT26)
+    if n == 0:
+        return lab, 0
+    sz, sy, sx = _spacing_zyx(spacing_xyz)
+    vox_ml = (sz * sy * sx) / 1000.0
+    out = np.zeros_like(lab)
+    nxt = 0
+    for i in range(1, n + 1):
+        b = lab == i
+        vol = float(b.sum()) * vox_ml
+        xs = np.where(b)[2]
+        left = float((xs > x_midline).mean())
+        straddles = min(left, 1.0 - left) >= SPLIT_MIN_SIDE_FRACTION
+        if vol < SPLIT_MIN_VOLUME_ML or not straddles:
+            nxt += 1
+            out[b] = nxt
+            continue
+        edt_b = ndi.distance_transform_edt(b, sampling=(sz, sy, sx)).astype(np.float32)
+        markers = None
+        step = max(min(sz, sy, sx), 0.25)
+        r = step
+        while r <= SPLIT_ERODE_MAX_MM:
+            core = b & (edt_b >= r)
+            cl, cn = ndi.label(core, STRUCT26)
+            if cn >= 2:
+                csz = ndi.sum(core, cl, range(1, cn + 1))
+                keep = [k + 1 for k in range(cn) if csz[k] * vox_ml >= 0.3]
+                if len(keep) >= 2:
+                    markers = np.zeros_like(cl)
+                    for j, k in enumerate(keep, start=1):
+                        markers[cl == k] = j
+                    break
+            r += step
+        if markers is None:
+            nxt += 1
+            out[b] = nxt
+            continue
+        try:
+            from skimage.segmentation import watershed
+        except Exception:
+            nxt += 1
+            out[b] = nxt
+            continue
+        ws = watershed(-edt_b, markers, mask=b)
+        for j in range(1, int(markers.max()) + 1):
+            piece = b & (ws == j)
+            if not piece.any():
+                continue
+            nxt += 1
+            out[piece] = nxt
+    return out, nxt
+
+
 def name_sinus_bodies(
     sinus,
     airway,
@@ -164,7 +236,7 @@ def name_sinus_bodies(
     xmid = float(x_midline) if x_midline is not None else fr["xmid"]
     dy = max(fr["y1"] - fr["y0"], 1)
     dz = max(fr["z1"] - fr["z0"], 1)
-    lab, n = ndi.label(sinus, STRUCT26)
+    lab, n = _split_midline_straddlers(sinus, spacing_xyz, xmid)
     out = []
     for i in range(1, n + 1):
         b = lab == i
@@ -298,7 +370,10 @@ def drainage(
     bodies = name_sinus_bodies(
         sinus, airway, spacing_xyz, y_anterior_is_low, superior_is_high_z
     )
-    lab, _ = ndi.label(sinus, STRUCT26)
+    # MUST use the same labelling name_sinus_bodies used, or a record's name and
+    # its mask refer to different bodies -- and the mismatch is silent, because
+    # the names still look right while the geometry behind them is wrong.
+    lab, _ = _split_midline_straddlers(sinus, spacing_xyz, _frame(airway)["xmid"])
     # Sinuses whose ostium is not resolved at this HU/resolution are SEPARATE air
     # components, never part of the nares->trachea path, so the dead-end strip
     # cannot see them. On CQ500CT390 both maxillary antra (3.0 / 2.8 mL) and a

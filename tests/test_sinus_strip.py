@@ -211,3 +211,72 @@ def test_out_of_range_connection_is_not_called_an_ostium():
         assert rec["ostium_valid"] is False
         assert rec["patent"] is False
         assert "not bounded at an ostium" in rec["ostium_note"]
+
+
+def test_midline_straddling_body_is_split_into_left_and_right():
+    """Two chambers joined across the midline are two sinuses, not one.
+
+    26-connectivity fused both of THCA's maxillary antra into a single 43.2 mL
+    body 74 mm wide, which the naming heuristic could only call "unknown".
+    """
+    from sinus_cfd.patency import drainage
+
+    shape = (40, 60, 80)
+    airway = np.zeros(shape, dtype=bool)
+    airway[12:28, 6:54, 38:42] = True             # midline passage
+    sinus = np.zeros(shape, dtype=bool)
+    sinus[12:28, 16:44, 8:34] = True              # left chamber
+    sinus[12:28, 16:44, 46:72] = True             # right chamber
+    sinus[18:22, 28:32, 34:46] = True             # thin bridge across the midline
+    air = airway | sinus
+    res = drainage(air, sinus, airway, ISO)
+    sides = {r["side"] for r in res["sinuses"]}
+    assert len(res["sinuses"]) >= 2, res
+    assert "L" in sides and "R" in sides, res
+    for r in res["sinuses"]:
+        assert r["volume_ml"] < 40.0, "still fused"
+
+
+def test_single_sided_body_is_not_split():
+    """A sinus wholly on one side must survive intact."""
+    from sinus_cfd.patency import drainage
+
+    shape = (40, 60, 80)
+    airway = np.zeros(shape, dtype=bool)
+    airway[12:28, 6:54, 38:42] = True
+    sinus = np.zeros(shape, dtype=bool)
+    sinus[12:28, 16:44, 6:34] = True              # one big left chamber only
+    air = airway | sinus
+    res = drainage(air, sinus, airway, ISO)
+    assert len(res["sinuses"]) == 1, res
+
+
+def test_split_bodies_get_their_own_geometry_not_a_stale_mask():
+    """Names and masks must come from the SAME labelling.
+
+    name_sinus_bodies splits midline straddlers; if drainage() re-labels with a
+    plain ndi.label the records keep correct names while their masks point at
+    different bodies (or at nothing). That is silent, so assert on a geometric
+    quantity -- volume -- which can only be right if the mask matched.
+    """
+    from sinus_cfd.patency import drainage
+    from sinus_cfd.auto_airway import _spacing_zyx
+
+    shape = (40, 60, 80)
+    airway = np.zeros(shape, dtype=bool)
+    airway[12:28, 6:54, 38:42] = True
+    sinus = np.zeros(shape, dtype=bool)
+    sinus[12:28, 16:44, 8:34] = True
+    sinus[12:28, 16:44, 46:72] = True
+    sinus[18:22, 28:32, 34:46] = True
+    air = airway | sinus
+    res = drainage(air, sinus, airway, ISO)
+    sz, sy, sx = _spacing_zyx(ISO)
+    vox_ml = sz * sy * sx / 1000.0
+    total_reported = sum(r["volume_ml"] for r in res["sinuses"])
+    total_actual = float(sinus.sum()) * vox_ml
+    # every voxel accounted for once
+    assert abs(total_reported - total_actual) < 0.5 * total_actual, (
+        total_reported, total_actual)
+    for r in res["sinuses"]:
+        assert r["volume_ml"] > 0.0
