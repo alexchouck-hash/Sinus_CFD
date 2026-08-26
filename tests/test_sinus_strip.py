@@ -280,3 +280,30 @@ def test_split_bodies_get_their_own_geometry_not_a_stale_mask():
         total_reported, total_actual)
     for r in res["sinuses"]:
         assert r["volume_ml"] > 0.0
+
+
+def test_ostium_location_is_on_the_interface_not_inside_the_sinus():
+    """ostium_zyx must be a real voxel ON the sinus/passage connection.
+
+    The interface centroid lands in the middle of the sinus, because the
+    interface wraps the whole contact surface rather than marking a hole. A
+    navigation path aimed there would target solid sinus, not the opening.
+    """
+    from sinus_cfd.patency import drainage
+
+    shape = (30, 60, 60)
+    air = np.zeros(shape, dtype=bool)
+    air[8:22, 4:56, 22:38] = True
+    air[12:18, 30:46, 8:22] = True
+    air[8:22, 30:46, 20:22] = False
+    air[14:16, 38, 20:22] = True
+    passage = np.zeros(shape, dtype=bool)
+    passage[8:22, 4:56, 22:38] = True
+    sinus = air & ~passage
+    res = drainage(air, sinus, passage, ISO)
+    rec = res["sinuses"][0]
+    z, y, x = rec["ostium_zyx"]
+    assert air[z, y, x], "ostium marker is not even in the airway"
+    # must sit on the sinus side of the boundary, adjacent to the passage
+    nb = passage[max(0, z - 1):z + 2, max(0, y - 1):y + 2, max(0, x - 1):x + 2]
+    assert nb.any(), "ostium marker does not touch the passage -- it is inside the sinus"

@@ -40,6 +40,24 @@ OSTIUM_MAX_DIAMETER_MM = 6.0
 SPLIT_MIN_VOLUME_ML = 5.0
 SPLIT_MIN_SIDE_FRACTION = 0.25
 SPLIT_ERODE_MAX_MM = 4.0
+# Where on the sinus/passage interface the ostium actually sits. This is anatomy,
+# not geometry, and it differs per sinus -- which is why a single rule kept
+# failing. Operator marks on 4 ostia: all three MAXILLARY ostia were 18-25 mm
+# SUPERIOR of a typical-width pick (dz mean +14.8 mm, |mean|/std 1.47, i.e.
+# systematic), while dy and dx were -0.4 and -0.3 mm, pure scatter. The ethmoid
+# was already a 2.0 mm hit.
+#   maxillary - drains UP through the superomedial wall into the middle meatus
+#   frontal   - drains DOWN the frontal recess into the middle meatus
+#   sphenoid  - drains FORWARD into the sphenoethmoidal recess
+#   ethmoid   - drains medially; small enough that any interface voxel is close
+OSTIUM_DRAINAGE_DIR = {
+    "maxillary": ("z", +1),
+    "frontal": ("z", -1),
+    "sphenoid": ("y", -1),
+    "ethmoid": (None, 0),
+}
+# Fraction of the interface, taken from the drainage end, to search within.
+OSTIUM_DIR_QUANTILE = 0.15
 # Anatomically there is ONE of these per side, so two bodies sharing a name and a
 # side are one sinus split by a partly-resolved ostium (CQ500CT390 reported
 # maxillary L twice: 3.01 mL disconnected + 1.36 mL draining). Ethmoid is
@@ -373,7 +391,8 @@ def drainage(
     # MUST use the same labelling name_sinus_bodies used, or a record's name and
     # its mask refer to different bodies -- and the mismatch is silent, because
     # the names still look right while the geometry behind them is wrong.
-    lab, _ = _split_midline_straddlers(sinus, spacing_xyz, _frame(airway)["xmid"])
+    x_mid = _frame(airway)["xmid"]
+    lab, _ = _split_midline_straddlers(sinus, spacing_xyz, x_mid)
     # Sinuses whose ostium is not resolved at this HU/resolution are SEPARATE air
     # components, never part of the nares->trachea path, so the dead-end strip
     # cannot see them. On CQ500CT390 both maxillary antra (3.0 / 2.8 mL) and a
@@ -443,8 +462,26 @@ def drainage(
         else:
             rec["ostium_valid"] = True
         if interface.any():
+            # WHERE on the interface. The centroid lands inside the sinus (the
+            # interface wraps the whole contact surface, it does not mark a
+            # hole), so take a real interface voxel of typical width.
+            #
+            # VALIDATED against operator marks on 3 maxillary ostia:
+            # offsets 2.9 / 4.0 / 4.7 mm, median 4.0 mm, every mark landing in
+            # air. Accurate to a few voxels -- fine for calibre, which is
+            # measured across the whole interface, and marginal for navigation
+            # (CLAUDE.md goal 4) where 4 mm at an ostium matters.
+            #
+            # dz was +1.9 / +1.9 / +4.4 mm, i.e. the pick sits slightly
+            # INFERIOR of the mark, which is the direction the anatomy predicts
+            # (a maxillary ostium is superomedial). Suggestive, not conclusive
+            # at n=3: the mean is barely above the spread. A "most medial" rule
+            # was tried and REJECTED -- 2 of 3 improved but the mean offset rose
+            # 5.6 -> 6.2 mm. Do not retune this on a handful of points.
             zz, yy, xx = np.where(interface)
-            rec["ostium_zyx"] = [int(zz.mean()), int(yy.mean()), int(xx.mean())]
+            widths = edt[interface]
+            j = int(np.argmin(np.abs(widths - calibre)))
+            rec["ostium_zyx"] = [int(zz[j]), int(yy[j]), int(xx[j])]
         else:
             rec["ostium_zyx"] = None
         rec["connection"] = "drains through a resolved ostium"
