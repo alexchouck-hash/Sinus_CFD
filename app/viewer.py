@@ -43,6 +43,11 @@ LEFT_COLOR = "#2b8cbe"   # blue = left cavity
 RIGHT_COLOR = "#d6604d"  # red = right cavity
 NASOPHARYNX_COLOR = "#8cc9e8"  # pale blue = shared posterior airway
 SINUS_COLOR = "#f28e2b"        # orange = sinus air (outside the CFD domain)
+CONVERGE_COLOR = "#9c6ade"     # violet = fed by both nares
+# Which label map the shared scrubber/3D renderers should draw. Set by
+# render_segmentation before it calls them; Streamlit reruns the module
+# top-to-bottom on every interaction, so this is always set before use.
+_VIEW_MODE: dict = {'territory': False}
 
 DEFAULT_CASE = "P001"
 OUTPUTS = REPO_ROOT / "outputs"
@@ -476,6 +481,28 @@ def list_segmented_cases() -> list[str]:
     ]
 
 
+def _load_territory_label(case_id: str) -> dict | None:
+    """CT + the per-naris territory map, when qa_patency has written one.
+
+    Values match the scrubber's convention so the same renderer serves both
+    views: 1 = left-fed, 2 = right-fed, 3 = fed by both (the convergence zone,
+    reused here for the nasopharynx onward).
+    """
+    import SimpleITK as sitk
+
+    cd = OUTPUTS / case_id
+    terr_p = cd / f"{case_id}_naris_territory.nrrd"
+    if not terr_p.is_file():
+        return None
+    base = _load_wholehead_ct_label(case_id)
+    if base is None:
+        return None
+    lab = sitk.GetArrayFromImage(sitk.ReadImage(str(terr_p))).astype(np.uint8)
+    if lab.shape != base["ct"].shape:
+        return None
+    return {"ct": base["ct"], "label": lab, "spacing_xyz": base["spacing_xyz"]}
+
+
 def _load_wholehead_ct_label(case_id: str) -> dict | None:
     """Compose a viewer label map for a whole-head case.
 
@@ -611,7 +638,8 @@ def _scrubber_fig(case_id: str, axis: int, default_idx: int, spacing_xyz: tuple)
 
     from PIL import Image
 
-    data = _load_ct_label(case_id)
+    data = (_load_territory_label(case_id) if _VIEW_MODE.get('territory')
+            else None) or _load_ct_label(case_id)
     ct, label = data["ct"], data["label"]
     sx, sy, sz = spacing_xyz
     # vertical/horizontal physical spacing per plane → aspect ratio
@@ -629,7 +657,8 @@ def _scrubber_fig(case_id: str, axis: int, default_idx: int, spacing_xyz: tuple)
         l = np.take(label, i, axis=axis)
         g = ((np.clip(c, -1000, 400) + 1000) / 1400 * 255).astype(np.float32)
         rgb = np.stack([g, g, g], axis=-1)
-        for lid, col in ((3, np_rgb), (4, sinus_rgb), (1, left_rgb), (2, right_rgb)):
+        third = _rgb(CONVERGE_COLOR) if _VIEW_MODE.get('territory') else np_rgb
+        for lid, col in ((3, third), (4, sinus_rgb), (1, left_rgb), (2, right_rgb)):
             m = l == lid
             rgb[m] = 0.55 * rgb[m] + 0.45 * np.array(col, dtype=np.float32)
         buf = io.BytesIO()
@@ -1116,17 +1145,34 @@ def render_segmentation() -> None:
     pref = [c for c in ("CQ500CT390", "CQ500CT105") if c in cases]
     case_id = st.selectbox("Case", cases, index=cases.index(pref[0]) if pref else 0)
 
-    data = _load_ct_label(case_id)
+    has_terr = (OUTPUTS / case_id / f"{case_id}_naris_territory.nrrd").is_file()
+    mode = "Anatomy"
+    if has_terr:
+        mode = st.radio(
+            "Colour by", ("Anatomy", "Feeding naris"), horizontal=True,
+            help="Anatomy: L/R cavity, nasopharynx, sinus. Feeding naris: which "
+                 "nostril supplies each part of the CFD domain, by shortest "
+                 "route through the lumen.")
+    else:
+        st.caption("Run `qa_patency.py --write-territory` to add the per-naris view.")
+    _VIEW_MODE['territory'] = (mode == "Feeding naris")
+
+    data = (_load_territory_label(case_id) if _VIEW_MODE['territory']
+            else None) or _load_ct_label(case_id)
     if data is None or data.get("label") is None:
         st.error(f"Could not load CT + segmentation for {case_id}.")
         return
     label, sp = data["label"], data["spacing_xyz"]
     vml = float(np.prod(sp)) / 1000.0
 
+    if _VIEW_MODE['territory']:
+        classes = ((1, "Left-fed", LEFT_COLOR), (2, "Right-fed", RIGHT_COLOR),
+                   (3, "Fed by both", CONVERGE_COLOR), (4, "Sinus air", SINUS_COLOR))
+    else:
+        classes = ((1, "Left cavity", LEFT_COLOR), (2, "Right cavity", RIGHT_COLOR),
+                   (3, "Nasopharynx", NASOPHARYNX_COLOR), (4, "Sinus air", SINUS_COLOR))
     cols = st.columns(4)
-    for col, (lid, name, colour) in zip(cols, (
-            (1, "Left cavity", LEFT_COLOR), (2, "Right cavity", RIGHT_COLOR),
-            (3, "Nasopharynx", NASOPHARYNX_COLOR), (4, "Sinus air", SINUS_COLOR))):
+    for col, (lid, name, colour) in zip(cols, classes):
         with col:
             st.markdown(
                 f"<span style='color:{colour};font-size:1.6em'>&#9632;</span> "
@@ -1135,9 +1181,12 @@ def render_segmentation() -> None:
     nL = int((label == 1).sum()); nR = int((label == 2).sum())
     if nL and nR:
         bal = min(nL, nR) / max(nL, nR)
-        st.caption(
-            f"L/R balance {bal:.2f} — a healthy airway is near-symmetric; a very low "
-            "value usually means the naris seeds are wrong, not that the patient is.")
+        note = ("Share of the domain each nostril supplies. Asymmetry here is the "
+                "nasal cycle plus any obstruction."
+                if _VIEW_MODE['territory'] else
+                "A healthy airway is near-symmetric; a very low value usually means "
+                "the naris seeds are wrong, not that the patient is.")
+        st.caption(f"L/R balance {bal:.2f} — {note}")
 
     tab_ct, tab_3d = st.tabs(["Slices", "3D"])
     with tab_ct:

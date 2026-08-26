@@ -35,7 +35,7 @@ import SimpleITK as sitk
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from sinus_cfd.patency import drainage, flow_path  # noqa: E402
+from sinus_cfd.patency import drainage, flow_path, naris_territory  # noqa: E402
 
 
 def _read(path: Path):
@@ -87,6 +87,8 @@ def audit(case: str, outputs: Path) -> dict:
                 outlet = zyx
 
     rec: dict = {"case": case, "domain": used_passage}
+    rec["_ref_img"] = img
+    rec["_passage"] = passage
     if not inlets or outlet is None:
         rec["flow"] = {"ok": False, "notes": ["boundary_conditions.json has no inlet/outlet ports"]}
     else:
@@ -95,6 +97,10 @@ def audit(case: str, outputs: Path) -> dict:
         if not rec["flow"].get("ok"):
             rec["flow_on_airway_mask"] = flow_path(airway, inlets, outlet, spacing)
 
+    if inlets and len(inlets) >= 2:
+        terr, tmeta = naris_territory(passage, inlets, spacing, outlet_zyx=outlet)
+        rec["territory"] = tmeta
+        rec["_territory"] = terr
     sinus_p = cd / f"{case}_sinus_detour.nrrd"
     if sinus_p.is_file():
         y_ant, sup_hi = _orientation(stats)
@@ -138,6 +144,19 @@ def render(rec: dict) -> bool:
               f"{len(alt.get('inlets') or {})} inlet(s) connect"
               f"{' -> the strip or the box crop removed the vestibule' if good else ''}")
 
+    t = rec.get("territory")
+    if t:
+        print()
+        print("  [3] AIRWAY ID  per naris")
+        if t.get("left_ml") is not None:
+            print(f"      left-fed   {t['left_ml']:>7.2f} mL   (port snapped {t.get('left_snap_mm')} mm)")
+            print(f"      right-fed  {t['right_ml']:>7.2f} mL   (port snapped {t.get('right_snap_mm')} mm)")
+            print(f"      convergence{t['convergence_ml']:>7.2f} mL   "
+                  f"(streams within {t['mixing_tol_mm']} mm of equal route)")
+            if t.get("balance") is not None:
+                print(f"      L/R balance {t['balance']:.2f}")
+        for n in t.get("notes") or []:
+            print(f"      note: {n}")
     dr = rec.get("drainage", {})
     sins = dr.get("sinuses") or []
     print(f"\n  [2] DRAINAGE PATHWAYS                  {len(sins)} sinus body(ies)")
@@ -160,6 +179,9 @@ def main() -> int:
     g.add_argument("--all", action="store_true")
     ap.add_argument("--outputs-dir", type=Path, default=REPO_ROOT / "outputs")
     ap.add_argument("--json", type=Path, default=None)
+    ap.add_argument("--write-territory", action="store_true",
+                    help="write <case>_naris_territory.nrrd (1=left-fed, 2=right-fed, "
+                         "3=convergence) for the viewer")
     args = ap.parse_args()
 
     cases = (
@@ -170,8 +192,16 @@ def main() -> int:
     recs, all_ok = [], True
     for c in cases:
         r = audit(c, args.outputs_dir)
-        recs.append(r)
+        if args.write_territory and r.get("_territory") is not None:
+            out = args.outputs_dir / c / f"{c}_naris_territory.nrrd"
+            im = sitk.GetImageFromArray(r["_territory"].astype(np.uint8))
+            im.CopyInformation(r["_ref_img"])
+            sitk.WriteImage(im, str(out), useCompression=True)
+            print(f"  wrote {out.name}")
         all_ok &= render(r)
+        for k in ("_territory", "_ref_img", "_passage"):
+            r.pop(k, None)
+        recs.append(r)
     print(f"\n{'=' * 74}")
     for r in recs:
         tag = "ERROR" if "error" in r else ("PASS" if r.get("flow", {}).get("ok") else "FAIL")

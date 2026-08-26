@@ -496,3 +496,103 @@ def drainage(
         if want not in have:
             res["notes"].append(f"no {want} sinus found")
     return res
+
+
+# Voxels whose geodesic distance to the two nares differs by less than this are
+# fed by both -- the convergence zone. Not a hard anatomical boundary: it is the
+# width of the band where the streams meet, and it widens where the airway is wide.
+NARIS_MIXING_TOL_MM = 2.0
+
+
+def naris_territory(passage, inlets_zyx, spacing_xyz, mixing_tol_mm=NARIS_MIXING_TOL_MM,
+                    outlet_zyx=None):
+    """Which naris feeds each voxel of the CFD domain.
+
+    Competing geodesic flood inside ``passage`` from the two naris ports. Air
+    reaching a voxel takes the shorter route, so the nearer naris feeds it; where
+    the two distances are within ``mixing_tol_mm`` the streams converge and
+    neither owns the voxel.
+
+    Distance is geodesic IN THE LUMEN, not Euclidean -- a Euclidean split would
+    put the boundary on a plane through the septum, which is the midplane error
+    this project spent a cycle removing (docs/segmentation_strategy.md K3).
+
+    Returns ``(label, meta)`` with label 0=outside, 1=left-fed, 2=right-fed,
+    3=convergence.
+    """
+    passage = passage.astype(bool)
+    sz, sy, sx = _spacing_zyx(spacing_xyz)
+    vox_ml = (sz * sy * sx) / 1000.0
+    label = np.zeros(passage.shape, dtype=np.uint8)
+    meta: dict[str, Any] = {"notes": []}
+    if not passage.any() or len(inlets_zyx) < 2:
+        meta["notes"].append("need a passage and two naris ports")
+        return label, meta
+    names = list(inlets_zyx)
+    left_name = next((n for n in names if "left" in n.lower()), names[0])
+    right_name = next((n for n in names if n != left_name), names[-1])
+    snaps = {}
+    for nm in (left_name, right_name):
+        snap, dist = _snap(passage, inlets_zyx[nm], spacing_xyz)
+        if snap is None:
+            meta["notes"].append(f"{nm} does not resolve onto the passage")
+            return label, meta
+        snaps[nm] = (snap, dist)
+    d_l = geodesic_distance_mm(passage, snaps[left_name][0], spacing_xyz)
+    d_r = geodesic_distance_mm(passage, snaps[right_name][0], spacing_xyz)
+    fl, fr = np.isfinite(d_l), np.isfinite(d_r)
+    reach = passage & (fl | fr)
+    # Reachable from ONE naris only -> that naris feeds it, whatever the other
+    # distance is. Only compare where both are finite; inf - inf is not a
+    # tie, it is "unreachable", and subtracting them would make it a silent NaN.
+    label[passage & fl & ~fr] = 1
+    label[passage & fr & ~fl] = 2
+    both = passage & fl & fr
+    if both.any():
+        diff = np.zeros(passage.shape, dtype=np.float64)
+        diff[both] = d_l[both] - d_r[both]
+        label[both & (diff < -mixing_tol_mm)] = 1
+        label[both & (diff > mixing_tol_mm)] = 2
+        label[both & (np.abs(diff) <= mixing_tol_mm)] = 3
+    # Once the two streams have met they stay met: everything DOWNSTREAM of the
+    # convergence band is fed by both nares. Without this, a long shared channel
+    # (THCA carries the whole pharynx and larynx) is handed entirely to whichever
+    # naris happens to be geodesically nearer its entrance -- THCA came out
+    # 57.9 / 11.9 mL, balance 0.21, which is an artefact of the tie-break, not
+    # anatomy. Downstream = closer to the outlet than the far edge of the band.
+    if outlet_zyx is not None and (label == 3).any():
+        o_snap, _o_d = _snap(passage, outlet_zyx, spacing_xyz)
+        if o_snap is not None:
+            d_out = geodesic_distance_mm(passage, o_snap, spacing_xyz)
+            band = d_out[(label == 3) & np.isfinite(d_out)]
+            if band.size:
+                # The tie band is not a single front: it runs the whole length of
+                # the septum, where the two routes are equal all the way forward.
+                # The streams actually MERGE at its posterior end -- the point
+                # nearest the outlet -- so threshold on the MINIMUM. Using the
+                # maximum swallowed the nasal cavities whole (VH: left-fed went
+                # to 0.00 mL).
+                thr = float(band.min())
+                downstream = passage & np.isfinite(d_out) & (d_out <= thr) & (label != 0)
+                meta["downstream_of_convergence_ml"] = round(
+                    float((downstream & (label != 3)).sum()) * vox_ml, 2)
+                label[downstream] = 3
+    unreached = int(passage.sum()) - int(reach.sum())
+    meta.update({
+        "left_port": left_name, "right_port": right_name,
+        "left_snap_mm": round(snaps[left_name][1], 2),
+        "right_snap_mm": round(snaps[right_name][1], 2),
+        "left_ml": round(float((label == 1).sum()) * vox_ml, 2),
+        "right_ml": round(float((label == 2).sum()) * vox_ml, 2),
+        "convergence_ml": round(float((label == 3).sum()) * vox_ml, 2),
+        "unreached_ml": round(float(unreached) * vox_ml, 2),
+        "mixing_tol_mm": mixing_tol_mm,
+    })
+    tot = meta["left_ml"] + meta["right_ml"]
+    if tot > 0:
+        meta["balance"] = round(min(meta["left_ml"], meta["right_ml"]) / max(meta["left_ml"], meta["right_ml"]), 3)
+    if unreached:
+        meta["notes"].append(
+            f"{meta['unreached_ml']:.2f} mL of the passage is not reachable from "
+            "either naris -- disconnected domain")
+    return label, meta

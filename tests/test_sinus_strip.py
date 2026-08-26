@@ -307,3 +307,52 @@ def test_ostium_location_is_on_the_interface_not_inside_the_sinus():
     # must sit on the sinus side of the boundary, adjacent to the passage
     nb = passage[max(0, z - 1):z + 2, max(0, y - 1):y + 2, max(0, x - 1):x + 2]
     assert nb.any(), "ostium marker does not touch the passage -- it is inside the sinus"
+
+
+# --------------------------------------------------------------------------
+# naris_territory
+# --------------------------------------------------------------------------
+
+
+def _y_tube():
+    """Two nostril limbs meeting in a common posterior channel."""
+    shape = (24, 70, 60)
+    p = np.zeros(shape, dtype=bool)
+    p[8:16, 6:34, 34:42] = True      # left limb  (high x)
+    p[8:16, 6:34, 18:26] = True      # right limb (low x)
+    p[8:16, 34:64, 24:36] = True     # shared channel
+    return p
+
+
+def test_naris_territory_splits_by_route_not_by_a_plane():
+    from sinus_cfd.patency import naris_territory
+
+    p = _y_tube()
+    lab, meta = naris_territory(p, {"left_nostril": (12, 7, 38),
+                                    "right_nostril": (12, 7, 22)}, ISO)
+    assert lab[12, 10, 38] == 1, meta        # left limb is left-fed
+    assert lab[12, 10, 22] == 2, meta        # right limb is right-fed
+    assert meta["left_ml"] > 0 and meta["right_ml"] > 0
+    # a near-symmetric Y must come out near-balanced
+    assert meta["balance"] > 0.7, meta
+
+
+def test_naris_territory_marks_the_convergence_zone():
+    from sinus_cfd.patency import naris_territory
+
+    p = _y_tube()
+    lab, meta = naris_territory(p, {"left_nostril": (12, 7, 38),
+                                    "right_nostril": (12, 7, 22)}, ISO)
+    # the shared channel runs down the midline; its centre is equidistant
+    assert lab[12, 50, 30] == 3, meta
+    assert meta["convergence_ml"] > 0
+
+
+def test_naris_territory_needs_ports_on_the_passage():
+    from sinus_cfd.patency import naris_territory
+
+    p = _y_tube()
+    lab, meta = naris_territory(p, {"left_nostril": (12, 7, 38),
+                                    "right_nostril": (2, 2, 2)}, ISO)
+    assert not lab.any()
+    assert any("does not resolve" in n for n in meta["notes"])
