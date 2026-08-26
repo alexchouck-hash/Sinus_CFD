@@ -356,3 +356,24 @@ def test_naris_territory_needs_ports_on_the_passage():
                                     "right_nostril": (2, 2, 2)}, ISO)
     assert not lab.any()
     assert any("does not resolve" in n for n in meta["notes"])
+
+
+def test_ostium_location_is_the_narrowest_point_of_the_connection():
+    """A chamber joined to a wide tube by a narrow neck: the reported ostium must
+    sit AT the neck, not somewhere of average width on the contact surface."""
+    from sinus_cfd.patency import drainage
+
+    shape = (30, 60, 60)
+    air = np.zeros(shape, dtype=bool)
+    air[8:22, 4:56, 22:38] = True            # wide tube
+    air[12:18, 30:46, 8:22] = True           # chamber
+    air[8:22, 30:46, 20:22] = False          # wall
+    air[14:16, 38, 20:22] = True             # 2-voxel neck at y=38
+    passage = np.zeros(shape, dtype=bool)
+    passage[8:22, 4:56, 22:38] = True
+    sinus = air & ~passage
+    res = drainage(air, sinus, passage, ISO)
+    rec = res["sinuses"][0]
+    z, y, x = rec["ostium_zyx"]
+    assert abs(y - 38) <= 2, f"ostium at y={y}, neck is at y=38: {rec}"
+    assert rec["ostium_min_diameter_mm"] <= rec["ostium_diameter_mm"]

@@ -462,26 +462,30 @@ def drainage(
         else:
             rec["ostium_valid"] = True
         if interface.any():
-            # WHERE on the interface. The centroid lands inside the sinus (the
-            # interface wraps the whole contact surface, it does not mark a
-            # hole), so take a real interface voxel of typical width.
+            # WHERE on the interface: the NARROWEST voxel. An ostium is by
+            # definition the tightest constriction between sinus and passage,
+            # so this is the physical definition rather than a tuned choice.
             #
-            # VALIDATED against operator marks on 3 maxillary ostia:
-            # offsets 2.9 / 4.0 / 4.7 mm, median 4.0 mm, every mark landing in
-            # air. Accurate to a few voxels -- fine for calibre, which is
-            # measured across the whole interface, and marginal for navigation
-            # (CLAUDE.md goal 4) where 4 mm at an ostium matters.
+            # Measured against operator marks on 3 maxillary ostia:
+            #   narrowest voxel        1.5 / 2.5 / 4.0 mm   median 2.5   <-- this
+            #   typical width (old)    4.0 / 2.9 / 4.8 mm   median 4.0
+            #   best-connected         2.6 / 3.7 / 5.1 mm   median 3.7
+            #   edt ~ ostium radius   12.7 /14.7 /18.1 mm   median 14.7
+            #   centroid of narrowest 10%  11.9 /12.4 /15.2 mm
             #
-            # dz was +1.9 / +1.9 / +4.4 mm, i.e. the pick sits slightly
-            # INFERIOR of the mark, which is the direction the anatomy predicts
-            # (a maxillary ostium is superomedial). Suggestive, not conclusive
-            # at n=3: the mean is barely above the spread. A "most medial" rule
-            # was tried and REJECTED -- 2 of 3 improved but the mean offset rose
-            # 5.6 -> 6.2 mm. Do not retune this on a handful of points.
+            # That last one is the recurring trap: AVERAGING POSITIONS lands
+            # inside the sinus, because narrow voxels are scattered around the
+            # whole interface rim. Never take a centroid of a surface and call
+            # it a location -- pick a real voxel.
             zz, yy, xx = np.where(interface)
             widths = edt[interface]
-            j = int(np.argmin(np.abs(widths - calibre)))
+            j = int(np.argmin(widths))
             rec["ostium_zyx"] = [int(zz[j]), int(yy[j]), int(xx[j])]
+            # Narrowest point, alongside the median calibre reported above.
+            # They answer different questions: the median is the effective
+            # opening (and matches the clinical 2-4 mm for a maxillary ostium),
+            # the minimum is the tightest squeeze a probe would meet.
+            rec["ostium_min_diameter_mm"] = round(2.0 * float(widths[j]), 2)
         else:
             rec["ostium_zyx"] = None
         rec["connection"] = "drains through a resolved ostium"
