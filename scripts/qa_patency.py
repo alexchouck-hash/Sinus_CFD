@@ -38,6 +38,21 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from sinus_cfd.patency import drainage, flow_path, naris_territory  # noqa: E402
 
 
+def _load_hu(cd: Path, case: str, stats: dict, shape):
+    """CT cropped to the mask frame, for the probable-ostium estimate."""
+    img_p = Path(stats.get("image_path") or "")
+    if not img_p.is_file():
+        return None
+    full = sitk.GetArrayFromImage(sitk.ReadImage(str(img_p))).astype(np.float32)
+    cz, cy, cx = stats.get("crop_origin_zyx") or [0, 0, 0]
+    nz, ny, nx = shape
+    hu = np.full(shape, -1024.0, np.float32)
+    z1 = min(nz, full.shape[0] - cz); y1 = min(ny, full.shape[1] - cy)
+    x1 = min(nx, full.shape[2] - cx)
+    hu[:z1, :y1, :x1] = full[cz:cz + z1, cy:cy + y1, cx:cx + x1]
+    return hu
+
+
 def _read(path: Path):
     return sitk.GetArrayFromImage(sitk.ReadImage(str(path))).astype(bool)
 
@@ -105,11 +120,14 @@ def audit(case: str, outputs: Path) -> dict:
     if sinus_p.is_file():
         y_ant, sup_hi = _orientation(stats)
         air_p = cd / f"{case}_all_interior_air.nrrd"
+        hu_arr = _load_hu(cd, case, stats, airway.shape)
         rec["drainage"] = drainage(
             airway, _read(sinus_p), passage, spacing,
             y_anterior_is_low=y_ant, superior_is_high_z=sup_hi,
             interior_air=_read(air_p) if air_p.is_file() else None,
+            hu=hu_arr,
         )
+        rec["drainage"].pop("body_labels", None)
     else:
         rec["drainage"] = {"sinuses": [], "notes": ["no <case>_sinus_detour.nrrd"]}
     return rec
@@ -166,6 +184,12 @@ def render(rec: dict) -> bool:
             ost = f"{s['ostium_diameter_mm']:.2f}" if s["drains"] else "-"
             print(f"      {s['name']:<12}{s['side']:<8}{s['volume_ml']:>8.2f}"
                   f"{ost:>11}{str(s['drains']):>8}  {s.get('connection','')}")
+            est = s.get("probable_ostium")
+            if est:
+                print(f"        estimated drainage route: exit {est['exit_zyx']} -> "
+                      f"{est['route_mm']:.1f} mm, {est['non_air_mm']:.1f} mm non-air, "
+                      f"peak {est['peak_hu']:.0f} HU")
+                print(f"        {est['verdict']}  (HYPOTHESIS, not a measurement)")
     for n in dr.get("notes") or []:
         print(f"      note: {n}")
     return ok

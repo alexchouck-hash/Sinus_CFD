@@ -377,3 +377,61 @@ def test_ostium_location_is_the_narrowest_point_of_the_connection():
     z, y, x = rec["ostium_zyx"]
     assert abs(y - 38) <= 2, f"ostium at y={y}, neck is at y=38: {rec}"
     assert rec["ostium_min_diameter_mm"] <= rec["ostium_diameter_mm"]
+
+
+# --------------------------------------------------------------------------
+# probable_ostium
+# --------------------------------------------------------------------------
+
+
+def _chamber_behind_a_wall(wall_hu):
+    """A chamber and a tube separated by a 2-voxel wall of the given density."""
+    shape = (24, 40, 40)
+    hu = np.full(shape, 60.0, dtype=np.float32)       # soft tissue everywhere
+    passage = np.zeros(shape, dtype=bool)
+    passage[8:16, 4:18, 8:32] = True
+    sinus = np.zeros(shape, dtype=bool)
+    sinus[8:16, 22:36, 8:32] = True
+    hu[passage] = -1000.0
+    hu[sinus] = -1000.0
+    # The wall must span the WHOLE volume in z and x. A wall covering only the
+    # chambers leaves surrounding soft tissue as a bypass, and the search -- quite
+    # correctly -- goes around it rather than through, so the fixture would test
+    # nothing. (The first version of this test failed for exactly that reason.)
+    hu[:, 18:22, :] = wall_hu
+    return hu, sinus, passage
+
+
+def test_probable_ostium_reads_a_soft_wall_as_a_plausible_route():
+    from sinus_cfd.patency import probable_ostium
+
+    hu, sinus, passage = _chamber_behind_a_wall(60.0)   # mucosa-like
+    est = probable_ostium(hu, sinus, passage, ISO)
+    assert est["found"], est
+    assert est["peak_hu"] <= 250, est
+    assert "unresolved ostium" in est["verdict"], est
+    # the exit must be ON the sinus, adjacent to the wall
+    z, y, x = est["exit_zyx"]
+    assert sinus[z, y, x], est
+
+
+def test_probable_ostium_reads_cortical_bone_as_blocked():
+    from sinus_cfd.patency import probable_ostium
+
+    hu, sinus, passage = _chamber_behind_a_wall(1200.0)  # cortical bone
+    est = probable_ostium(hu, sinus, passage, ISO)
+    assert est["found"], est
+    assert est["peak_hu"] >= 700, est
+    assert "blocked" in est["verdict"], est
+
+
+def test_probable_ostium_prefers_the_cheaper_of_two_walls():
+    """Given a bone wall and a soft-tissue gap, the route must take the gap."""
+    from sinus_cfd.patency import probable_ostium
+
+    hu, sinus, passage = _chamber_behind_a_wall(1200.0)
+    hu[8:16, 18:22, 26:32] = 40.0        # a soft window at high x
+    est = probable_ostium(hu, sinus, passage, ISO)
+    assert est["found"], est
+    assert est["peak_hu"] < 700, est
+    assert est["exit_zyx"][2] >= 24, est  # exits through the soft window

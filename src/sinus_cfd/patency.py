@@ -364,6 +364,7 @@ def drainage(
     superior_is_high_z=True,
     interior_air=None,
     min_leftover_ml=0.25,
+    hu=None,
 ):
     """Per-sinus ostium location and calibre, and whether it reaches the passage.
 
@@ -378,6 +379,11 @@ def drainage(
     sz, sy, sx = _spacing_zyx(spacing_xyz)
     vox_ml = (sz * sy * sx) / 1000.0
     res: dict[str, Any] = {"sinuses": [], "notes": []}
+    # Every body gets a unique id in this map. Recovering a body by matching its
+    # VOLUME is ambiguous -- two frontal cells of 0.42 and 0.36 mL both matched a
+    # 0.40 mL component and silently shared one mask.
+    body_labels = np.zeros(airway.shape, dtype=np.int32)
+    next_id = 0
     if not sinus.any() and interior_air is None:
         res["notes"].append("no sinus bodies segmented")
         return res
@@ -410,10 +416,16 @@ def drainage(
                 if lsz[i] * vox_ml >= min_leftover_ml:
                     big |= llab == i + 1
             if big.any():
+                lmap, _ln = _split_midline_straddlers(
+                    big, spacing_xyz, _frame(airway)["xmid"])
                 for rec in name_sinus_bodies(
                     big, airway, spacing_xyz, y_anterior_is_low, superior_is_high_z
                 ):
-                    rec.pop("_label", None)
+                    _lid = rec.pop("_label", None)
+                    if _lid is not None:
+                        next_id += 1
+                        body_labels[lmap == _lid] = next_id
+                        rec["body_id"] = next_id
                     rec["ostium_radius_mm"] = 0.0
                     rec["ostium_diameter_mm"] = 0.0
                     rec["touches_passage"] = False
@@ -425,6 +437,9 @@ def drainage(
     bott = widest_path_bottleneck_mm(airway, passage, edt, spacing_xyz)
     for rec in bodies:
         b = lab == rec.pop("_label")
+        next_id += 1
+        body_labels[b] = next_id
+        rec["body_id"] = next_id
         interface = ndi.binary_dilation(b, STRUCT26) & passage
         # Calibre is the MEDIAN half-width across the interface, not the max.
         # The interface is the whole watershed contact surface between sinus and
@@ -495,6 +510,18 @@ def drainage(
     res["sinuses"].extend(r for r in leftover_recs if r["name"] != "unknown")
     res["sinuses"] = _merge_split_sinuses(res["sinuses"], spacing_xyz, res["notes"])
     res["sinuses"].sort(key=lambda r: -r["volume_ml"])
+    res["body_labels"] = body_labels
+    # For a named sinus with no resolved ostium, estimate where it WOULD drain.
+    if hu is not None:
+        for rec in res["sinuses"]:
+            if rec.get("drains") or rec["name"] in ("unknown",):
+                continue
+            bid = rec.get("body_id")
+            if not bid:
+                continue
+            est = probable_ostium(hu, body_labels == bid, passage, spacing_xyz)
+            if est.get("found"):
+                rec["probable_ostium"] = est
     have = {r["name"] for r in res["sinuses"] if r["name"] != "unknown"}
     for want in ("maxillary", "frontal", "sphenoid"):
         if want not in have:
@@ -600,3 +627,121 @@ def naris_territory(passage, inlets_zyx, spacing_xyz, mixing_tol_mm=NARIS_MIXING
             f"{meta['unreached_ml']:.2f} mL of the passage is not reachable from "
             "either naris -- disconnected domain")
     return label, meta
+
+
+# --- Probable ostium: a hypothesis, not a measurement -----------------------
+# HU above this is treated as air and costs nothing to traverse.
+OSTIUM_PATH_AIR_HU = -300.0
+# Peak HU on the route, used to judge whether it is a plausible unresolved
+# ostium (mucosa / thin bone, partial-volumed) or a solid wall.
+OSTIUM_PATH_PLAUSIBLE_HU = 250.0    # below: consistent with an unresolved ostium
+OSTIUM_PATH_BLOCKED_HU = 700.0      # above: cortical bone, not a drainage route
+OSTIUM_PATH_SEARCH_MM = 30.0
+
+
+def probable_ostium(hu, sinus_body, passage, spacing_xyz,
+                    search_mm=OSTIUM_PATH_SEARCH_MM):
+    """Where a sinus would most likely drain, when no ostium resolves as air.
+
+    A frontal recess or sphenoethmoidal recess is often sub-millimetre and simply
+    is not resolved at 0.4-0.6 mm, so the sinus appears as disconnected air. The
+    CT still carries partial-volume evidence: along a real but unresolved channel
+    the HU is depressed toward air, while a solid wall stays at cortical values.
+
+    This walks the least-resistance route from the sinus to the passage, with
+    per-voxel cost rising from 0 at air to high at bone, and reports where that
+    route leaves the sinus.
+
+    THIS IS A HYPOTHESIS, NOT A MEASUREMENT. It says "if this sinus drains, here
+    is the most likely place and this is what stands in the way". A route through
+    cortical bone means no pathway was found, not a narrow one.
+
+    Returns a dict with the exit point, the route's peak HU (the barrier), the
+    millimetres of non-air crossed, and a verdict.
+    """
+    import heapq
+
+    sinus_body = sinus_body.astype(bool)
+    passage = passage.astype(bool)
+    sz, sy, sx = _spacing_zyx(spacing_xyz)
+    if not sinus_body.any() or not passage.any():
+        return {"found": False, "reason": "empty sinus or passage"}
+    # crop to the sinus plus a search margin, for speed
+    zz, yy, xx = np.where(sinus_body)
+    rz = max(int(round(search_mm / sz)), 1)
+    ry = max(int(round(search_mm / sy)), 1)
+    rx = max(int(round(search_mm / sx)), 1)
+    z0, z1 = max(0, zz.min() - rz), min(hu.shape[0], zz.max() + rz + 1)
+    y0, y1 = max(0, yy.min() - ry), min(hu.shape[1], yy.max() + ry + 1)
+    x0, x1 = max(0, xx.min() - rx), min(hu.shape[2], xx.max() + rx + 1)
+    H = hu[z0:z1, y0:y1, x0:x1].astype(np.float32)
+    S = sinus_body[z0:z1, y0:y1, x0:x1]
+    P = passage[z0:z1, y0:y1, x0:x1]
+    if not P.any():
+        return {"found": False, "reason": "no passage within the search window"}
+    # cost: 0 in air, rising through soft tissue, steep in bone
+    cost = np.clip((H - OSTIUM_PATH_AIR_HU) / 300.0, 0.0, None).astype(np.float64)
+    nz_, ny_, nx_ = H.shape
+    INF = np.inf
+    dist = np.full(H.shape, INF)
+    prev = np.full(H.shape + (3,), -1, dtype=np.int32)
+    heap = []
+    for z, y, x in zip(*np.where(S)):
+        dist[z, y, x] = 0.0
+        heap.append((0.0, int(z), int(y), int(x)))
+    heapq.heapify(heap)
+    offs = [(dz, dy, dx, float(np.sqrt((dz * sz) ** 2 + (dy * sy) ** 2 + (dx * sx) ** 2)))
+            for dz in (-1, 0, 1) for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+            if (dz, dy, dx) != (0, 0, 0)]
+    target = None
+    while heap:
+        d, z, y, x = heapq.heappop(heap)
+        if d > dist[z, y, x]:
+            continue
+        if P[z, y, x]:
+            target = (z, y, x)
+            break
+        for dz, dy, dx, L in offs:
+            z2, y2, x2 = z + dz, y + dy, x + dx
+            if not (0 <= z2 < nz_ and 0 <= y2 < ny_ and 0 <= x2 < nx_):
+                continue
+            nd = d + L * (1.0 + 0.5 * (cost[z, y, x] + cost[z2, y2, x2]))
+            if nd < dist[z2, y2, x2]:
+                dist[z2, y2, x2] = nd
+                prev[z2, y2, x2] = (z, y, x)
+                heapq.heappush(heap, (nd, z2, y2, x2))
+    if target is None:
+        return {"found": False, "reason": "no route to the passage within the window"}
+    path = [target]
+    while True:
+        pz, py, px = prev[path[-1]]
+        if pz < 0:
+            break
+        path.append((int(pz), int(py), int(px)))
+    path.reverse()
+    hus = np.array([H[p] for p in path], dtype=float)
+    lens = [0.0] + [float(np.sqrt(((path[i][0] - path[i - 1][0]) * sz) ** 2
+                                  + ((path[i][1] - path[i - 1][1]) * sy) ** 2
+                                  + ((path[i][2] - path[i - 1][2]) * sx) ** 2))
+                    for i in range(1, len(path))]
+    non_air_mm = float(sum(l for l, h in zip(lens, hus) if h > OSTIUM_PATH_AIR_HU))
+    peak = float(hus.max())
+    # the exit point is the last voxel still inside the sinus
+    exit_idx = 0
+    for i, p in enumerate(path):
+        if S[p]:
+            exit_idx = i
+    ez, ey, ex = path[exit_idx]
+    verdict = ("consistent with an unresolved ostium" if peak <= OSTIUM_PATH_PLAUSIBLE_HU
+               else "blocked by bone -- no drainage route found"
+               if peak >= OSTIUM_PATH_BLOCKED_HU
+               else "uncertain -- thin bone or partial volume")
+    return {
+        "found": True,
+        "exit_zyx": [int(ez + z0), int(ey + y0), int(ex + x0)],
+        "entry_zyx": [int(path[-1][0] + z0), int(path[-1][1] + y0), int(path[-1][2] + x0)],
+        "route_mm": round(float(sum(lens)), 2),
+        "non_air_mm": round(non_air_mm, 2),
+        "peak_hu": round(peak, 0),
+        "verdict": verdict,
+    }
