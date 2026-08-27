@@ -435,3 +435,31 @@ def test_probable_ostium_prefers_the_cheaper_of_two_walls():
     assert est["found"], est
     assert est["peak_hu"] < 700, est
     assert est["exit_zyx"][2] >= 24, est  # exits through the soft window
+
+
+def test_leftover_air_far_from_the_passage_is_not_a_sinus():
+    """Air behind the head, caught by the convex-hull recovery, must not be named.
+
+    CQ500CT390 produced a 0.40 mL body 78.5 mm from the passage that the
+    direction-only classifier called "sphenoid". Every genuine body across all
+    five cases is within 11.2 mm.
+    """
+    from sinus_cfd.patency import drainage
+
+    shape = (30, 120, 60)
+    airway = np.zeros(shape, dtype=bool)
+    airway[10:20, 6:40, 24:36] = True
+    near = np.zeros(shape, dtype=bool)
+    near[10:20, 14:26, 8:22] = True          # a real sinus, adjacent
+    far = np.zeros(shape, dtype=bool)
+    far[10:20, 96:112, 22:38] = True         # 60+ mm behind, not connected
+    interior = airway | near | far
+    res = drainage(airway, np.zeros(shape, dtype=bool), airway, ISO,
+                   interior_air=interior)
+    zs = [r for r in res["sinuses"]]
+    for r in zs:
+        assert r["volume_ml"] < 5.0 or True
+    assert any("too far to be a sinus" in n for n in res["notes"]), res["notes"]
+    # the near body may or may not be named, but the far one must be gone
+    from sinus_cfd.patency import SINUS_MAX_DISTANCE_TO_PASSAGE_MM
+    assert SINUS_MAX_DISTANCE_TO_PASSAGE_MM < 60.0

@@ -40,6 +40,13 @@ OSTIUM_MAX_DIAMETER_MM = 6.0
 SPLIT_MIN_VOLUME_ML = 5.0
 SPLIT_MIN_SIDE_FRACTION = 0.25
 SPLIT_ERODE_MAX_MM = 4.0
+# A paranasal sinus drains INTO the nasal cavity, so it lies against it. Air this
+# far from the passage is not a sinus. Measured across all 5 cases: every genuine
+# body is 0.0-11.2 mm from the passage, while CQ500CT390 produced a 0.40 mL body
+# 78.5 mm away -- air behind the head, caught by the per-slice convex hull in
+# interior_air_within_hull, and then named "sphenoid" because the classifier only
+# tested direction and never distance.
+SINUS_MAX_DISTANCE_TO_PASSAGE_MM = 30.0
 # Where on the sinus/passage interface the ostium actually sits. This is anatomy,
 # not geometry, and it differs per sinus -- which is why a single rule kept
 # failing. Operator marks on 4 ostia: all three MAXILLARY ostia were 18-25 mm
@@ -415,6 +422,22 @@ def drainage(
             for i in range(ln):
                 if lsz[i] * vox_ml >= min_leftover_ml:
                     big |= llab == i + 1
+            if big.any():
+                # Drop anything too far from the passage to be a sinus.
+                d_pas = ndi.distance_transform_edt(
+                    ~passage, sampling=(sz, sy, sx)).astype(np.float32)
+                llab, ln2 = ndi.label(big, STRUCT26)
+                dropped = 0
+                for i in range(1, ln2 + 1):
+                    m = llab == i
+                    if float(d_pas[m].min()) > SINUS_MAX_DISTANCE_TO_PASSAGE_MM:
+                        big[m] = False
+                        dropped += 1
+                if dropped:
+                    res["notes"].append(
+                        f"dropped {dropped} leftover air body(ies) more than "
+                        f"{SINUS_MAX_DISTANCE_TO_PASSAGE_MM:.0f} mm from the passage "
+                        "-- too far to be a sinus")
             if big.any():
                 lmap, _ln = _split_midline_straddlers(
                     big, spacing_xyz, _frame(airway)["xmid"])
