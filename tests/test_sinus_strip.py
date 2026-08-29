@@ -463,3 +463,35 @@ def test_leftover_air_far_from_the_passage_is_not_a_sinus():
     # the near body may or may not be named, but the far one must be gone
     from sinus_cfd.patency import SINUS_MAX_DISTANCE_TO_PASSAGE_MM
     assert SINUS_MAX_DISTANCE_TO_PASSAGE_MM < 60.0
+
+
+def test_merge_only_fuses_bodies_that_are_actually_adjacent():
+    """Two bodies 100 mm apart are not one sinus split by a partly-resolved ostium.
+
+    The gate used to compare only the OFF-MIDLINE offsets, a single lateral
+    coordinate, so two bodies at the same distance from the septum fused however
+    far apart they were along z or y. On VH Male that reported 16.37 + 1.89 + 0.50
+    mL -- parts 43 mm and 104 mm from the antrum -- as one 18.76 mL maxillary.
+    """
+    from sinus_cfd.patency import _merge_split_sinuses
+
+    def body(vol, centroid, off):
+        return {
+            "name": "maxillary", "side": "L", "volume_ml": vol,
+            "off_midline_mm": off, "centroid_mm": list(centroid),
+            "ostium_diameter_mm": 2.0, "ostium_radius_mm": 1.0,
+            "drains": True, "body_ids": [len(centroid)], "connection": "x",
+        }
+
+    near = [body(16.0, (100.0, 50.0, 120.0), 20.0),
+            body(1.5, (108.0, 56.0, 124.0), 20.0)]      # 11 mm away
+    notes: list[str] = []
+    merged = _merge_split_sinuses(near, ISO, notes)
+    assert len(merged) == 1 and merged[0]["volume_ml"] == 17.5, notes
+
+    far = [body(16.0, (100.0, 50.0, 120.0), 20.0),
+           body(1.5, (204.0, 50.0, 120.0), 20.0)]       # 104 mm away, same offset
+    notes = []
+    kept = _merge_split_sinuses(far, ISO, notes)
+    assert len(kept) == 2, f"welded bodies 104 mm apart: {notes}"
+    assert {round(r["volume_ml"], 2) for r in kept} == {16.0, 1.5}

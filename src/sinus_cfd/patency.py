@@ -71,9 +71,76 @@ OSTIUM_DIR_QUANTILE = 0.15
 # deliberately absent -- it is a cluster of separate cells and must not be fused.
 MERGE_SINGLETON_SINUSES = ("maxillary", "frontal", "sphenoid")
 # Only fuse bodies whose centroids are this close; guards against welding two
-# genuinely different structures that happened to get the same label.
+# genuinely different structures that happened to get the same label. This is a
+# 3-D centroid separation. It used to compare only the OFF-MIDLINE offsets, which
+# is a single lateral coordinate: on VH Male that welded the left antrum to two
+# bodies 43 mm and 104 mm away from it and reported the total, 18.76 mL, as one
+# maxillary sinus. A sinus split by a partly-resolved ostium is split in place --
+# its parts are adjacent, and an adult maxillary antrum is only ~35 mm across.
 MERGE_MAX_CENTROID_MM = 40.0
 STRUCT26 = np.ones((3, 3, 3), dtype=bool)
+
+
+def inside_edt_mm(mask, spacing_xyz):
+    """Distance from each ``mask`` voxel to the nearest background voxel, in mm.
+
+    Computed on the mask's bounding box padded by one voxel, then written back.
+    That padding is what makes it EXACT rather than an approximation: every voxel
+    immediately outside the bounding box is background by definition, so the
+    nearest background voxel to any mask voxel is already inside the padded crop.
+
+    Worth doing because scipy's EDT allocates several float64 and int32 arrays of
+    ``3 x shape``. On CQ500CT390 the airway fills 3.1 M of 47.6 M voxels, so the
+    full-volume call needs ~1.6 GB and raised MemoryError on a 16 GB machine while
+    the cropped one needs ~100 MB. Values OUTSIDE the mask are left at zero: this
+    is only valid for the in-mask radii it is used for, never for a distance-to-
+    the-mask field.
+    """
+    mask = mask.astype(bool)
+    out = np.zeros(mask.shape, dtype=np.float32)
+    if not mask.any():
+        return out
+    zz, yy, xx = np.where(mask)
+    sl = tuple(
+        slice(max(int(v.min()) - 1, 0), min(int(v.max()) + 2, n))
+        for v, n in ((zz, mask.shape[0]), (yy, mask.shape[1]), (xx, mask.shape[2]))
+    )
+    sz, sy, sx = _spacing_zyx(spacing_xyz)
+    out[sl] = ndi.distance_transform_edt(
+        mask[sl], sampling=(sz, sy, sx)
+    ).astype(np.float32)
+    return out
+
+
+def distance_to_mask_mm(mask, region, spacing_xyz, max_mm):
+    """Distance in mm from each ``region`` voxel to the nearest ``mask`` voxel.
+
+    Cropped to the bounding box of ``mask | region`` grown by ``max_mm``, so it
+    answers "is this within max_mm of the mask?" exactly: if a region voxel really
+    is within ``max_mm``, the mask voxel achieving that distance lies inside the
+    padded crop. Beyond ``max_mm`` the value may be an over-estimate, which only
+    ever pushes a body further past the threshold, never under it.
+
+    The uncropped call is ``distance_transform_edt(~passage)`` over the whole
+    volume -- 1.06 GB of float64 on CQ500CT390, which raised MemoryError.
+    """
+    mask = mask.astype(bool)
+    region = region.astype(bool)
+    out = np.full(mask.shape, np.inf, dtype=np.float32)
+    if not mask.any() or not region.any():
+        return out
+    sz, sy, sx = _spacing_zyx(spacing_xyz)
+    pad = [max(int(np.ceil(max_mm / max(s, 1e-6))), 1) for s in (sz, sy, sx)]
+    both = mask | region
+    zz, yy, xx = np.where(both)
+    sl = tuple(
+        slice(max(int(v.min()) - p, 0), min(int(v.max()) + p + 1, n))
+        for v, p, n in zip((zz, yy, xx), pad, mask.shape)
+    )
+    out[sl] = ndi.distance_transform_edt(
+        ~mask[sl], sampling=(sz, sy, sx)
+    ).astype(np.float32)
+    return out
 
 
 def _snap(mask, zyx, spacing_xyz, radius_mm=PORT_SNAP_MM):
@@ -121,7 +188,7 @@ def flow_path(passage, inlets_zyx, outlet_zyx, spacing_xyz):
     if not passage.any():
         out["notes"].append("empty passage")
         return out
-    edt = ndi.distance_transform_edt(passage, sampling=(sz, sy, sx)).astype(np.float32)
+    edt = inside_edt_mm(passage, spacing_xyz)
     o_snap, o_dist = _snap(passage, outlet_zyx, spacing_xyz)
     out["outlet_snap_mm"] = round(o_dist, 2)
     if o_snap is None:
@@ -199,7 +266,7 @@ def _split_midline_straddlers(mask, spacing_xyz, x_midline):
             nxt += 1
             out[b] = nxt
             continue
-        edt_b = ndi.distance_transform_edt(b, sampling=(sz, sy, sx)).astype(np.float32)
+        edt_b = inside_edt_mm(b, spacing_xyz)
         markers = None
         step = max(min(sz, sy, sx), 0.25)
         r = step
@@ -296,11 +363,31 @@ def name_sinus_bodies(
                 "off_midline_mm": round(off, 1),
                 "frac_posterior": round(fy, 2),
                 "frac_superior": round(fz, 2),
+                # Millimetre centroid, so the merge can ask how far apart two
+                # bodies actually are rather than only how far off the midline.
+                "centroid_mm": [
+                    round(float(zz.mean()) * sz, 1),
+                    round(float(yy.mean()) * sy, 1),
+                    round(float(xx.mean()) * sx, 1),
+                ],
                 "_label": i,
             }
         )
     out.sort(key=lambda r: -r["volume_ml"])
     return out
+
+
+def _centroid_gap_mm(a, b) -> float:
+    """Millimetre distance between two body centroids.
+
+    Falls back to the off-midline offsets when a record predates ``centroid_mm``,
+    which is the old, wrong-by-one-axis comparison -- kept only so a caller
+    passing hand-built records still gets an answer rather than a KeyError.
+    """
+    ca, cb = a.get("centroid_mm"), b.get("centroid_mm")
+    if ca is None or cb is None:
+        return abs(float(a["off_midline_mm"]) - float(b["off_midline_mm"]))
+    return float(np.linalg.norm(np.asarray(ca, float) - np.asarray(cb, float)))
 
 
 def _merge_split_sinuses(recs, spacing_xyz, notes):
@@ -328,7 +415,7 @@ def _merge_split_sinuses(recs, spacing_xyz, notes):
             o = recs[j]
             if o["name"] != r["name"] or o["side"] != r["side"]:
                 continue
-            if abs(o["off_midline_mm"] - r["off_midline_mm"]) > MERGE_MAX_CENTROID_MM:
+            if _centroid_gap_mm(r, o) > MERGE_MAX_CENTROID_MM:
                 continue
             group.append(o)
             used.add(j)
@@ -343,6 +430,12 @@ def _merge_split_sinuses(recs, spacing_xyz, notes):
         merged["off_midline_mm"] = round(
             sum(g["off_midline_mm"] * g["volume_ml"] for g in group) / max(vol, 1e-9), 1
         )
+        if all(g.get("centroid_mm") for g in group):
+            merged["centroid_mm"] = [
+                round(sum(g["centroid_mm"][k] * g["volume_ml"] for g in group)
+                      / max(vol, 1e-9), 1)
+                for k in range(3)
+            ]
         merged["drains"] = drains
         merged["ostium_radius_mm"] = best["ostium_radius_mm"]
         merged["ostium_diameter_mm"] = best["ostium_diameter_mm"]
@@ -402,7 +495,7 @@ def drainage(
     if not passage.any():
         res["notes"].append("empty passage; cannot measure drainage")
         return res
-    edt = ndi.distance_transform_edt(airway, sampling=(sz, sy, sx)).astype(np.float32)
+    edt = inside_edt_mm(airway, spacing_xyz)
     bodies = name_sinus_bodies(
         sinus, airway, spacing_xyz, y_anterior_is_low, superior_is_high_z
     )
@@ -429,8 +522,8 @@ def drainage(
                     big |= llab == i + 1
             if big.any():
                 # Drop anything too far from the passage to be a sinus.
-                d_pas = ndi.distance_transform_edt(
-                    ~passage, sampling=(sz, sy, sx)).astype(np.float32)
+                d_pas = distance_to_mask_mm(
+                    passage, big, spacing_xyz, SINUS_MAX_DISTANCE_TO_PASSAGE_MM)
                 llab, ln2 = ndi.label(big, STRUCT26)
                 dropped = 0
                 for i in range(1, ln2 + 1):
