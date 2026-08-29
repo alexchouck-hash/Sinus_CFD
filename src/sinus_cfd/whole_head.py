@@ -21,7 +21,6 @@ import SimpleITK as sitk
 import trimesh
 from scipy import ndimage as ndi
 from skimage import morphology
-from skimage.morphology import convex_hull_image
 
 from .boundary_conditions import (
     BoundarySetup,
@@ -89,27 +88,41 @@ def interior_air_within_hull(
 
     On a living head CT the nasal lumen is 26-connected to the ambient FOV air
     through the nostrils (and to the exterior through the caudal FOV cut at the
-    neck), so ``binary_fill_holes`` cannot reclaim it and ``body & (hu<=air)``
-    collapses to a handful of sealed-sinus voxels (~1e3). This mirrors the
-    body-hull method proven in ``scripts/assess_dicom_incoming.internal_air_ml``:
-    take the per-axial-slice convex hull of the body silhouette (which seals the
-    in-plane nostril gap and the neck outline), then keep low-HU voxels inside
-    that hull. Works at any spacing because the hull is silhouette-geometric and
-    the speck filter is expressed in mL, not voxels.
+    neck), so a 3-D ``binary_fill_holes`` cannot reclaim it and ``body & (hu<=air)``
+    collapses to a handful of sealed-sinus voxels (~1e3).
+
+    The bound is the **per-axial-slice hole-filled body silhouette**. In-plane the
+    nasal lumen, the sinuses and the pharynx are holes in the tissue outline, so
+    filling per slice recovers them all, while ambient air -- which reaches the
+    slice border -- is never a hole and is never recovered. Slice-wise is what
+    makes this work: the nostril and the caudal neck cut open along z, not within
+    a slice. Any spacing, because the test is silhouette-geometric and the speck
+    filter is in mL, not voxels.
+
+    This used to take the per-slice CONVEX HULL of the silhouette instead. The
+    hull does seal the nostril gap, but it also spans every facial concavity, so
+    it admitted the wedge of room air in front of the nose, the hollow behind the
+    jaw and the gap beside the ear. Downstream that air was handed on as sinus
+    air (CQ500CT390 reported two "maxillary sinuses" that were the air in front of
+    the face) and, where it stayed connected to the lumen through the nostrils, as
+    part of the CFD domain itself (6.8 mL of THCA's 72.3 mL passage was a band
+    hugging the cheeks, up to 7.3 mm outside the skin). Both cases are excluded by
+    construction here. Measured on the three open-nares cases, nothing genuine is
+    lost: CQ500CT390 and CQ500CT105 are unchanged to the voxel, and every boundary
+    port still resolves onto the airway (worst 4.2 mm, inside the 6 mm snap).
     """
-    hull = np.zeros_like(body)
+    enclosed = np.zeros_like(body)
     for z in range(body.shape[0]):
         sl = body[z]
         if int(sl.sum()) < 50:  # too little tissue to define a head silhouette
             continue
-        try:
-            hull[z] = convex_hull_image(sl)
-        except Exception:
-            hull[z] = sl  # degenerate slice: fall back to raw body silhouette
+        enclosed[z] = ndi.binary_fill_holes(sl)
 
-    interior = (hu <= air_hu_max) & hull
-    # Light closing to reconnect thin passages without bridging tissue walls
-    interior = morphology.closing(interior, footprint=morphology.ball(1))
+    interior = (hu <= air_hu_max) & enclosed
+    # Light closing to reconnect thin passages without bridging tissue walls.
+    # Re-masked afterwards: closing dilates before it erodes, and the net gain in
+    # a concavity can push voxels back outside the silhouette.
+    interior = morphology.closing(interior, footprint=morphology.ball(1)) & enclosed
     labeled, n = ndi.label(interior)
     if n == 0:
         return interior.astype(bool)

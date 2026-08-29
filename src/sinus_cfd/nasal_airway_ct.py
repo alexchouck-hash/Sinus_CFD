@@ -863,7 +863,9 @@ def extract_ct_nasal_airway(
             choanal_landmark_from_bone,
             competing_naris_flood,
             dead_end_sinus_strip,
+            main_air_component,
             meeting_set,
+            NARIS_SNAP_RADIUS_MM,
             nasal_box_mask,
             septum_ridge_from_cavities,
             snap_seed_to_air,
@@ -876,10 +878,20 @@ def extract_ct_nasal_airway(
             domain.shape, left_zyx, right_zyx, spacing_xyz, y_anterior_is_low
         )
         domain = domain & box
-        snap_l = snap_seed_to_air(domain, left_zyx, spacing_xyz)
-        snap_r = snap_seed_to_air(domain, right_zyx, spacing_xyz)
+        # Snap onto the air the flood can actually traverse. A naris that lands on
+        # a stranded pocket is not a naris: THCA's right seed once took a 55-voxel
+        # island painted at the nostril and the flood returned 55 voxels for the
+        # entire right cavity. The snap RADIUS still bounds the move, so this
+        # cannot invent a connection across an obstruction.
+        snap_domain = main_air_component(domain)
+        snap_l = snap_seed_to_air(snap_domain, left_zyx, spacing_xyz)
+        snap_r = snap_seed_to_air(snap_domain, right_zyx, spacing_xyz)
         if snap_l is None or snap_r is None:
-            notes.append("ERROR: naris seed did not snap onto flood-domain air.")
+            miss = " and ".join(
+                s for s, v in (("left", snap_l), ("right", snap_r)) if v is None)
+            notes.append(
+                f"ERROR: {miss} naris seed did not snap onto the main flood-domain "
+                f"air component within {NARIS_SNAP_RADIUS_MM:.0f} mm.")
             empty = np.zeros_like(body)
             return CTNasalAirwayResult(
                 interior_air=interior_air,

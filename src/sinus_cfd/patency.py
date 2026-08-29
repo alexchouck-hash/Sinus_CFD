@@ -349,6 +349,11 @@ def _merge_split_sinuses(recs, spacing_xyz, notes):
         merged["patent"] = bool(best["ostium_diameter_mm"] >= OSTIUM_PATENT_MM) and drains
         merged["ostium_zyx"] = best.get("ostium_zyx")
         merged["merged_from"] = len(group)
+        # Carry EVERY part's label, not just the first. dict(r) copies r's
+        # body_id alone, so the merged record used to name a sinus while
+        # pointing at a fraction of it -- and a tool path or a virtual
+        # antrostomy built on that mask would operate on the wrong volume.
+        merged["body_ids"] = [i for g in group for i in g.get("body_ids", [])]
         merged["connection"] = (
             best.get("connection", "") if drains
             else "no ostium resolved at this resolution"
@@ -449,6 +454,7 @@ def drainage(
                         next_id += 1
                         body_labels[lmap == _lid] = next_id
                         rec["body_id"] = next_id
+                        rec["body_ids"] = [next_id]
                     rec["ostium_radius_mm"] = 0.0
                     rec["ostium_diameter_mm"] = 0.0
                     rec["touches_passage"] = False
@@ -463,6 +469,7 @@ def drainage(
         next_id += 1
         body_labels[b] = next_id
         rec["body_id"] = next_id
+        rec["body_ids"] = [next_id]
         interface = ndi.binary_dilation(b, STRUCT26) & passage
         # Calibre is the MEDIAN half-width across the interface, not the max.
         # The interface is the whole watershed contact surface between sinus and

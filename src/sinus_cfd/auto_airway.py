@@ -75,6 +75,27 @@ def _isotropic(spacing_xyz: tuple[float, float, float]) -> bool:
     return float(s.max() / max(s.min(), 1e-9)) <= SPACING_ISOTROPIC_RATIO_MAX
 
 
+def main_air_component(air: np.ndarray) -> np.ndarray:
+    """The largest 26-connected component of an air mask.
+
+    A naris seed has to land on the air the flood can actually traverse. THCA's
+    right seed once snapped onto a 55-voxel pocket painted at the nostril that was
+    not joined to the lumen, and the competing flood then returned 55 voxels for
+    the whole right cavity while the left took everything. Snapping against this
+    mask cannot fabricate a connection: the snap radius still bounds how far a
+    seed may move, so a genuinely unreachable lumen fails loudly instead.
+    """
+    air = air.astype(bool)
+    if not air.any():
+        return air
+    lab, n = ndi.label(air, np.ones((3, 3, 3), dtype=bool))
+    if n <= 1:
+        return air
+    counts = np.bincount(lab.ravel())
+    counts[0] = 0
+    return lab == int(counts.argmax())
+
+
 def snap_seed_to_air(
     air: np.ndarray,
     seed_zyx: tuple[int, int, int],
@@ -505,6 +526,15 @@ def dead_end_sinus_strip(
     # A basin must also survive the extent slabs: on a full airway those ARE the
     # openings, and a sinus must not touch them either.
     terminal = terminal | ant_slab | post_slab
+    # KNOWN LIMITATION. merge_zone is a posterior HALF-SPACE, so it holds more
+    # than the nasopharynx: the sphenoid sits behind the choanae too, and the veto
+    # hands it back to the flow domain (THCA: 9.1 mL, both sphenoids, inside
+    # passage_lumen). Narrowing the veto to "half-space that is not itself behind
+    # a neck" was tried and REJECTED -- it carved the nasopharynx instead,
+    # producing bodies bounded at 6.5-11.5 mm openings (an ostium is 0.2-6 mm) and
+    # an unnamed 3.0 mL midline body on VH Male. Fixing this needs a merge zone
+    # bounded by the choanal aperture, not a half-space; until then a sphenoid
+    # behind the landmark stays in the domain rather than risk removing airway.
     behind = air & (bott > 0) & (edt > SINUS_SEED_RATIO * bott) & ~merge_zone
     struct = np.ones((3, 3, 3), dtype=bool)
     lab, n = ndi.label(behind, struct)

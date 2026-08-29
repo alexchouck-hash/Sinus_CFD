@@ -77,8 +77,15 @@ def audit(case: str, outputs: Path) -> dict:
     cd = outputs / case
     stats_p = cd / f"{case}_stats.json"
     airway_p = cd / f"{case}_airway_mask.nrrd"
-    if not stats_p.is_file() or not airway_p.is_file():
-        return {"case": case, "error": f"missing process_whole_head outputs in {cd}"}
+    head_p = cd / f"{case}_head_mask.nrrd"
+    # head_mask is read for the geometry (spacing + physical->index), so it has to
+    # be in the required set: --all walks every outputs/ subdirectory, and a
+    # NasalSeg-style case dir has stats + airway but no head_mask, which crashed
+    # the whole sweep on one incomplete case rather than skipping it.
+    missing = [p.name for p in (stats_p, airway_p, head_p) if not p.is_file()]
+    if missing:
+        return {"case": case,
+                "error": f"missing process_whole_head outputs in {cd}: {', '.join(missing)}"}
     stats = json.loads(stats_p.read_text(encoding="utf-8"))
     img = sitk.ReadImage(str(cd / f"{case}_head_mask.nrrd"))
     spacing = tuple(float(v) for v in img.GetSpacing())
