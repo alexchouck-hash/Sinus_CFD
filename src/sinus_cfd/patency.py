@@ -80,6 +80,25 @@ MERGE_SINGLETON_SINUSES = ("maxillary", "frontal", "sphenoid")
 MERGE_MAX_CENTROID_MM = 40.0
 STRUCT26 = np.ones((3, 3, 3), dtype=bool)
 
+# --- Frontal sinus, anchored on the maxillary antra ------------------------
+# A body must be at least this far off the midline to serve as an antral anchor.
+# Every confirmed antrum measured 18.1-25.6 mm off midline; every confirmed
+# frontal 7.0-17.6 mm, so 15 mm sits inside the antral population without
+# reaching the frontals.
+ANTRAL_ANCHOR_MIN_OFFSET_MM = 15.0
+# The antral roof, as a percentile of the anchor bodies' superior extent. Not the
+# max: a single voxel poking into the infraorbital canal would lift the whole
+# reference.
+ANTRAL_ROOF_PCTILE = 95.0
+# A body with at least this fraction of its voxels above the antral roof is
+# frontal. Measured on 19 hand-identified bodies across five cases the two
+# populations do not come close:
+#     maxillary  0.02 - 0.11        frontal  0.99 - 1.00
+#     ethmoid    0.00               non-sinus air  0.00
+# The roof is the orbital floor, which is the anatomical line this question
+# actually turns on -- a frontal sinus is above the orbit, an antrum below it.
+FRONTAL_ABOVE_ANTRAL_ROOF_FRAC = 0.5
+
 
 def inside_edt_mm(mask, spacing_xyz):
     """Distance from each ``mask`` voxel to the nearest background voxel, in mm.
@@ -390,6 +409,84 @@ def _centroid_gap_mm(a, b) -> float:
     return float(np.linalg.norm(np.asarray(ca, float) - np.asarray(cb, float)))
 
 
+def _antral_roof_z(recs, body_labels, superior_is_high_z):
+    """Superior extent of the maxillary antra, in signed-superior voxel units.
+
+    The anchor bodies are picked on GEOMETRY alone -- the largest body on each
+    side that is more than ``ANTRAL_ANCHOR_MIN_OFFSET_MM`` off the midline -- not
+    on the provisional name, so a mislabelled body cannot corrupt the reference
+    that is about to correct it. Returns None when no lateral body exists, in
+    which case the caller keeps the provisional names.
+    """
+    ssup = 1.0 if superior_is_high_z else -1.0
+    cands = [r for r in recs
+             if abs(r.get("off_midline_mm", 0.0)) > ANTRAL_ANCHOR_MIN_OFFSET_MM]
+    if not cands:
+        return None, []
+    cands.sort(key=lambda r: -r["volume_ml"])
+    anchors = []
+    for side in ("L", "R"):
+        same = [r for r in cands if r.get("side") == side]
+        if same:
+            anchors.append(same[0])
+    if not anchors:
+        return None, []
+    tops = []
+    for r in anchors:
+        ids = r.get("body_ids") or ([r["body_id"]] if r.get("body_id") else [])
+        if not ids:
+            continue
+        zz = np.where(np.isin(body_labels, ids))[0]
+        if zz.size:
+            tops.append(float(np.percentile(zz * ssup, ANTRAL_ROOF_PCTILE)))
+    if not tops:
+        return None, []
+    return float(np.mean(tops)), anchors
+
+
+def refine_frontal_by_antral_roof(
+    recs, body_labels, superior_is_high_z, notes=None
+):
+    """Rename as frontal any body sitting above the maxillary antral roof.
+
+    Replaces a fractional height taken against the AIRWAY BOUNDING BOX, which
+    moves with how much pharynx is in the mask and with where the naris ports
+    landed. On CQ500CT390 -- a brain-framed scan whose nostrils sit at the bottom
+    edge of the FOV, so the ports fell back to the airway's anterior opening --
+    both frontal sinuses scored 0.60 and 0.68 against a 0.72 threshold and came
+    out ``maxillary R`` and ``ethmoid L``.
+
+    The antra are the one landmark this pipeline finds reliably (9 of 9 correct
+    across the five audited cases) and they are large, paired and lateral, so
+    they are hard to confuse. Their roof is the orbital floor.
+    """
+    roof, anchors = _antral_roof_z(recs, body_labels, superior_is_high_z)
+    if roof is None:
+        return recs
+    ssup = 1.0 if superior_is_high_z else -1.0
+    anchor_ids = {id(r) for r in anchors}
+    for r in recs:
+        if id(r) in anchor_ids:
+            continue  # an anchor defines the roof; it cannot sit above it
+        ids = r.get("body_ids") or ([r["body_id"]] if r.get("body_id") else [])
+        if not ids:
+            continue
+        zz = np.where(np.isin(body_labels, ids))[0]
+        if not zz.size:
+            continue
+        frac = float((zz * ssup > roof).mean())
+        r["frac_above_antral_roof"] = round(frac, 2)
+        if frac >= FRONTAL_ABOVE_ANTRAL_ROOF_FRAC and r["name"] != "frontal":
+            if notes is not None:
+                notes.append(
+                    f"renamed {r['name']} {r['side']} ({r['volume_ml']:.2f} mL) "
+                    f"-> frontal: {100 * frac:.0f}% of it is above the maxillary "
+                    "antral roof"
+                )
+            r["name"] = "frontal"
+    return recs
+
+
 def _merge_split_sinuses(recs, spacing_xyz, notes):
     """Fuse bodies that are one sinus split by a partly-resolved ostium.
 
@@ -631,6 +728,11 @@ def drainage(
     # Keep only anatomically named leftovers; unnamed blobs at this stage are
     # mastoid / orbital air, not sinuses.
     res["sinuses"].extend(r for r in leftover_recs if r["name"] != "unknown")
+    # Correct frontal/maxillary BEFORE merging: _merge_split_sinuses groups by
+    # name and side, so a body renamed afterwards would already have been welded
+    # into the wrong group.
+    res["sinuses"] = refine_frontal_by_antral_roof(
+        res["sinuses"], body_labels, superior_is_high_z, res["notes"])
     res["sinuses"] = _merge_split_sinuses(res["sinuses"], spacing_xyz, res["notes"])
     res["sinuses"].sort(key=lambda r: -r["volume_ml"])
     res["body_labels"] = body_labels
