@@ -346,6 +346,139 @@ passage, is unioned back on; sinuses are inside the box and stay stripped).
 
 ---
 
+## 9c. Pipeline status and queue (2026-08-30)
+
+Answers the question "does the pipeline work, end to end?" stage by stage, with
+the evidence for each answer. Supersedes the stage claims in §12, which predate
+the 2026-08-24/30 fixes.
+
+### Stage status
+
+| # | Stage | State | Evidence |
+|---|-------|-------|----------|
+| 1 | Import CT + auto-segment | **works** | `qa_patency.py --all`: flow path PASS on all 5 audited cases (VH F, VH M, THCA, CQ500CT105, CQ500CT390). Bounded domain, L/R split, sinus bodies named. |
+| — | Operator labelling | **works, low yield** | 22 ostium sheets marked. Ostium location validated to **2.5 mm median** — at the noise floor, since two operator marks of the *same* ostium differ by 4.5 mm. |
+| — | Neural net | **works, wrong target** | nnU-Net Dataset501 airway Dice **0.885** vs classical 0.260. But **0/130** NasalSeg cases connect both cavities to the nasopharynx, so the labels cannot teach CFD topology. Not a retraining problem. |
+| 2 | Mesh boundary | **works (was silently broken until 2026-08-30)** | `export_openfoam_geometry.py` writes a solid air body plus open inlet/outlet/wall STL patches. Foam cases for VH F, VH M, THCA, P001, CQ500CT390. Re-exporting CQ500CT390 produced a **6-face, 0.00 mL** "watertight" body against a 38.91 mL mask and reported it as good — see §9d. Now guarded: the surface is compared against the voxel mask and the export raises if they are >15% apart. |
+| 3 | Mesh refinement | **works** | snappyHexMesh + layers. `checkMesh` **Mesh OK** on 3 of 4; non-orthogonality max ~64.5, average 13.4–14.3. Independence study on P001 at 74.9k / 259k / 817k cells → R = 0.0541 / 0.0522 / **0.0520** Pa·s/mL. 259k is independent to 0.3%. |
+| 4 | Airflow nares → trachea | **works, but every solve is stale** | 4 completed `simpleFoam` runs to 500 iterations, final p residual 1e-5–1e-4. **All solved in July against masks rebuilt in August.** No solve exists on the current segmentation. |
+| 5 | Sinus drainage | **works** | Per-sinus volume, ostium calibre and drains yes/no. Calibres 1.46–2.83 mm, inside the 0.2–6 mm anatomical range. Where no ostium resolves, `probable_ostium` returns a labelled hypothesis, never a number. |
+| 6 | Seeker paths to ostia | **centreline only** | `compute_surgical_guidance.py` produces naris→frontal paths and a high-\|u\| corridor. It models **no instrument geometry at all** — no diameter, no curvature, no bend, no clearance test. |
+| 7 | Virtual surgery | **geometry only** | `virtual_surgery.py` edits the airway and reports pre/post volume, MCA and L/R ratio. It writes an edited label so CFD *could* re-run; no pre/post CFD comparison has been run. |
+
+### The 20-minute budget
+
+Solve wall-clock alone, before segmentation and meshing:
+
+| case | cells | ExecutionTime | ClockTime |
+|------|-------|---------------|-----------|
+| VH female | 260,413 | 406 s | **434 s** |
+| P001 | 259,283 | 441 s | **474 s** |
+| THCA | 139,033 | 778 s | 1,495 s |
+| VH male | 240,479 | 1,271 s | 2,097 s |
+
+Two of four fit inside 20 minutes for the solve alone. The two that do not are
+not cell-count bound — THCA has the *fewest* cells and takes 3× the wall clock
+of P001 — so the variance is in convergence, not mesh size. None of the runs
+used a convergence criterion; they all ran to the 500-iteration cap, so the
+budget question is currently unanswerable from these logs.
+
+### 9d. The export collapse (found and fixed 2026-08-30)
+
+Worth recording because the failure was silent and three faults deep, each
+covering for the last:
+
+1. trimesh 4.x changed `simplify_quadric_decimation` to
+   `(percent, face_count, aggression)`. The positional call passed the 40,000
+   face target as *percent* and raised `target_reduction must be between 0 and 1`.
+2. A bare `except Exception` caught that and fell back to keeping every Nth face
+   via `np.linspace` — not decimation, but shredding the surface into loose
+   triangles. `_largest_component` then picked **6 of 266,060**, and `fill_holes`
+   closed them into a degenerate shell.
+3. The acceptance test asked only `is_watertight`. A closed shell of 6 triangles
+   *is* watertight and bounds nothing, so the ruin passed and the export printed
+   "watertight (good for snappyHexMesh)".
+
+Reproduced exactly on an icosphere: 5,120 faces → 8, volume 4.18 → 0.01.
+`fast_simplification` was also missing from the environment, which is what made
+the argument bug fatal rather than merely wrong; it is now installed, but none of
+the three fixes depend on it.
+
+The lesson generalises: **watertightness is a topological test and cannot detect
+a surface that bounds the wrong body.** The guard that catches it is comparing
+the mesh volume against the voxel mask it came from.
+
+### Queue
+
+Tagged by what unblocks each item: **[CODE]** implementable now, **[LABEL]**
+needs operator marks, **[NN]** needs a network, **[CFD]** needs a solve, **[DATA]**
+needs a better scan.
+
+**Blocking the end-to-end claim**
+
+1. **[CFD]** Re-solve at least one case on the current segmentation. Every foam
+   result on disk predates the 2026-08-24/30 interior-air and naris-snap fixes;
+   THCA's airway changed 117.4 → 110.6 mL, so its solve is against geometry that
+   no longer exists. **CQ500CT390 is staged and ready**: `analyze_passage` 1,075 s,
+   `export_openfoam_geometry` 86 s, `scaffold_openfoam_case` 3 s, surface 38.52 mL
+   against a 38.91 mL mask (1.0% apart), patches split
+   left 8,952 / right 8,618 / trachea 6,049 / wall 242,441 faces.
+   **Blocked only on the Docker daemon** — the CLI is installed (29.6.1) but
+   Docker Desktop is stopped, and the sole WSL distro is `docker-desktop`
+   itself, so there is no second route to a solver.
+2. **[CFD]** Add a residual convergence criterion and record time-to-converge.
+   Until then the 20-minute constraint cannot be evaluated.
+
+**Goal 1/3 correctness**
+
+3. **[CODE]** Sphenoid air is inside the CFD domain (THCA: 9.1 mL). `merge_zone`
+   is a posterior half-space, so it holds the sphenoid as well as the
+   nasopharynx. Needs a merge zone bounded by the choanal aperture. Narrowing the
+   veto to "half-space not itself behind a neck" was tried and **rejected** — it
+   carved the nasopharynx instead (bodies bounded at 6.5–11.5 mm openings).
+4. **[CODE]** Two non-sinuses still named `maxillary L` on VH male (neck air
+   1.89 mL, skull-base air 0.50 mL). The antral-roof anchor already measures them
+   at 58 and 109 mm below the roof against −20.2 mm for the lowest real sinus.
+   One threshold, not yet applied.
+5. **[CODE]** CQ500CT390's right maxillary antrum is never found. Its left is
+   found at 1.36 mL. Likely opacified or below the FOV — screen before fixing.
+6. **[DATA]** CQ500CT390's naris ports are not at the nostrils. The FOV is
+   brain-framed and the nostrils sit at or below its bottom edge, so the ports
+   fall back to the airway's anterior opening ~33 mm higher. Flow path still
+   passes, but "flow from the nares" is not literally true for that case.
+
+**Goal 4 — the biggest gap**
+
+7. **[CODE]** Instrument-fit checking does not exist. A centreline is not a path.
+   Needs clearance against each tool's real geometry: frontal seeker **2 mm
+   diameter** curved, maxillary and sphenoid seekers with their own curvature,
+   ET seeker ~4 in shaft with a **45° bend** and **18.5 mm** working tip past the
+   bend. This is a geometric feasibility problem, not a shortest-path problem.
+8. **[LABEL]** Frontal and sphenoid ostia resolve on **no** usable case — those
+   recesses are sub-millimetre. Operator marks on the frontal recess would give
+   `probable_ostium` something to be scored against.
+
+**Goal 5**
+
+9. **[CFD]** Run the pre/post pair through CFD. `virtual_surgery.py` already
+   writes the edited label; nothing has been solved on one.
+
+**Data**
+
+10. **[DATA]** 421 CQ500 scans still unscreened for a patent airway. `data/incoming`
+    is now 32.0 GB after deleting 625 thick series (6.03 GB, all ≥3 mm). The
+    screen must be re-run — its `internal_air_ml` used the same convex hull that
+    counted room air as internal, so old verdicts are inflated and were never
+    persisted.
+11. **[CODE]** `assess_dicom_incoming.eff_spacing_mm` prefers DICOM
+    `SpacingBetweenSlices` (0018,0088), which CQ500 fills with **20.0 mm for a
+    series named CT 0.625mm**. Use `SliceThickness` (0018,0050). Also: CQ500
+    filenames are **not in slice order**, so any z-step measured from consecutive
+    files by name is wrong — a genuine 0.625 mm series measures as 3.75 mm.
+
+
+---
+
 ## 10. Conventions and landmines
 
 - Arrays `(z, y, x)`; spacing/origin from SimpleITK. **High x ≈ patient left** on Visible Human.
