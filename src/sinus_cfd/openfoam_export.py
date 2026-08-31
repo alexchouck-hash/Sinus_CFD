@@ -42,14 +42,59 @@ class OpenFoamExportResult:
         return asdict(self)
 
 
-def _decimate(mesh: trimesh.Trimesh, target: int) -> trimesh.Trimesh:
+# A decimation that changes the enclosed volume by more than this is not a
+# simplification of the same body and is rejected. Quadric decimation on a real
+# airway surface moves the volume by ~0.2%; the failure mode it guards against
+# moved it by 100%.
+DECIMATION_MAX_VOLUME_CHANGE = 0.05
+# The exported surface must enclose the same volume as the sealed voxel mask.
+# Marching cubes plus Taubin smoothing on a real airway lands within a few
+# percent; anything past this is a broken surface, not a smoothed one.
+MESH_VS_VOXEL_MAX_REL_DIFF = 0.15
+
+
+def _decimate(mesh: trimesh.Trimesh, target: int) -> trimesh.Trimesh | None:
+    """Quadric-decimate to ``target`` faces, or None if that is not possible.
+
+    ``face_count=`` is passed by KEYWORD. trimesh 4.x changed the signature to
+    ``(percent, face_count, aggression)``, so a positional call sets *percent*
+    and raises ``target_reduction must be between 0 and 1``.
+
+    Returning None rather than falling back is deliberate. The old fallback took
+    ``np.linspace`` over the face array and kept every Nth triangle, which is not
+    decimation at all -- it shreds the surface into disconnected triangles. On
+    CQ500CT390 the caller's ``_largest_component`` then picked 6 triangles out of
+    266,060, ``fill_holes`` closed them into a degenerate shell, ``is_watertight``
+    returned True, and the export announced "watertight (good for
+    snappyHexMesh)" over a 0.00 mL body. A heavier mesh is a cost; a wrong one is
+    a wrong answer.
+    """
     if len(mesh.faces) <= target:
         return mesh
     try:
-        return mesh.simplify_quadric_decimation(target)
+        return mesh.simplify_quadric_decimation(face_count=int(target))
     except Exception:
-        idx = np.linspace(0, len(mesh.faces) - 1, target, dtype=int)
-        return trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces[idx], process=False)
+        return None
+
+
+def _decimation_kept_the_body(
+    before: trimesh.Trimesh, after: trimesh.Trimesh
+) -> tuple[bool, str]:
+    """Did decimation produce a simplification of the same solid, or a ruin?"""
+    if after is None or len(after.faces) < 4:
+        return False, f"collapsed to {0 if after is None else len(after.faces)} faces"
+    try:
+        v0 = abs(float(before.volume))
+        v1 = abs(float(after.volume))
+    except Exception:
+        return True, ""  # volume undefined on an open surface; topology tests stand
+    if v0 <= 0.0:
+        return True, ""
+    rel = abs(v1 - v0) / v0
+    if rel > DECIMATION_MAX_VOLUME_CHANGE:
+        return False, (f"volume changed {100 * rel:.1f}% "
+                       f"({v0 / 1000.0:.2f} -> {v1 / 1000.0:.2f} mL)")
+    return True, ""
 
 
 def _planar_cap_mesh(
@@ -335,25 +380,39 @@ def solid_mask_to_watertight_mesh(
     n_faces_raw = len(mesh.faces)
     if n_faces_raw > target_faces:
         simplified = _decimate(mesh, target_faces)
-        simplified = _largest_component(simplified)
-        # Re-fill after decimation (often opens small holes)
-        for _ in range(4):
-            if bool(simplified.is_watertight):
-                break
-            try:
-                simplified.fill_holes()
-            except Exception:
-                break
-        if bool(simplified.is_watertight) or not was_wt:
-            mesh = simplified
+        if simplified is None:
             notes.append(
-                f"Decimated solid mesh {n_faces_raw} → {len(mesh.faces)} faces."
+                f"Quadric decimation unavailable (install fast_simplification); "
+                f"keeping the full-resolution mesh ({n_faces_raw} faces)."
             )
         else:
-            # Keep denser mesh to preserve watertightness
-            notes.append(
-                f"Kept unsimplified solid mesh ({n_faces_raw} faces) to stay watertight."
-            )
+            simplified = _largest_component(simplified)
+            # Re-fill after decimation (often opens small holes)
+            for _ in range(4):
+                if bool(simplified.is_watertight):
+                    break
+                try:
+                    simplified.fill_holes()
+                except Exception:
+                    break
+            kept, why = _decimation_kept_the_body(mesh, simplified)
+            if not kept:
+                # is_watertight alone cannot catch this: a degenerate closed
+                # shell is watertight and bounds nothing.
+                notes.append(
+                    f"REJECTED decimation of the solid mesh -- {why}. "
+                    f"Keeping the full-resolution mesh ({n_faces_raw} faces)."
+                )
+            elif bool(simplified.is_watertight) or not was_wt:
+                mesh = simplified
+                notes.append(
+                    f"Decimated solid mesh {n_faces_raw} → {len(mesh.faces)} faces."
+                )
+            else:
+                # Keep denser mesh to preserve watertightness
+                notes.append(
+                    f"Kept unsimplified solid mesh ({n_faces_raw} faces) to stay watertight."
+                )
     try:
         mesh.fix_normals()
     except Exception:
@@ -512,8 +571,30 @@ def export_openfoam_geometry(
     )
     notes.extend(mesh_notes)
     is_wt = bool(solid_mesh.is_watertight)
+    # The surface must bound the SAME body the voxel mask does. Watertightness is
+    # a topological test and passes on a degenerate closed shell: CQ500CT390 once
+    # exported a 6-face, 0.00 mL "watertight" solid against a 38.91 mL mask and
+    # the run continued. This is the check that makes that a hard failure.
+    mesh_ml = 0.0
     if is_wt:
-        notes.append("solid_air_body mesh is watertight (good for snappyHexMesh).")
+        try:
+            mesh_ml = abs(float(solid_mesh.volume)) / 1000.0
+        except Exception:
+            mesh_ml = 0.0
+        rel = abs(mesh_ml - vol_closed_ml) / max(vol_closed_ml, 1e-9)
+        if rel > MESH_VS_VOXEL_MAX_REL_DIFF:
+            raise ValueError(
+                f"[{case_id}] solid_air_body surface encloses {mesh_ml:.2f} mL but the "
+                f"sealed voxel mask is {vol_closed_ml:.2f} mL ({100 * rel:.0f}% apart, "
+                f"limit {100 * MESH_VS_VOXEL_MAX_REL_DIFF:.0f}%). The surface does not "
+                f"represent the airway -- refusing to hand it to snappyHexMesh. "
+                f"faces={len(solid_mesh.faces)}, verts={len(solid_mesh.vertices)}."
+            )
+        notes.append(
+            f"solid_air_body mesh is watertight and encloses {mesh_ml:.2f} mL "
+            f"against a {vol_closed_ml:.2f} mL voxel mask "
+            f"({100 * rel:.1f}% apart) -- good for snappyHexMesh."
+        )
     else:
         notes.append(
             "WARNING: solid_air_body mesh is not fully watertight; "
