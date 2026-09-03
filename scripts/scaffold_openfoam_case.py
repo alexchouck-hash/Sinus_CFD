@@ -64,8 +64,17 @@ def _scale_stl_mm_to_m(src: Path, dst: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _write(path: Path, text: str) -> None:
+    """Write a case file with LF line endings, whatever the host platform.
+
+    Allrun/Allclean are bash scripts. Written in Windows text mode they get CRLF,
+    and bash then looks for the interpreter "/bin/bash" followed by a carriage
+    return -- the failure reads "./Allrun: cannot execute: required file not
+    found". OpenFOAM dictionaries tolerate CRLF; the shell scripts do not, so
+    everything is written LF.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text.lstrip("\n"), encoding="utf-8")
+    with path.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text.lstrip("\n"))
 
 
 def scaffold(
@@ -457,7 +466,16 @@ application     simpleFoam;
 startFrom       startTime;
 startTime       0;
 stopAt          endTime;
-endTime         500;
+// residualControl ends the run if p, U and turbulence all reach 1e-3. On real
+// airway meshes the p residual can plateau above that -- CQ500CT390 sat at
+// 3.8e-3 from iteration ~200 to 2000, pinned by two highly-skew boundary faces
+// where the flat nostril cap meets the curved wall -- while the inlet
+// pressures were flat to 0.17% from iteration 50. So the cap is the real stop,
+// and it is sized to the answer, not the residual: 400 iterations is ~8 min at
+// 312k cells and leaves a 2x margin over where dP settled. Convergence is then
+// JUDGED on the surfaceFieldValue history by import_openfoam_results.py, which
+// raises if the inlet pressure moved more than 1% over the last 3 samples.
+endTime         400;
 deltaT          1;
 writeControl    timeStep;
 writeInterval   50;
@@ -560,7 +578,14 @@ solvers
 SIMPLE
 {
     nNonOrthogonalCorrectors 2;
-    consistent      no;
+    // SIMPLEC. Under plain SIMPLE with p relaxed to 0.3 the pressure residual
+    // crawls -- measured on VisibleHuman_Head it went 1 -> 0.087 (iter 50) ->
+    // 0.020 (200) -> 0.0055 (500), a power-law decay still 5x above the 1e-3
+    // tolerance at the iteration cap. Every archived run hit the cap instead of
+    // converging, which is why the 20-minute budget could not be evaluated.
+    // SIMPLEC folds the neighbour-coefficient sum into the correction, so p
+    // needs no under-relaxation and U can run near 1.
+    consistent      yes;
     pRefCell        0;
     pRefValue       0;
     residualControl
@@ -573,14 +598,15 @@ SIMPLE
 
 relaxationFactors
 {
+    // SIMPLEC: p is not relaxed; the equations carry the relaxation.
     fields
     {
-        p               0.3;
+        p               1;
     }
     equations
     {
-        U               0.5;
-        ".*"            0.5;
+        U               0.9;
+        ".*"            0.9;
     }
 }
 """,
@@ -873,8 +899,18 @@ boundaryField
 set -e
 cd "${0%/*}" || exit 1
 
-# Source OpenFOAM (adjust to your install)
-if [ -f /usr/lib/openfoam/openfoam2312/etc/bashrc ]; then
+# The ESI bashrc returns non-zero when sourced from a non-interactive shell
+# (bash pop_var_context quirk in config.sh/setup). Under `set -e` that killed
+# this script before its first solver step, so source with -e off and verify
+# the binary is actually on PATH afterwards.
+set +e
+# Source OpenFOAM. 2412 first: it is the version the Docker image
+# (opencfd/openfoam-run:2412) runs, so a WSL solve stays comparable to an
+# archived Docker solve.
+if [ -f /usr/lib/openfoam/openfoam2412/etc/bashrc ]; then
+  # shellcheck disable=SC1091
+  source /usr/lib/openfoam/openfoam2412/etc/bashrc
+elif [ -f /usr/lib/openfoam/openfoam2312/etc/bashrc ]; then
   # shellcheck disable=SC1091
   source /usr/lib/openfoam/openfoam2312/etc/bashrc
 elif [ -f "$HOME/OpenFOAM/OpenFOAM-11/etc/bashrc" ]; then
@@ -884,6 +920,11 @@ elif [ -n "$WM_PROJECT_DIR" ]; then
   echo "Using existing OpenFOAM env: $WM_PROJECT_DIR"
 else
   echo "ERROR: OpenFOAM bashrc not found. Install OpenFOAM and source it first."
+  exit 1
+fi
+set -e
+if ! command -v simpleFoam >/dev/null 2>&1; then
+  echo "ERROR: simpleFoam not on PATH after sourcing OpenFOAM."
   exit 1
 fi
 
@@ -964,7 +1005,7 @@ chmod +x Allrun Allclean
 From Windows PowerShell with WSL:
 
 ```powershell
-wsl -e bash -lc "cd /mnt/c/Users/houck/Documents/Sinus_CFD/foam/{case_id} && ./Allrun"
+wsl -d Ubuntu-24.04 -u root -- bash -lc "cd /mnt/c/Users/houck/Sinus_CFD/foam/{case_id} && ./Allrun"
 ```
 
 (Adjust the path to your username/drive.)
@@ -999,9 +1040,18 @@ py -3.12 scripts\\scaffold_openfoam_case.py --case {case_id}
     _write(
         foam_root / "run_in_wsl.ps1",
         f"""# Run Allrun inside WSL (OpenFOAM must be installed in the distro)
-$caseUnix = (wsl wslpath -a "{foam_root.resolve()}").Trim()
+# Compute the /mnt/<drive>/... path in PowerShell. Shelling out to wslpath
+# through `wsl -d <distro> --` eats the backslashes in the Windows path (the
+# drive path arrived with every separator stripped) and returned nothing.
+$caseWin  = "{foam_root.resolve()}"
+$caseUnix = "/mnt/" + $caseWin.Substring(0,1).ToLower() + ($caseWin.Substring(2) -replace "\\\\","/")
 Write-Host "Case path in WSL: $caseUnix"
-wsl -e bash -lc "cd '$caseUnix' && chmod +x Allrun Allclean && ./Allrun"
+# The DEFAULT WSL distro on a Docker Desktop machine is docker-desktop, which has
+# no bash and no OpenFOAM. Name the solver distro explicitly; override with
+# $env:SINUS_CFD_WSL_DISTRO. Runs as root so apt-installed OpenFOAM needs no
+# per-user shell setup; NTFS under /mnt/c ignores Linux ownership anyway.
+$distro = if ($env:SINUS_CFD_WSL_DISTRO) {{ $env:SINUS_CFD_WSL_DISTRO }} else {{ "Ubuntu-24.04" }}
+wsl -d $distro -u root -- bash -lc "cd '$caseUnix' && chmod +x Allrun Allclean && ./Allrun"
 """,
     )
 

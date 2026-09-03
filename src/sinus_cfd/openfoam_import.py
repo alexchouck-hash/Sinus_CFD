@@ -40,9 +40,108 @@ class OpenFoamImportResult:
     method: str = "openfoam_simpleFoam"
     notes: list[str] = field(default_factory=list)
     out_npz: str = ""
+    pressure_drop: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+# simpleFoam is incompressible and solves KINEMATIC pressure (m^2/s^2); multiply
+# by density to report pascals.
+RHO_AIR_KG_M3 = 1.2
+# The quantity a surgeon acts on is the pressure drop, not the p residual. A
+# solve counts as converged when the inlet pressures have stopped moving: the
+# largest relative change across the last samples must be under this.
+DP_STABLE_MAX_REL = 0.01
+DP_STABLE_SAMPLES = 3
+
+
+def _read_surface_field_value(foam_root: Path, name: str) -> list[tuple[float, float]]:
+    """(time, value) rows from postProcessing/<name>/*/surfaceFieldValue.dat."""
+    rows: list[tuple[float, float]] = []
+    base = foam_root / "postProcessing" / name
+    if not base.is_dir():
+        return rows
+    for dat in sorted(base.rglob("surfaceFieldValue.dat")):
+        for line in dat.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            try:
+                rows.append((float(parts[0]), float(parts[1])))
+            except (IndexError, ValueError):
+                continue
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def pressure_drop_verdict(foam_root: Path) -> dict[str, Any] | None:
+    """Pressure drop, resistance and whether they had SETTLED when the run ended.
+
+    Reads the surfaceFieldValue history the scaffold writes every writeInterval.
+    Returns None when that history is absent (older cases). Raises when the
+    history exists but the inlet pressure was still moving by more than
+    ``DP_STABLE_MAX_REL`` over the last ``DP_STABLE_SAMPLES`` samples -- that is
+    a solve that stopped before it converged, and its resistance is not a
+    measurement.
+
+    Why this and not the p residual: on CQ500CT390 the first-corrector p
+    residual plateaued at 3.8e-3 against a 1e-3 residualControl and never
+    tripped it, while the inlet pressures were flat to 0.17% from iteration 50
+    onward. The residual floor was set by two highly-skew boundary faces where
+    the flat nostril cap meets the curved wall; the answer had long stopped
+    changing. Judging convergence on the residual would have called 40 minutes
+    of extra iterations necessary. They were not.
+    """
+    p_l = _read_surface_field_value(foam_root, "p_left_nostril")
+    p_r = _read_surface_field_value(foam_root, "p_right_nostril")
+    p_o = _read_surface_field_value(foam_root, "p_trachea")
+    q_o = _read_surface_field_value(foam_root, "Q_trachea")
+    if not (p_l and p_r and p_o and q_o):
+        return None
+
+    def last(rows, n):
+        return [v for _t, v in rows[-n:]]
+
+    def rel_change(vals):
+        ref = max(abs(vals[-1]), 1e-12)
+        return max(abs(v - vals[-1]) for v in vals) / ref
+
+    n = DP_STABLE_SAMPLES
+    rel_l = rel_change(last(p_l, n))
+    rel_r = rel_change(last(p_r, n))
+    worst = max(rel_l, rel_r)
+
+    pl, pr, po = p_l[-1][1], p_r[-1][1], p_o[-1][1]
+    q_m3_s = abs(q_o[-1][1])
+    dp_kin = 0.5 * (pl + pr) - po
+    dp_pa = RHO_AIR_KG_M3 * dp_kin
+    q_ml_s = q_m3_s * 1e6
+    r_pa_s_ml = dp_pa / q_ml_s if q_ml_s > 0 else float("nan")
+    out = {
+        "time": p_l[-1][0],
+        "n_samples": len(p_l),
+        "p_left_kin": pl, "p_right_kin": pr, "p_outlet_kin": po,
+        "dp_pa": dp_pa,
+        "dp_left_pa": RHO_AIR_KG_M3 * (pl - po),
+        "dp_right_pa": RHO_AIR_KG_M3 * (pr - po),
+        "q_m3_s": q_m3_s,
+        "q_L_min": q_m3_s * 6e4,
+        "resistance_pa_s_per_ml": r_pa_s_ml,
+        "stability_rel_change_last_samples": worst,
+        "stability_samples": n,
+        "stable": bool(worst <= DP_STABLE_MAX_REL),
+    }
+    if worst > DP_STABLE_MAX_REL:
+        raise ValueError(
+            f"simpleFoam stopped before the pressure drop settled: inlet pressure "
+            f"moved {100 * worst:.2f}% across the last {n} samples "
+            f"(limit {100 * DP_STABLE_MAX_REL:.1f}%). The resistance "
+            f"{r_pa_s_ml:.4f} Pa*s/mL is not a measurement; raise endTime or "
+            f"inspect the mesh. History: {foam_root / 'postProcessing'}"
+        )
+    return out
 
 
 _NUM_RE = re.compile(
@@ -608,6 +707,23 @@ def import_openfoam_to_grid(
             f,
         )
 
+    pressure_drop = pressure_drop_verdict(foam_root)
+    if pressure_drop is None:
+        notes.append(
+            "WARNING: no postProcessing/p_*/surfaceFieldValue.dat history; "
+            "pressure-drop convergence UNVERIFIED for this import."
+        )
+    else:
+        notes.append(
+            f"Pressure drop settled: inlet p moved "
+            f"{100 * pressure_drop['stability_rel_change_last_samples']:.2f}% over "
+            f"the last {pressure_drop['stability_samples']} samples. "
+            f"dP={pressure_drop['dp_pa']:.2f} Pa at "
+            f"{pressure_drop['q_L_min']:.1f} L/min -> "
+            f"R={pressure_drop['resistance_pa_s_per_ml']:.4f} Pa*s/mL "
+            f"(L {pressure_drop['dp_left_pa']:.2f} / R {pressure_drop['dp_right_pa']:.2f} Pa)."
+        )
+
     meta = {
         "case_id": case_id,
         "method": "openfoam_simpleFoam",
@@ -619,6 +735,7 @@ def import_openfoam_to_grid(
         "mean_speed_m_s": mean_speed,
         "target_flow_L_per_min": 18.0,
         "mesh_bbox_volume_m3": mesh_vol,
+        "pressure_drop": pressure_drop,
         "notes": notes,
     }
     # merge BC flow if present
@@ -644,4 +761,5 @@ def import_openfoam_to_grid(
         mesh_volume_m3=mesh_vol,
         notes=notes,
         out_npz=str(out_npz),
+        pressure_drop=pressure_drop,
     )
