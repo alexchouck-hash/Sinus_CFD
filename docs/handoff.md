@@ -373,16 +373,17 @@ Full chain on a living 0.38 mm scan, 312,652 cells, wall clock:
 | stage | time | note |
 |-------|------|------|
 | `process_whole_head` + `autosegment_ct` | ~4 min | segmentation |
-| `analyze_passage` | **1,075 s** | potential-flow *preview* + port masks — export needs only the port masks |
+| `analyze_passage --skip-flow` | **140 s** | port masks + centreline; the potential-flow *preview* (another ~935 s) is now opt-in via `auto_process_head --preview-flow` and the CFD never reads it |
 | `export_openfoam_geometry` | 86 s | |
 | `scaffold_openfoam_case` | 3 s | |
 | `snappyHexMesh` + layers | 309 s | |
 | `simpleFoam` to a settled dP | **~236 s** (≈200 iter × 1.18 s) | ran 2,000 iterations = 2,361 s; the last 1,800 changed dP by <0.2% |
 
-**Mesh + solve fit in ~9 minutes.** The whole chain does not, and the single
-largest item is `analyze_passage`, which spends 18 minutes on a potential-flow
-preview the CFD never uses. Separating the port-mask step from the preview is
-the one change that brings the full chain inside budget. Queue item 1.
+**The whole chain is now inside the budget: ~4 + 2.3 + 1.4 + 0.05 + 5.1 + 3.9
+≈ 17 minutes** on a 0.38 mm living scan, with the solve stopped where dP settles.
+The 18-minute potential-flow preview that used to sit on the road to export is
+opt-in. Verified the honest way: the fast path reproduces all five masks the
+solved case was built from **byte for byte** — after fixing what §9f describes.
 
 **What "converged" now means.** Every archived run had hit its 500-iteration
 cap without tripping `residualControl`. SIMPLEC (p 1 / U 0.9, replacing SIMPLE
@@ -451,6 +452,27 @@ The lesson generalises: **watertightness is a topological test and cannot detect
 a surface that bounds the wrong body.** The guard that catches it is comparing
 the mesh volume against the voxel mask it came from.
 
+### 9f. The import that moved the outlet (found and fixed 2026-09-01)
+
+The byte compare above failed the first time: `outlet_open` came back at 2,450
+voxels against the 1,780 the solver used — same lumen, same code. The cause was
+`import_openfoam_results.py`. It overwrote the outlet port's `center_mm` — the
+domain definition `analyze_passage` seeds the outlet cap from — with the
+*centroid* of the previous cap, "for viewer labels". The lumen clips the cap
+asymmetrically, so its centroid sits anterior of its own seed; writing it back
+moved the seed, and the next cap grew from there. One import walked the seed
+3 voxels (1.1 mm) anteriorly. Every import → re-analyze cycle would have walked
+it further. The CFD domain changed because a plot label was saved.
+
+Proven, not argued: rebuilding the cap from candidate seeds against the real
+port builder, only **(27,232,220)** — the pre-import seed — reproduces the
+solved geometry byte for byte; the post-import seed (27,229,220) gives 2,450.
+
+The marker now lives in `ports[].viewer_marker_mm`; `center_mm` is never
+touched by anything downstream of the geometry stages, and the viewer prefers
+the marker when present. This is the repo's "averaging positions" trap in a
+new coat: a downstream consumer editing an upstream definition.
+
 ### Queue
 
 Tagged by what unblocks each item: **[CODE]** implementable now, **[LABEL]**
@@ -459,66 +481,61 @@ needs a better scan.
 
 **Blocking the end-to-end claim**
 
-1. **[CODE]** Split the port-mask step out of `analyze_passage`. Export needs
-   only `passage_inlet_open` / `passage_outlet_open`; the 300-iteration
-   potential-flow preview that costs 18 minutes is a visualisation the CFD
-   never reads. This is the one item between the pipeline and the 20-minute
-   budget — mesh + solve already fit in ~9 minutes.
-2. **[CFD]** Calibrate magnitudes. Resistances are 4–500× below physiological.
+1. **[CFD]** Calibrate magnitudes. Resistances are 4–500× below physiological.
    First suspects, in order: planar nostril caps (no entrance loss), the nasal
    valve unresolved at 1 mm, laminar treatment. Validate against a published
    rhinomanometry case before any number leaves the viewer unlabelled.
-3. **[CFD]** Re-solve VH female, VH male, P001 and THCA on the current
+2. **[CFD]** Re-solve VH female, VH male, P001 and THCA on the current
    segmentation. All four July solves predate the interior-air and naris-snap
    fixes; THCA's airway changed 117.4 → 110.6 mL and its July run never settled
    (inlet pressure still moving 2.61% at the cap — the verdict now refuses it).
-4. **[CODE]** The two highly-skew faces sit where the flat inlet cap meets the
+3. **[CODE]** The two highly-skew faces sit where the flat inlet cap meets the
    curved wall. They pin the p residual floor at ~4e-3. A cap that follows the
    lumen cross-section, or a short straight inlet extrusion, would remove them
    and likely let `residualControl` fire on its own.
 
 **Goal 1/3 correctness**
 
-5. **[CODE]** Sphenoid air is inside the CFD domain (THCA: 9.1 mL). `merge_zone`
+4. **[CODE]** Sphenoid air is inside the CFD domain (THCA: 9.1 mL). `merge_zone`
    is a posterior half-space, so it holds the sphenoid as well as the
    nasopharynx. Needs a merge zone bounded by the choanal aperture. Narrowing the
    veto to "half-space not itself behind a neck" was tried and **rejected** — it
    carved the nasopharynx instead (bodies bounded at 6.5–11.5 mm openings).
-6. **[CODE]** Two non-sinuses still named `maxillary L` on VH male (neck air
+5. **[CODE]** Two non-sinuses still named `maxillary L` on VH male (neck air
    1.89 mL, skull-base air 0.50 mL). The antral-roof anchor already measures them
    at 58 and 109 mm below the roof against −20.2 mm for the lowest real sinus.
    One threshold, not yet applied.
-7. **[CODE]** CQ500CT390's right maxillary antrum is never found. Its left is
+6. **[CODE]** CQ500CT390's right maxillary antrum is never found. Its left is
    found at 1.36 mL. Likely opacified or below the FOV — screen before fixing.
-8. **[DATA]** CQ500CT390's naris ports are not at the nostrils. The FOV is
+7. **[DATA]** CQ500CT390's naris ports are not at the nostrils. The FOV is
    brain-framed and the nostrils sit at or below its bottom edge, so the ports
    fall back to the airway's anterior opening ~33 mm higher. Flow path still
    passes, but "flow from the nares" is not literally true for that case.
 
 **Goal 4 — the biggest gap**
 
-9. **[CODE]** Instrument-fit checking does not exist. A centreline is not a path.
+8. **[CODE]** Instrument-fit checking does not exist. A centreline is not a path.
    Needs clearance against each tool's real geometry: frontal seeker **2 mm
    diameter** curved, maxillary and sphenoid seekers with their own curvature,
    ET seeker ~4 in shaft with a **45° bend** and **18.5 mm** working tip past the
    bend. This is a geometric feasibility problem, not a shortest-path problem.
-10. **[LABEL]** Frontal and sphenoid ostia resolve on **no** usable case — those
+9. **[LABEL]** Frontal and sphenoid ostia resolve on **no** usable case — those
    recesses are sub-millimetre. Operator marks on the frontal recess would give
    `probable_ostium` something to be scored against.
 
 **Goal 5**
 
-11. **[CFD]** Run the pre/post pair through CFD. `virtual_surgery.py` already
+10. **[CFD]** Run the pre/post pair through CFD. `virtual_surgery.py` already
    writes the edited label; nothing has been solved on one.
 
 **Data**
 
-12. **[DATA]** 421 CQ500 scans still unscreened for a patent airway. `data/incoming`
+11. **[DATA]** 421 CQ500 scans still unscreened for a patent airway. `data/incoming`
     is now 32.0 GB after deleting 625 thick series (6.03 GB, all ≥3 mm). The
     screen must be re-run — its `internal_air_ml` used the same convex hull that
     counted room air as internal, so old verdicts are inflated and were never
     persisted.
-13. **[CODE]** `assess_dicom_incoming.eff_spacing_mm` prefers DICOM
+12. **[CODE]** `assess_dicom_incoming.eff_spacing_mm` prefers DICOM
     `SpacingBetweenSlices` (0018,0088), which CQ500 fills with **20.0 mm for a
     series named CT 0.625mm**. Use `SliceThickness` (0018,0050). Also: CQ500
     filenames are **not in slice order**, so any z-step measured from consecutive
