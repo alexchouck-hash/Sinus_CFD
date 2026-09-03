@@ -510,7 +510,8 @@ def export_openfoam_geometry(
     port_names_inlet: list[str] | None = None,
     port_name_outlet: str = "trachea",
     all_interior_air: np.ndarray | None = None,
-    include_sinuses: bool = True,
+    include_sinuses: bool = False,
+    sinus_exclude: np.ndarray | None = None,
     reference_image: sitk.Image | None = None,
     left_inlet_mask: np.ndarray | None = None,
     right_inlet_mask: np.ndarray | None = None,
@@ -524,6 +525,26 @@ def export_openfoam_geometry(
     notes: list[str] = []
 
     solid = build_solid_air_body(lumen, all_interior_air, include_sinuses)
+    # Hard guard: the solid the mesher receives must not hold the sinus air the
+    # strip removed. include_sinuses=True merged every interior-air component
+    # touching the passage -- the stripped sinuses at their ostia -- and was the
+    # default; it put 23.5 mL back into VH male after autosegment and
+    # analyze_passage had both kept the domain clean.
+    if sinus_exclude is not None:
+        excl = np.asarray(sinus_exclude).astype(bool)
+        if excl.shape == solid.shape and excl.any():
+            inside = float((solid & excl).sum()) / float(excl.sum())
+            if inside > 0.05:
+                raise ValueError(
+                    f"[{case_id}] {100 * inside:.0f}% of the stripped sinus air "
+                    f"({(solid & excl).sum() * float(np.prod(spacing)) / 1000.0:.1f} mL) "
+                    "is inside the solid air body; refusing to export a CFD domain "
+                    "that contains sinuses (CLAUDE.md goal 1)."
+                )
+            notes.append(
+                f"Stripped sinus air inside the solid body: {100 * inside:.1f}% -- "
+                "sinus-free domain preserved."
+            )
     sp_vol = float(np.prod(spacing))
     vol_ml = float(solid.sum() * sp_vol / 1000.0)
     notes.append(

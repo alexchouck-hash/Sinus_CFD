@@ -25,12 +25,26 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--case", default="VisibleHuman_Head")
     p.add_argument("--outputs-root", type=Path, default=REPO_ROOT / "outputs")
+    # Sinus-free is the DEFAULT. This used to be opt-in via --no-sinuses, and
+    # the default merged every interior-air component touching the passage back
+    # into the solid body -- which is exactly the stripped sinuses at their
+    # ostia. It re-added 23.5 mL to VH male after autosegment and
+    # analyze_passage had both kept the domain clean. CLAUDE.md goal 1: sinus
+    # air is out of the flow domain, kept and named for drainage.
+    p.add_argument(
+        "--include-sinuses",
+        action="store_true",
+        help="Merge connected sinus air into the solid body (NOT the CFD domain "
+             "the roadmap specifies; for comparison runs only)",
+    )
     p.add_argument(
         "--no-sinuses",
         action="store_true",
-        help="Solid air body = passage only (exclude connected sinus air)",
+        help="(default; kept for old command lines) Solid air body = passage only",
     )
     args = p.parse_args()
+    if args.include_sinuses and args.no_sinuses:
+        raise SystemExit("--include-sinuses and --no-sinuses contradict each other")
 
     case_dir = args.outputs_root / args.case
     lumen_p = case_dir / f"{args.case}_passage_lumen.nrrd"
@@ -53,8 +67,12 @@ def main() -> int:
     inlet = sitk.GetArrayFromImage(sitk.ReadImage(str(inlet_p))).astype(bool)
     outlet = sitk.GetArrayFromImage(sitk.ReadImage(str(outlet_p))).astype(bool)
     all_air = None
-    if all_air_p.is_file() and not args.no_sinuses:
+    if all_air_p.is_file() and args.include_sinuses:
         all_air = sitk.GetArrayFromImage(sitk.ReadImage(str(all_air_p))).astype(bool)
+    # The sinus air autosegment stripped: the export refuses a solid that holds it.
+    sinus_p = case_dir / f"{args.case}_sinus_detour.nrrd"
+    sinus_ex = (sitk.GetArrayFromImage(sitk.ReadImage(str(sinus_p))).astype(bool)
+                if sinus_p.is_file() and not args.include_sinuses else None)
 
     spacing = tuple(float(v) for v in lumen_img.GetSpacing())
     origin = tuple(float(v) for v in lumen_img.GetOrigin())
@@ -81,7 +99,8 @@ def main() -> int:
         spacing=spacing,
         origin=origin,
         all_interior_air=all_air,
-        include_sinuses=not args.no_sinuses,
+        include_sinuses=args.include_sinuses,
+        sinus_exclude=sinus_ex,
         reference_image=lumen_img,
         left_inlet_mask=left_m,
         right_inlet_mask=right_m,
