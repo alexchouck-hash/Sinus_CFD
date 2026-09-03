@@ -98,6 +98,11 @@ ANTRAL_ROOF_PCTILE = 95.0
 # The roof is the orbital floor, which is the anatomical line this question
 # actually turns on -- a frontal sinus is above the orbit, an antrum below it.
 FRONTAL_ABOVE_ANTRAL_ROOF_FRAC = 0.5
+# A body this far BELOW the antral roof is not a paranasal sinus. Every real
+# sinus measured sits between -20.2 mm (antral floor) and +39.3 mm (frontal);
+# the two non-sinuses that were being named "maxillary L" on VH male -- neck air
+# and skull-base air -- sit at -58.2 and -109.0 mm. 45 mm splits the gap.
+SINUS_MAX_BELOW_ANTRAL_ROOF_MM = 45.0
 
 
 def inside_edt_mm(mask, spacing_xyz):
@@ -445,7 +450,7 @@ def _antral_roof_z(recs, body_labels, superior_is_high_z):
 
 
 def refine_frontal_by_antral_roof(
-    recs, body_labels, superior_is_high_z, notes=None
+    recs, body_labels, superior_is_high_z, notes=None, spacing_xyz=None
 ):
     """Rename as frontal any body sitting above the maxillary antral roof.
 
@@ -476,6 +481,19 @@ def refine_frontal_by_antral_roof(
             continue
         frac = float((zz * ssup > roof).mean())
         r["frac_above_antral_roof"] = round(frac, 2)
+        if spacing_xyz is not None:
+            sz = float(spacing_xyz[2])
+            dz_mm = (float(zz.mean()) * ssup - roof) * sz
+            r["mm_above_antral_roof"] = round(dz_mm, 1)
+            if dz_mm < -SINUS_MAX_BELOW_ANTRAL_ROOF_MM:
+                if notes is not None:
+                    notes.append(
+                        f"dropped {r['name']} {r['side']} ({r['volume_ml']:.2f} mL): "
+                        f"{-dz_mm:.0f} mm below the maxillary antral roof -- not a "
+                        "paranasal sinus (neck or skull-base air)"
+                    )
+                r["name"] = "unknown"
+                continue
         if frac >= FRONTAL_ABOVE_ANTRAL_ROOF_FRAC and r["name"] != "frontal":
             if notes is not None:
                 notes.append(
@@ -732,7 +750,11 @@ def drainage(
     # name and side, so a body renamed afterwards would already have been welded
     # into the wrong group.
     res["sinuses"] = refine_frontal_by_antral_roof(
-        res["sinuses"], body_labels, superior_is_high_z, res["notes"])
+        res["sinuses"], body_labels, superior_is_high_z, res["notes"],
+        spacing_xyz=spacing_xyz)
+    # The antral-roof pass can also RE-classify a body as not-a-sinus (neck or
+    # skull-base air far below the roof); those must not reach the report.
+    res["sinuses"] = [r for r in res["sinuses"] if r["name"] != "unknown"]
     res["sinuses"] = _merge_split_sinuses(res["sinuses"], spacing_xyz, res["notes"])
     res["sinuses"].sort(key=lambda r: -r["volume_ml"])
     res["body_labels"] = body_labels

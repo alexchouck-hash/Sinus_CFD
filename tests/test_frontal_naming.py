@@ -110,3 +110,36 @@ def test_the_anchor_is_picked_on_geometry_not_on_the_provisional_name():
     assert {tuple(a["body_ids"]) for a in anchors} == {(1,), (2,)}
     out = refine_frontal_by_antral_roof(recs, lab, True, [])
     assert {r["body_ids"][0] for r in out if r["name"] == "frontal"} == {1, 3}
+
+
+def test_air_far_below_the_antral_roof_is_not_a_sinus():
+    """VH male's neck air (1.89 mL) and skull-base air (0.50 mL) were named
+    maxillary L. They sit 58 and 109 mm below the antral roof; no real sinus
+    measured sits more than 20.2 mm below it.
+    """
+    lab = np.zeros((70, 30, 60), dtype=np.int32)
+    lab[40:54, 8:22, 38:52] = 1      # antrum L   (roof ~53)
+    lab[40:54, 8:22, 8:22] = 2       # antrum R
+    lab[2:7, 8:18, 30:40] = 3        # ~49 mm below the roof at 1 mm: neck air
+    lab[32:38, 8:18, 26:34] = 4      # ~18 mm below the roof: a real low body
+    recs = [
+        dict(name="maxillary", side="L", volume_ml=14.0, off_midline_mm=+22.0, body_ids=[1]),
+        dict(name="maxillary", side="R", volume_ml=12.0, off_midline_mm=-22.0, body_ids=[2]),
+        dict(name="maxillary", side="L", volume_ml=1.9, off_midline_mm=+17.6, body_ids=[3]),
+        dict(name="ethmoid", side="R", volume_ml=0.6, off_midline_mm=-4.0, body_ids=[4]),
+    ]
+    notes = []
+    out = refine_frontal_by_antral_roof(recs, lab, True, notes, spacing_xyz=(1.0, 1.0, 1.0))
+    by_id = {r["body_ids"][0]: r for r in out}
+    assert by_id[3]["name"] == "unknown", by_id[3]
+    assert by_id[3]["mm_above_antral_roof"] < -45.0
+    assert any("not a paranasal sinus" in n for n in notes), notes
+    assert by_id[4]["name"] == "ethmoid" and by_id[4]["mm_above_antral_roof"] > -45.0
+    assert by_id[1]["name"] == "maxillary" and by_id[2]["name"] == "maxillary"
+
+
+def test_without_spacing_the_gate_is_skipped():
+    lab, recs = _scene()
+    out = refine_frontal_by_antral_roof(recs, lab, True, [])
+    assert all("mm_above_antral_roof" not in r for r in out)
+    assert all(r["name"] != "unknown" for r in out)
