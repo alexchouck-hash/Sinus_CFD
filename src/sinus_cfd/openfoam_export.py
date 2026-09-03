@@ -605,16 +605,25 @@ def export_openfoam_geometry(
         "1" if is_wt else "0", encoding="utf-8"
     )
 
-    # Interior seed for snappy locationInMesh (mm): centroid of sealed mask
-    zz, yy, xx = np.where(solid_closed)
+    # Interior seed for snappy locationInMesh (mm): the voxel FARTHEST from any
+    # wall, never the centroid. A nasal airway is a thin curved sheet, so its
+    # centroid lands beside a wall -- CQ500CT390's sat 0.85 mm from one, and
+    # snappy then keeps the background box instead of the lumen. The same
+    # averaging-positions trap already bit the naris and outlet ports.
     sx, sy, sz = spacing
     ox, oy, oz = origin
-    if len(zz):
+    if solid_closed.any():
+        edt = ndi.distance_transform_edt(solid_closed, sampling=(sz, sy, sx))
+        iz, iy, ix = np.unravel_index(int(np.argmax(edt)), edt.shape)
         loc_mm = [
-            float(ox + xx.mean() * sx),
-            float(oy + yy.mean() * sy),
-            float(oz + zz.mean() * sz),
+            float(ox + ix * sx),
+            float(oy + iy * sy),
+            float(oz + iz * sz),
         ]
+        notes.append(
+            f"locationInMesh seed is {float(edt[iz, iy, ix]):.2f} mm from the nearest "
+            "wall (deepest interior voxel)."
+        )
     else:
         b = solid_mesh.bounds
         loc_mm = (0.5 * (b[0] + b[1])).tolist()
