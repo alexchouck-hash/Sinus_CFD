@@ -241,6 +241,7 @@ def seal_solid_for_watertight_mesh(
     solid: np.ndarray,
     port_masks: list[np.ndarray | None],
     close_radius: int = 2,
+    exclude: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Close open nares/trachea holes so marching cubes yields a closed shell.
@@ -250,8 +251,20 @@ def seal_solid_for_watertight_mesh(
       2. Morphological closing
       3. binary_fill_holes (multiple passes)
       4. Keep largest connected component
+
+    ``exclude`` is air that must stay OUT of the sealed solid: the sinus bodies
+    the strip removed. Each is a 3-D hole in the passage, so the two
+    whole-solid fill passes below refilled every one of them -- on VH male the
+    passage went in clean (47.6 mL, 0.00 mL sinus) and the sealed solid came
+    out at 75.4 mL holding 23.55 of the 23.5 mL that had been stripped. The
+    exclusion is applied after every morphological step.
     """
     sealed = solid.astype(bool)
+    excl = None if exclude is None else np.asarray(exclude).astype(bool)
+
+    def _keep_out(m: np.ndarray) -> np.ndarray:
+        return m if excl is None else (m & ~excl)
+
     ball_port = morphology.ball(max(close_radius + 1, 2))
     for pm in port_masks:
         if pm is None:
@@ -260,13 +273,14 @@ def seal_solid_for_watertight_mesh(
         if not pm.any():
             continue
         sealed = sealed | morphology.dilation(pm, footprint=ball_port)
+    sealed = _keep_out(sealed)
 
     ball = morphology.ball(close_radius)
-    sealed = morphology.closing(sealed, footprint=ball)
-    sealed = ndi.binary_fill_holes(sealed)
+    sealed = _keep_out(morphology.closing(sealed, footprint=ball))
+    sealed = _keep_out(ndi.binary_fill_holes(sealed))
     # Second close catches residual tunnels
-    sealed = morphology.closing(sealed, footprint=morphology.ball(1))
-    sealed = ndi.binary_fill_holes(sealed)
+    sealed = _keep_out(morphology.closing(sealed, footprint=morphology.ball(1)))
+    sealed = _keep_out(ndi.binary_fill_holes(sealed))
 
     lab, n = ndi.label(sealed)
     if n > 1:
@@ -572,11 +586,30 @@ def export_openfoam_geometry(
         solid,
         port_masks=[left_inlet_mask, right_inlet_mask, outlet_open],
         close_radius=2,
+        exclude=sinus_exclude,
     )
     vol_closed_ml = float(solid_closed.sum() * sp_vol / 1000.0)
     notes.append(
         f"Sealed solid (ports closed) voxel volume = {vol_closed_ml:.2f} mL."
     )
+    # The guard that matters is on the SEALED solid -- that is what is written
+    # and meshed. The pre-seal check above passed on VH male while the seal's
+    # fill passes put 23.55 of 23.5 mL of sinus back.
+    if sinus_exclude is not None:
+        excl = np.asarray(sinus_exclude).astype(bool)
+        if excl.shape == solid_closed.shape and excl.any():
+            inside = float((solid_closed & excl).sum()) / float(excl.sum())
+            if inside > 0.05:
+                raise ValueError(
+                    f"[{case_id}] {100 * inside:.0f}% of the stripped sinus air "
+                    f"({(solid_closed & excl).sum() * sp_vol / 1000.0:.1f} mL) is inside "
+                    "the SEALED solid air body; refusing to export a CFD domain that "
+                    "contains sinuses (CLAUDE.md goal 1)."
+                )
+            notes.append(
+                f"Stripped sinus air inside the sealed solid: {100 * inside:.1f}% -- "
+                "sinus-free domain preserved through sealing."
+            )
 
     # Save sealed solid air mask (what snappy should keep as fluid)
     solid_img = sitk.GetImageFromArray(solid_closed.astype(np.uint8))

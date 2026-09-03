@@ -32,6 +32,13 @@ def _scene():
     passage[10:20, 5:55, 10:20] = True
     sinus = np.zeros_like(passage)
     sinus[12:18, 25:33, 19:27] = True          # x=19 is shared with the tube
+    # A second body that is a true 3-D HOLE in the passage: a chamber carved
+    # out of the tube's interior, the way the dead-end strip leaves a sinus.
+    # The seal's whole-solid fill passes refill exactly this shape.
+    cavity = np.zeros_like(passage)
+    cavity[13:17, 40:46, 13:17] = True
+    passage &= ~cavity
+    sinus |= cavity
     sinus_only = sinus & ~passage
     all_air = passage | sinus
     inlet = np.zeros_like(passage); inlet[10:20, 5:7, 10:20] = True
