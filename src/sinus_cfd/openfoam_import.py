@@ -62,7 +62,13 @@ def _read_surface_field_value(foam_root: Path, name: str) -> list[tuple[float, f
     base = foam_root / "postProcessing" / name
     if not base.is_dir():
         return rows
-    for dat in sorted(base.rglob("surfaceFieldValue.dat")):
+    # OpenFOAM does not overwrite an existing surfaceFieldValue.dat; a re-run in
+    # a case that still holds an old history writes surfaceFieldValue_0.dat,
+    # _1.dat, ... beside it. Globbing only the bare name read a July history for
+    # a September solve on VisibleHuman_Male_Head and called it settled. Take
+    # the NEWEST file, and only that one.
+    dats = sorted(base.rglob("surfaceFieldValue*.dat"), key=lambda p: p.stat().st_mtime)
+    for dat in dats[-1:]:
         for line in dat.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
@@ -353,6 +359,44 @@ def cell_centres_from_poly_mesh(
     return sum_xyz / count[:, None]
 
 
+def _time_dirs_desc(foam_case: Path) -> list[str]:
+    """Numeric time directories that hold a U field, newest first."""
+    out: list[tuple[float, str]] = []
+    for p in foam_case.iterdir():
+        if not p.is_dir() or p.name in ("constant", "system"):
+            continue
+        if not (p / "U").is_file():
+            continue
+        try:
+            out.append((float(p.name), p.name))
+        except ValueError:
+            continue
+    return [n for _t, n in sorted(out, reverse=True)]
+
+
+def select_time_dir_matching_cells(foam_case: Path, n_cells: int) -> str | None:
+    """Latest time directory whose U field has exactly ``n_cells`` entries.
+
+    A case directory that was solved more than once can hold time directories
+    from different meshes. The newest number is not the newest run: OpenFOAM
+    leaves old time directories in place, so a re-solve to endTime 400 sits
+    beside an earlier run's 500/. The field that fits the mesh is the one from
+    this mesh. None when no time directory fits.
+    """
+    for name in _time_dirs_desc(foam_case):
+        if float(name) == 0.0:
+            continue  # the initial condition is not a solve
+        try:
+            u = read_foam_vector_field(foam_case / name / "U")
+        except Exception:
+            continue
+        if u.shape[0] == 1:
+            continue  # a uniform field fits every mesh and proves nothing
+        if u.shape[0] == n_cells:
+            return name
+    return None
+
+
 def latest_time_dir(foam_case: Path) -> str:
     times: list[tuple[float, str]] = []
     for p in foam_case.iterdir():
@@ -464,6 +508,27 @@ def import_openfoam_to_grid(
     U = read_foam_vector_field(u_path)
     if U.shape[0] == 1 and n_cells > 1:
         U = np.repeat(U, n_cells, axis=0)
+    if U.shape[0] != n_cells:
+        # A field that does not fit the mesh is from ANOTHER mesh. This used to
+        # truncate or pad and carry on: on VisibleHuman_Male_Head a September
+        # solve (127,198 cells, written to 400/) sat beside July's untouched
+        # 500/ (240,479 cells); latest_time_dir took 500, and July's velocities
+        # were padded onto the new mesh and reported as the new result.
+        picked = select_time_dir_matching_cells(foam_root, n_cells)
+        if picked is None:
+            raise ValueError(
+                f"[{case_id}] no time directory holds a U field with {n_cells} "
+                f"entries (mesh cell count); latest '{time_name}' has {U.shape[0]}. "
+                "The solve and the mesh in this case directory are from different "
+                "runs. Clean stale time directories (Allclean) and re-solve."
+            )
+        notes.append(
+            f"time '{time_name}' has {U.shape[0]} U entries for a {n_cells}-cell mesh "
+            f"(stale run); using '{picked}', the latest time whose field fits."
+        )
+        time_name = picked
+        u_path = foam_root / time_name / "U"
+        U = read_foam_vector_field(u_path)
     if U.shape[0] != n_cells:
         notes.append(
             f"WARNING: U has {U.shape[0]} entries, mesh has {n_cells} cells — truncating/padding."
