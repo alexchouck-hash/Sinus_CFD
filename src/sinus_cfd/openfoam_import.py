@@ -375,6 +375,37 @@ def latest_time_dir(foam_case: Path) -> str:
     return times[-1][1]
 
 
+def persist_outlet_viewer_marker(bc_path: Path, marker_mm) -> dict[str, Any]:
+    """Record where the viewer should draw the outlet -- WITHOUT moving the outlet.
+
+    ``ports[].center_mm`` is the domain definition: ``analyze_passage`` seeds the
+    outlet_open cap from the lumen voxel nearest to it, and export, scaffold and
+    the solve all descend from that cap. This function used to overwrite it with
+    the *centroid* of the previous cap "for viewer labels". The lumen clips the
+    cap asymmetrically, so its centroid sits anterior of its own seed; writing it
+    back moved the seed, the next cap grew from the new seed, and its centroid
+    sat further forward still. On CQ500CT390 one import walked the seed 3 voxels
+    (1.1 mm) anteriorly and the outlet cap from 1,780 to 2,450 voxels -- the CFD
+    domain changed because a plot label was saved. Proven by rebuilding the cap
+    from candidate seeds: only (27,232,220), the pre-import seed, reproduces the
+    solved geometry byte for byte.
+
+    The marker now lives in its own field. ``center_mm`` is never touched here.
+    """
+    bc = json.loads(bc_path.read_text(encoding="utf-8"))
+    touched = []
+    for port in bc.get("ports", []):
+        if port.get("role") == "outlet" or port.get("name") == "trachea":
+            port["viewer_marker_mm"] = [float(v) for v in marker_mm]
+            port["viewer_marker_method"] = "passage_outlet_open_centroid"
+            port["viewer_marker_note"] = (
+                "Display position only. The outlet the solver used is center_mm."
+            )
+            touched.append(port.get("name"))
+    bc_path.write_text(json.dumps(bc, indent=2), encoding="utf-8")
+    return {"ports": touched, "marker_mm": [float(v) for v in marker_mm]}
+
+
 def import_openfoam_to_grid(
     case_id: str = "VisibleHuman_Head",
     foam_root: Path | str | None = None,
@@ -599,22 +630,17 @@ def import_openfoam_to_grid(
     if not inlet_centers and skin_naris_centers:
         inlet_centers = list(skin_naris_centers)
 
-    # Persist corrected trachea location into BC JSON for the viewer
+    # Viewer marker for the outlet. NEVER written into center_mm -- see the
+    # helper's docstring for the ratchet that caused.
     if bc_path.is_file() and outlet_center is not None:
         try:
-            bc_fix = json.loads(bc_path.read_text(encoding="utf-8"))
-            for port in bc_fix.get("ports", []):
-                if port.get("role") == "outlet" or port.get("name") == "trachea":
-                    port["center_mm"] = outlet_center
-                    port["method"] = "passage_outlet_open_centroid"
-                    port["notes"] = (
-                        "Caudal airway outlet (trachea direction) from passage "
-                        "outlet_open mask centroid — not maxillary sinus."
-                    )
-            bc_path.write_text(json.dumps(bc_fix, indent=2), encoding="utf-8")
-            notes.append("Updated BC trachea center_mm for viewer labels.")
+            persist_outlet_viewer_marker(bc_path, outlet_center)
+            notes.append(
+                "Outlet viewer marker written to BC ports[].viewer_marker_mm "
+                "(center_mm left untouched)."
+            )
         except Exception as exc:
-            notes.append(f"Could not update BC trachea center: {exc}")
+            notes.append(f"Could not write outlet viewer marker: {exc}")
 
     # Streamlines restricted to passage lumen (no sinus chambers)
     domain = airway & mapped

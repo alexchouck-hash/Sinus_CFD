@@ -117,8 +117,11 @@ def main() -> int:
 
         amesh = _mask_to_mesh(masks["lumen"], spacing, origin)
         if len(amesh.faces) > 30000:
+            # face_count= by KEYWORD: trimesh 4.x made the first positional
+            # argument `percent`, which raises and (here) silently kept the
+            # full mesh. Same trap that collapsed the OpenFOAM export to 6 faces.
             try:
-                amesh = amesh.simplify_quadric_decimation(30000)
+                amesh = amesh.simplify_quadric_decimation(face_count=30000)
             except Exception:
                 pass
         amesh.export(case_dir / f"{args.case}_airway.stl")

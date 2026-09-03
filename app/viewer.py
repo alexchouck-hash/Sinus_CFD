@@ -2036,9 +2036,11 @@ def _fig_3d(
                 )
             )
 
-    # Port markers — tip-accurate nares + trachea only (no per-path clutter)
+    # Port markers — tip-accurate nares + trachea only (no per-path clutter).
+    # A display-only marker may be recorded separately by the OpenFOAM import;
+    # center_mm is the solver's outlet and is never rewritten for the viewer.
     for port in ports:
-        c = port.get("center_mm", [0, 0, 0])
+        c = port.get("viewer_marker_mm") or port.get("center_mm", [0, 0, 0])
         is_inlet = port.get("role") == "inlet"
         name = str(port.get("name", "port"))
         if is_inlet:
