@@ -50,9 +50,19 @@ class OpenFoamImportResult:
 # by density to report pascals.
 RHO_AIR_KG_M3 = 1.2
 # The quantity a surgeon acts on is the pressure drop, not the p residual. A
-# solve counts as converged when the inlet pressures have stopped moving: the
-# largest relative change across the last samples must be under this.
-DP_STABLE_MAX_REL = 0.01
+# solve counts as converged when the inlet pressure has stopped MOVING. Two
+# statistics, both always reported, each with its own bound:
+#   drift  -- mean of the last DP_STABLE_SAMPLES against the mean of the ones
+#             before them. A trend fails this; oscillation averages out.
+#   wobble -- largest relative change within the last window. The amplitude.
+# Measured on five solved cases: drift 0.05-0.52%, wobble 0.26-2.06%. THCA sat
+# at wobble 1.53% for 400 extra iterations while its resistance moved 0.6% --
+# a per-sample rule at 1% called that unconverged; the drift rule (0.08%) does
+# not. The choked-outlet guard is separate and catches the case whose wobble
+# was harmless but whose cap was not (VH female, 41x).
+DP_DRIFT_MAX_REL = 0.01
+DP_WOBBLE_MAX_REL = 0.03
+DP_STABLE_MAX_REL = DP_DRIFT_MAX_REL   # legacy name
 DP_STABLE_SAMPLES = 3
 
 
@@ -114,10 +124,22 @@ def pressure_drop_verdict(foam_root: Path) -> dict[str, Any] | None:
         ref = max(abs(vals[-1]), 1e-12)
         return max(abs(v - vals[-1]) for v in vals) / ref
 
+    def drift(rows, n):
+        # mean of the last n samples against the mean of the n before them:
+        # the answer is still moving if these disagree. Oscillation between
+        # samples averages out; a trend does not.
+        vals = [v for _t, v in rows]
+        if len(vals) < 2 * n:
+            return float("nan")
+        a = float(np.mean(vals[-n:]))
+        b = float(np.mean(vals[-2 * n:-n]))
+        return abs(a - b) / max(abs(a), 1e-12)
+
     n = DP_STABLE_SAMPLES
     rel_l = rel_change(last(p_l, n))
     rel_r = rel_change(last(p_r, n))
-    worst = max(rel_l, rel_r)
+    worst = max(rel_l, rel_r)                       # wobble: amplitude within the window
+    drift_worst = max(drift(p_l, n), drift(p_r, n))  # drift: is the window still moving
 
     pl, pr, po = p_l[-1][1], p_r[-1][1], p_o[-1][1]
     q_m3_s = abs(q_o[-1][1])
@@ -135,17 +157,27 @@ def pressure_drop_verdict(foam_root: Path) -> dict[str, Any] | None:
         "q_m3_s": q_m3_s,
         "q_L_min": q_m3_s * 6e4,
         "resistance_pa_s_per_ml": r_pa_s_ml,
-        "stability_rel_change_last_samples": worst,
+        "stability_rel_change_last_samples": worst,   # kept: this is the wobble
+        "wobble_rel_change": worst,
+        "drift_rel_change": drift_worst,
         "stability_samples": n,
-        "stable": bool(worst <= DP_STABLE_MAX_REL),
+        "stable": False,
     }
-    if worst > DP_STABLE_MAX_REL:
+    drift_ok = (drift_worst != drift_worst) or drift_worst <= DP_DRIFT_MAX_REL  # nan: too few samples to judge drift
+    wobble_ok = worst <= DP_WOBBLE_MAX_REL
+    out["stable"] = bool(drift_ok and wobble_ok)
+    if not out["stable"]:
+        why = []
+        if not drift_ok:
+            why.append(f"the window mean is still DRIFTING {100 * drift_worst:.2f}% "
+                       f"(limit {100 * DP_DRIFT_MAX_REL:.1f}%)")
+        if not wobble_ok:
+            why.append(f"inlet pressure WOBBLES {100 * worst:.2f}% within the last {n} "
+                       f"samples (limit {100 * DP_WOBBLE_MAX_REL:.1f}%)")
         raise ValueError(
-            f"simpleFoam stopped before the pressure drop settled: inlet pressure "
-            f"moved {100 * worst:.2f}% across the last {n} samples "
-            f"(limit {100 * DP_STABLE_MAX_REL:.1f}%). The resistance "
-            f"{r_pa_s_ml:.4f} Pa*s/mL is not a measurement; raise endTime or "
-            f"inspect the mesh. History: {foam_root / 'postProcessing'}"
+            f"simpleFoam stopped before the pressure drop settled: {'; '.join(why)}. "
+            f"The resistance {r_pa_s_ml:.4f} Pa*s/mL is not a measurement; raise "
+            f"endTime or inspect the mesh. History: {foam_root / 'postProcessing'}"
         )
     return out
 
@@ -217,6 +249,51 @@ def read_foam_label_list(path: Path) -> np.ndarray:
     body = _find_list_body(text)
     nums = re.findall(r"-?\d+", body)
     return np.asarray([int(x) for x in nums], dtype=np.int64)
+
+
+# Largest face speed on the outlet patch, as a multiple of the patch mean. A
+# healthy outlet cap sees 2.5-3.5x (THCA, CQ500CT390, P001, both Visible Human
+# heads at the choana). The choked caudal trachea caps saw 57x (VH female) and
+# 8x (VH male, which also never settled). 10x sits between the populations with
+# the marginal case on the failing side.
+OUTLET_HOT_FACE_MAX_RATIO = 10.0
+
+
+def outlet_patch_velocity_stats(u_path: Path, patch: str) -> dict[str, float] | None:
+    """Per-face |U| statistics on one boundary patch of a volVectorField.
+
+    Returns None when the patch has no nonuniform value list (uniform, or not
+    written). This is the post-solve test the pre-solve geometry could not
+    provide: the cap's shape (PCA axes) and its position (touching the image
+    boundary) both failed to separate the choked Visible Human trachea outlets
+    from clean ones -- every cap is a fat 6 mm ball clipped by the lumen, and
+    none touches the volume edge. The solved field separates them at 15x.
+    """
+    text = _strip_foam_comments(u_path.read_text(encoding="utf-8", errors="replace"))
+    m = re.search(r"boundaryField\s*\{(.*)\}\s*$", text, re.S)
+    body = m.group(1) if m else text
+    pm = re.search(r"\b" + re.escape(patch) + r"\s*\{(.*?)\n\s*\}", body, re.S)
+    if not pm:
+        return None
+    vm = re.search(r"value\s+nonuniform\s+List<vector>\s*(\d+)\s*\((.*?)\)\s*;", pm.group(1), re.S)
+    if not vm:
+        return None
+    vals = np.array(
+        re.findall(r"\(\s*([-+eE0-9.]+)\s+([-+eE0-9.]+)\s+([-+eE0-9.]+)\s*\)", vm.group(2)),
+        dtype=float,
+    )
+    if vals.size == 0:
+        return None
+    speed = np.linalg.norm(vals, axis=1)
+    mean = float(speed.mean())
+    ratio = float(speed.max() / mean) if mean > 0 else float("inf")
+    return {
+        "n_faces": int(len(speed)),
+        "max_m_s": float(speed.max()),
+        "mean_m_s": mean,
+        "max_over_mean": ratio,
+        "hot_faces": int((speed > 5.0 * mean).sum()) if mean > 0 else int(len(speed)),
+    }
 
 
 def read_foam_vector_field(path: Path) -> np.ndarray:
@@ -798,7 +875,56 @@ def import_openfoam_to_grid(
             f,
         )
 
+    # Outlet patch health, read off the solved field. A choked cap puts the whole
+    # pressure drop on a few faces; the number that comes out is then about the
+    # cap, not the airway, and must not be reported.
+    outlet_patch = None
+    outlet_name = "trachea"
+    if bc_path.is_file():
+        try:
+            outlet_name = str(json.loads(bc_path.read_text(encoding="utf-8")).get("outlet_name") or "trachea")
+        except Exception:
+            pass
+    # The scaffold always names the mesh outlet patch "trachea" whatever the BC
+    # calls the port (P001's BC says trachea_outlet_proxy). Try the mesh name
+    # first, then the BC name; and never stay silent when neither reads.
+    outlet_patch_name = None
+    for cand in dict.fromkeys(["trachea", outlet_name]):
+        try:
+            stats = outlet_patch_velocity_stats(u_path, cand)
+        except Exception as exc:
+            notes.append(f"Could not read outlet patch '{cand}': {exc}")
+            stats = None
+        if stats is not None:
+            outlet_patch, outlet_patch_name = stats, cand
+            break
+    if outlet_patch is None:
+        notes.append(
+            f"WARNING: outlet patch velocities not readable (tried "
+            f"{list(dict.fromkeys(['trachea', outlet_name]))}); the choked-outlet guard "
+            "was NOT applied to this import."
+        )
+    else:
+        outlet_name = outlet_patch_name
+    if outlet_patch is not None:
+        if outlet_patch["max_over_mean"] > OUTLET_HOT_FACE_MAX_RATIO:
+            raise ValueError(
+                f"[{case_id}] outlet patch '{outlet_name}' is choked: max face speed is "
+                f"{outlet_patch['max_over_mean']:.0f}x the patch mean "
+                f"({outlet_patch['max_m_s']:.1f} vs {outlet_patch['mean_m_s']:.2f} m/s, "
+                f"{outlet_patch['hot_faces']} faces above 5x; limit "
+                f"{OUTLET_HOT_FACE_MAX_RATIO:.0f}x). The pressure drop is set by the cap, "
+                "not the airway. Move the outlet (auto_process_head --outlet nasopharynx) "
+                "and re-solve."
+            )
+        notes.append(
+            f"Outlet patch '{outlet_name}': {outlet_patch['n_faces']} faces, max/mean "
+            f"{outlet_patch['max_over_mean']:.1f}x, {outlet_patch['hot_faces']} above 5x -- clean."
+        )
+
     pressure_drop = pressure_drop_verdict(foam_root)
+    if pressure_drop is not None:
+        pressure_drop["outlet_patch"] = outlet_patch
     if pressure_drop is None:
         notes.append(
             "WARNING: no postProcessing/p_*/surfaceFieldValue.dat history; "
@@ -806,8 +932,9 @@ def import_openfoam_to_grid(
         )
     else:
         notes.append(
-            f"Pressure drop settled: inlet p moved "
-            f"{100 * pressure_drop['stability_rel_change_last_samples']:.2f}% over "
+            f"Pressure drop settled: drift "
+            f"{100 * pressure_drop['drift_rel_change']:.2f}%, wobble "
+            f"{100 * pressure_drop['wobble_rel_change']:.2f}% over "
             f"the last {pressure_drop['stability_samples']} samples. "
             f"dP={pressure_drop['dp_pa']:.2f} Pa at "
             f"{pressure_drop['q_L_min']:.1f} L/min -> "

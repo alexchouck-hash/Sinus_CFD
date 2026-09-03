@@ -187,10 +187,13 @@ def main() -> int:
                    choices=("geometry", "flow", "export", "scaffold", "cfd"),
                    default="cfd",
                    help="Stop the pipeline early after the named stage")
-    p.add_argument("--outlet", choices=("auto", "trachea", "nasopharynx"), default="auto",
-                   help="Outlet handling. auto: keep a clean midline trachea, else fall "
-                        "back to the nasopharynx (handles a disconnected/collapsed "
-                        "pharynx). trachea: always keep it. nasopharynx: always trim there.")
+    p.add_argument("--outlet", choices=("auto", "trachea", "nasopharynx"), default="nasopharynx",
+                   help="Outlet handling. nasopharynx (default): trim at the choanae -- the "
+                        "nares->nasopharynx domain the roadmap specifies. On both Visible "
+                        "Human heads the caudal trachea cap produced a choked outlet patch "
+                        "(57x and 8x max/mean face speed) and a dP 1000x off; the choanal "
+                        "cap on the same masks solved clean (2.5-3.5x) and settled. "
+                        "auto: keep a clean midline trachea, else trim. trachea: always keep.")
     p.add_argument("--dry-run", action="store_true", help="Print the plan and exit")
     args = p.parse_args()
 

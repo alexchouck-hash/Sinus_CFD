@@ -66,3 +66,37 @@ def test_per_side_pressure_is_kept_not_averaged_away(tmp_path):
     assert v["dp_left_pa"] == pytest.approx(RHO_AIR_KG_M3 * 18.0)
     assert v["dp_right_pa"] == pytest.approx(RHO_AIR_KG_M3 * 9.0)
     assert v["dp_left_pa"] > v["dp_pa"] > v["dp_right_pa"]
+
+
+def test_oscillation_around_a_stable_answer_is_settled(tmp_path):
+    """THCA at 800: per-sample wobble 1.5%, but the window mean moved 0.08%.
+
+    A rule on the wobble alone called this unconverged after 400 extra
+    iterations in which the resistance moved 0.6%. Drift is what 'still
+    moving' means; wobble is only the amplitude and gets a looser bound.
+    """
+    # Period-3 oscillation, so the two 3-sample windows are identical: drift is
+    # exactly zero while the wobble is ~1.3%. (A period-2 series splits a
+    # 3-sample window 2:1 and shows drift of about a third of the amplitude --
+    # still far under the 1% bound, but not the clean case this test is for.)
+    left = [6.05, 6.20, 6.12] * 2
+    right = [6.85, 7.00, 6.92] * 2
+    v = pressure_drop_verdict(_case(tmp_path, left, right))
+    assert v["stable"]
+    assert v["drift_rel_change"] < 0.005
+    assert 0.01 < v["wobble_rel_change"] < 0.03
+
+
+def test_a_trend_is_not_settled_even_when_each_step_is_small(tmp_path):
+    """Steps of 0.9% each look calm sample to sample; the mean is still moving."""
+    left = [7.00, 6.94, 6.88, 6.82, 6.76, 6.70]
+    right = [7.50, 7.43, 7.36, 7.30, 7.23, 7.17]
+    with pytest.raises(ValueError, match="DRIFTING"):
+        pressure_drop_verdict(_case(tmp_path, left, right))
+
+
+def test_large_wobble_is_not_settled(tmp_path):
+    left = [6.0, 6.5, 5.9, 6.4, 5.8, 6.5]            # ~12% swings, no trend
+    right = [6.8, 7.3, 6.7, 7.2, 6.6, 7.3]
+    with pytest.raises(ValueError, match="WOBBLES"):
+        pressure_drop_verdict(_case(tmp_path, left, right))
