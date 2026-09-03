@@ -139,6 +139,7 @@ def extend_lumen_to_external_nares(
     spacing: tuple[float, float, float],
     origin: tuple[float, float, float],
     tunnel_radius_mm: float = 3.5,
+    exclude: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[str], list[tuple[int, int, int]]]:
     """
     Add open-air corridors from external skin nares into the internal airway.
@@ -146,6 +147,16 @@ def extend_lumen_to_external_nares(
     The CT/airway mask often stops inside the nose (~3 cm deep of the face).
     Without these tunnels the fluid domain and centerline never reach the
     nostrils where air actually enters.
+
+    ``exclude`` is air that must NOT be part of the passage: the sinus bodies
+    the dead-end strip removed. A stripped sinus is a 3-D HOLE in the passage
+    mask -- the strip carves a chamber out of a region that surrounds it -- so
+    the hole-fill that closes pits in the painted tunnels was also refilling
+    every sinus. On CQ500CT390 it took a clean 29.6 mL passage to 35.5 mL and
+    put 93-97% of each of the three stripped bodies back (0.29 -> 5.60 mL).
+    Every CFD domain ever meshed here had its sinuses inside for this reason.
+    The fill is now confined to the neighbourhood of the painted tunnels, and
+    ``exclude`` is subtracted after every morphological step regardless.
 
     Returns (extended_lumen, notes, naris_seed_zyx_list).
     """
@@ -208,9 +219,25 @@ def extend_lumen_to_external_nares(
                 keep[li] = True
         extended = keep[lab]
 
-    # Fill small holes in tunnels
-    extended = morphology.closing(extended, footprint=morphology.ball(1))
-    extended = ndi.binary_fill_holes(extended) | extended
+    # Fill small holes IN THE TUNNELS -- and only there. A 3-D fill over the
+    # whole lumen refills every stripped sinus (they are holes in the passage).
+    excl = None if exclude is None else exclude.astype(bool)
+    painted = extended & ~lumen.astype(bool)          # what the tunnel paint added
+    if painted.any():
+        # A pit in a painted tunnel is ADJACENT to paint. One voxel of reach is
+        # what closes it; a reach of the tunnel radius extends to the first
+        # stripped sinus behind the nostril and refills it. Both the closing
+        # and the fill are confined here: a whole-lumen closing shaves a
+        # one-voxel shell off every stripped chamber (0.3 mL on CQ500CT390 --
+        # the ostium rim the drainage audit measures), and a whole-lumen fill
+        # refills the chamber outright.
+        near_paint = ndi.binary_dilation(painted, iterations=1)
+        closed = morphology.closing(extended, footprint=morphology.ball(1))
+        extended |= closed & near_paint
+        holes = ndi.binary_fill_holes(extended) & ~extended
+        extended |= holes & near_paint
+    if excl is not None:
+        extended &= ~excl
 
     # Re-keep largest component that includes a naris (or original lumen)
     lab2, n2 = ndi.label(extended)
@@ -397,6 +424,7 @@ def analyze_nasal_passage(
     open_radius_mm: float = 6.0,
     skin_naris_centers_mm: list[list[float]] | None = None,
     tunnel_radius_mm: float = 3.5,
+    sinus_exclude: np.ndarray | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any], PassageMetrics]:
     """
     Full passage analysis.
@@ -430,8 +458,26 @@ def analyze_nasal_passage(
         spacing,
         origin,
         tunnel_radius_mm=tunnel_radius_mm,
+        exclude=sinus_exclude,
     )
     notes.extend(ext_notes)
+    if sinus_exclude is not None:
+        # Hard guard, BEFORE anything is written: the CFD domain must not hold
+        # the sinus air the strip removed (CLAUDE.md goal 1).
+        excl = sinus_exclude.astype(bool)
+        if excl.shape == lumen.shape and excl.any():
+            inside = float((lumen & excl).sum()) / float(excl.sum())
+            if inside > 0.05:
+                vml = float(np.prod(spacing)) / 1000.0
+                raise ValueError(
+                    f"{case_id}: {100 * inside:.0f}% of the stripped sinus air "
+                    f"({(lumen & excl).sum() * vml:.1f} mL) is inside the extended "
+                    "passage; refusing to produce a CFD domain that contains sinuses."
+                )
+            notes.append(
+                f"Stripped sinus air inside the passage: {100 * inside:.1f}% -- "
+                "sinus-free domain preserved through the nostril extension."
+            )
 
     # Open ports: use skin nares for inlets so openings are at the face
     port_inlets = skin_pts if skin_pts else inlet_centers_mm
@@ -541,6 +587,9 @@ def analyze_nasal_passage(
         "centerline_left_mm": left_cl.tolist() if left_cl is not None and len(left_cl) else [],
         "centerline_right_mm": right_cl.tolist() if right_cl is not None and len(right_cl) else [],
         "cross_sections": sections,
+        # Analysis notes were dropped before: the extension's tunnel report and
+        # the sinus-exclusion verdict are what an auditor needs to see.
+        "notes": list(notes),
         "boundary_roles": {
             "wall": "no_slip_mucosa",
             "inlet_open": "volumetric_flow_nares_at_skin",

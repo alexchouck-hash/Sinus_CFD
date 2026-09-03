@@ -37,10 +37,23 @@ def main() -> int:
     args = p.parse_args()
 
     case_dir = args.outputs_root / args.case
-    lumen_path = case_dir / f"{args.case}_airway_mask.nrrd"
-    # Prefer dedicated passage lumen if we refine later
-    if (case_dir / f"{args.case}_passage_lumen.nrrd").is_file() and False:
-        lumen_path = case_dir / f"{args.case}_passage_lumen.nrrd"
+    # Start from the SINUS-STRIPPED passage when autosegment has produced one.
+    # This line used to read `... .is_file() and False:` -- the stripped lumen
+    # was never preferred, so every CFD domain ever meshed here was the raw
+    # airway with all of its sinus air inside (VH male 30.9 of 30.9 mL, THCA
+    # 36.3 of 36.3, CQ500CT390 5.6 of 5.6), which the roadmap forbids. The job
+    # of this script is to extend the passage to the external nares and cut the
+    # open ports; the sinus strip is autosegment's job and must survive it.
+    stripped = case_dir / f"{args.case}_passage_lumen.nrrd"
+    if stripped.is_file():
+        lumen_path = stripped
+        lumen_kind = "sinus-stripped passage (autosegment)"
+    else:
+        lumen_path = case_dir / f"{args.case}_airway_mask.nrrd"
+        lumen_kind = ("airway_mask as-is (no autosegment passage). Sinus-free only if "
+                      "the mask was built that way -- NasalSeg label-built airways use "
+                      "labels 1-3 and are; a whole-head raw airway is NOT")
+    print(f"[{args.case}] lumen source: {lumen_path.name}  [{lumen_kind}]")
     bc_path = case_dir / f"{args.case}_boundary_conditions.json"
     if not lumen_path.is_file():
         raise SystemExit(f"Missing lumen: {lumen_path}")
@@ -83,6 +96,15 @@ def main() -> int:
         open_radius_mm=args.open_radius_mm,
         skin_naris_centers_mm=skin_nares,
         tunnel_radius_mm=3.5,
+        # The sinus air autosegment stripped out. The nostril-tunnel step must
+        # not put it back (its hole-fill did, on every case), and the analysis
+        # refuses to return a passage that contains it.
+        sinus_exclude=(
+            sitk.GetArrayFromImage(
+                sitk.ReadImage(str(case_dir / f"{args.case}_sinus_detour.nrrd"))
+            ).astype(bool)
+            if (case_dir / f"{args.case}_sinus_detour.nrrd").is_file() else None
+        ),
     )
     paths = write_passage_outputs(
         args.case,
@@ -107,10 +129,27 @@ def main() -> int:
     for k, path in paths.items():
         print(f"  wrote {k}: {path.name}")
 
-    # Keep airway mask + air-space STL in sync with extended passage (includes nares)
-    out_img = sitk.GetImageFromArray(masks["lumen"].astype("uint8"))
-    out_img.CopyInformation(img)
-    sitk.WriteImage(out_img, str(case_dir / f"{args.case}_airway_mask.nrrd"))
+    # The extended lumen goes to passage_lumen.nrrd (written above by
+    # analyze_passage). It is NOT written over airway_mask.nrrd any more: that
+    # file is process_whole_head's raw airway and is an INPUT to the drainage
+    # audit -- overwriting it with the passage put the sinus/passage interface on
+    # a different mask from the sinus bodies and reported 6.63 mm maxillary
+    # ostia (real: 2.83) on VH male.
+    sinus_p = case_dir / f"{args.case}_sinus_detour.nrrd"
+    if sinus_p.is_file():
+        sinus = sitk.GetArrayFromImage(sitk.ReadImage(str(sinus_p))).astype(bool)
+        if sinus.shape == masks["lumen"].shape and sinus.any():
+            inside = float((sinus & masks["lumen"]).sum()) / float(sinus.sum())
+            vml = spacing[0] * spacing[1] * spacing[2] / 1000.0
+            if inside > 0.05:
+                raise SystemExit(
+                    f"[{args.case}] {100 * inside:.0f}% of the stripped sinus air "
+                    f"({(sinus & masks['lumen']).sum() * vml:.1f} mL) is inside the "
+                    "passage this script produced. The CFD domain must exclude the "
+                    "sinuses (CLAUDE.md goal 1); refusing to write it."
+                )
+            print(f"[{args.case}] sinus air inside the passage: {100 * inside:.1f}% "
+                  f"({(sinus & masks['lumen']).sum() * vml:.2f} mL) -- stripped domain preserved")
     # Viewer "Air space" mesh
     try:
         from sinus_cfd.pipeline import _mask_to_mesh  # noqa: E402

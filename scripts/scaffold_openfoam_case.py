@@ -334,12 +334,25 @@ addLayersControls
         {{
             nSurfaceLayers {wall_layers};
         }}
+        // The open ports get no layers, said explicitly. Where the wall's
+        // prism stack runs into an un-layered cap, snappy used to pin the
+        // stack's edge to the cap and leave sliver faces at the corner: both
+        // highly-skew faces on CQ500CT390 (max skewness 6.79) sat exactly
+        // there, one on the left_nostril cap and one on the wall beside it.
+        "(left_nostril|right_nostril|trachea)"
+        {{
+            nSurfaceLayers 0;
+        }}
     }}
     expansionRatio 1.2;
     finalLayerThickness 0.3;
     minThickness 0.1;
     nGrow 0;
     featureAngle 60;
+    // Let layer points SLIDE along a neighbouring patch instead of being
+    // pinned where the wall meets a cap: the cap/wall corner is ~90 deg, so
+    // with featureAngle 60 it is a feature and the layers collapse into it.
+    slipFeatureAngle 30;
     nRelaxIter 3;
     nSmoothSurfaceNormals 1;
     nSmoothNormals 3;
