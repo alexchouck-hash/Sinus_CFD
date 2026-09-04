@@ -362,8 +362,8 @@ the 2026-08-24/30 fixes.
 | 2 | Mesh boundary | **works; sinus-free at every layer since 2026-09-03** | `export_openfoam_geometry.py` writes a solid air body plus open inlet/outlet/wall STL patches. Foam cases for VH F, VH M, THCA, P001, CQ500CT390. Re-exporting CQ500CT390 produced a **6-face, 0.00 mL** "watertight" body against a 38.91 mL mask and reported it as good — see §9d. Now guarded: the surface is compared against the voxel mask and the export raises if they are >15% apart. |
 | 3 | Mesh refinement | **works** | snappyHexMesh + layers. `checkMesh` **Mesh OK** on 3 of 4; non-orthogonality max ~64.5, average 13.4–14.3. Independence study on P001 at 74.9k / 259k / 817k cells → R = 0.0541 / 0.0522 / **0.0520** Pa·s/mL. 259k is independent to 0.3%. |
 | 4 | Airflow nares → trachea | **works end to end on sinus-free domains** | CQ500CT390 (living, 0.38 mm) went CT → segmentation → export → snappyHexMesh (312,652 cells) → simpleFoam → import on 2026-09-01: dP **7.87 Pa** at 18 L/min, R 0.0262 Pa·s/mL, per-side 7.41 / 8.33 Pa, inlet pressure flat to 0.26%, outlet flux 0.01% off the imposed value. Solver is OpenFOAM 2412 in WSL Ubuntu 24.04 (Docker Desktop is wedged — see §9e). The four July solves are still stale against their August masks; THCA's never settled at all. |
-| 5 | Sinus drainage | **works** | Per-sinus volume, ostium calibre and drains yes/no. Calibres 1.46–2.83 mm, inside the 0.2–6 mm anatomical range. Where no ostium resolves, `probable_ostium` returns a labelled hypothesis, never a number. |
-| 6 | Seeker paths to ostia | **centreline only** | `compute_surgical_guidance.py` produces naris→frontal paths and a high-\|u\| corridor. It models **no instrument geometry at all** — no diameter, no curvature, no bend, no clearance test. |
+| 5 | Sinus drainage | **works; names what resolution allows** | Per-sinus volume, ostium calibre and drains yes/no. Calibres 1.46–2.83 mm, inside the 0.2–6 mm anatomical range. Where no ostium resolves, `probable_ostium` returns a labelled hypothesis, never a number. |
+| 6 | Seeker paths to ostia | **rigid instrument fit, maxillary + sphenoid targets** | `compute_surgical_guidance.py` produces naris→frontal paths and a high-\|u\| corridor. It models **no instrument geometry at all** — no diameter, no curvature, no bend, no clearance test. |
 | 7 | Virtual surgery | **geometry only** | `virtual_surgery.py` edits the airway and reports pre/post volume, MCA and L/R ratio. It writes an edited label so CFD *could* re-run; no pre/post CFD comparison has been run. |
 
 ### The 20-minute budget — now measurable (2026-09-01, CQ500CT390)
@@ -396,19 +396,21 @@ iteration 50. So `endTime` is capped at 400 and convergence is judged by
 dP, per-side split and resistance and **raises** if the inlet pressure moved
 more than 1% over the last 3 samples.
 
-Re-solved on the sinus-free domains (2026-09-03, evening), choanal outlet on
-every whole-head case, judged by drift / wobble / outlet patch:
+Re-solved on the rebuilt domains (2026-09-04: route-based nasopharynx veto,
+sphenoid stripped where it resolves, THCA at U 0.7), judged by drift / wobble /
+outlet patch:
 
 | case | cells | max skew | dP (Pa) | L / R (Pa) | R (Pa·s/mL) | drift | wobble | outlet | verdict |
 |------|-------|----------|---------|------------|-------------|-------|--------|--------|---------|
-| CQ500CT390 | 358,234 | 4.86 | 20.55 | 19.37 / 21.73 | 0.0685 | 0.04% | 0.03% | 1.8× | settled |
-| P001 | 257,780 | 3.07 | 16.72 | 21.99 / 11.46 | 0.0557 | 0.16% | 0.51% | 3.0× | settled |
-| VH male | 271,010 | 2.67 | 5.97 | 4.53 / 7.40 | 0.0199 | 0.57% | 1.22% | 2.8× | settled |
-| THCA | 237,438 | 3.27 | 14.42 | 13.72 / 15.13 | 0.0481 | 0.09% | 0.16% | 3.4× | settled |
+| CQ500CT390 | 356,535 | 4.74 | 20.52 | 19.34 / 21.69 | 0.0684 | 0.04% | 0.08% | 1.9× | settled |
+| P001 | 257,454 | 3.07 | 16.79 | 22.07 / 11.50 | 0.0560 | 0.27% | 1.69% | 3.1× | settled |
+| VH male | 287,569 | 2.67 | 6.78 | 6.04 / 7.52 | 0.0226 | n/a | 0.79% | 2.9× | settled; residualControl at 110 |
+| THCA | 254,882 | 3.07 | 14.55 | 13.83 / 15.26 | 0.0486 | 0.75% | 2.46% | 2.9× | settled |
 | VH female | 162,566 | 4.56 | — | — | — | — | — | — | **refused — choked: max face speed is 9x the patch mean** |
 
-Every earlier number, July and this morning's, is superseded: those
-domains held all of their sinus air (§9h). See §9g for the outlet story.
+Every earlier number is superseded: the 2026-09-03 domains still held the
+sphenoid where the scan had one (§9i); the domains before that held every
+sinus (§9h). See §9g for the outlet story.
 
 **Magnitudes are not calibrated.** Physiological nasal resistance at 300 mL/s
 is roughly 0.1–0.3 Pa·s/mL; these sit 4–500× below it, and the two 1 mm
@@ -569,6 +571,75 @@ through to solving the previous export.
 
 CQ500CT390: 6.79 → 4.86 max skewness, two faces remain, both now on the wall (one was on the left-nostril cap); VH female still one wall face at 4.56. The residual is the cap/wall corner geometry, not the layer template. VH female is refused at the choana regardless: the outlet patch's hottest face runs 9× its mean (limit 5×), so on that 1 mm cadaver the outlet section, not the airway, sets the pressure drop; the importer now leaves `<case>_flow_refused.json` with that reason and no field.
 
+### 9i. The sphenoid, the route, and what resolution allows (2026-09-04)
+
+**The nasopharynx veto follows the route.** The merge zone -- air behind the
+choanal landmark, vetoed from ever being a sinus -- was a posterior
+half-space, so it held the sphenoid. Two candidate fixes were measured on
+THCA and rejected: calibre ("not itself behind a neck") carves the
+nasopharynx, which *is* a roomy chamber behind necks at both ends; and
+connectivity inside the half-space cannot separate them, because the
+sphenoethmoidal recess lies behind the landmark too (the two cores, 9.7 and
+8.9 mL, 45 mm apart in height, split only at 2 mm erosion). What separates
+them is the route: detour = d(naris) + d(outlet) - shortest is 0-20 mm across
+THCA's nasopharynx core and 14-62 mm inside its sphenoid. The veto is now
+merge-zone air within 25 mm detour, a basin is passage when most of it is
+vetoed and sinus when most of it is not, and air behind the landmark below
+the palate is vetoed as pharynx (no sinus lies below the nasal floor; the
+floor comes from the palate bone the landmark builder already finds, not
+from the naris seeds -- on CQ500CT390 the seeds are not at the nostrils and
+using them cost two sinus bodies). Strategy K5 is revised accordingly: the
+merge zone is where the nasopharynx may be, not a declaration that all of it
+is passage.
+
+**Two more re-entry points, after the strip.** With the veto right, the
+strip removed THCA's sphenoid and the files still had it: the merge zone was
+OR'd back into the passage wholesale, and the outlet glue re-added every
+whole-head voxel outside the nasal box, where the sphenoid sits. Both now
+exclude the strip's sinus, and `sinus_detour` carries the strip's whole
+verdict instead of being clipped to the box. THCA's domain: 84.8 -> 68.5 mL.
+
+**What resolution allows.** On THCA (1.5 mm slices) the right maxillary,
+the posterior ethmoid cells and the sphenoid are one air mass whose joins are
+over 4 mm wide; no neck rule separates them, and the antral-roof rule named
+the 35 mL mass "frontal". Same-side bodies over 2 mL that erode apart at a
+neck of radius <= 3 mm into pieces >= 1 mL are now split before naming (a
+lobulated single sinus has a wide waist and is not); a body over 20 mL, or
+with over 1 mL below the antral roof, is reported as `complex` with the
+reason; and a body behind the most posterior antrum is never renamed
+frontal, however high it sits -- VH male's 4.47 mL midline sphenoid, 90%
+above the roof, had been. VH male now reports **sphenoid midline 4.47 mL
+draining through a 4.90 mm ostium**, the first sphenoid ostium resolved on
+any case here.
+
+**Instrument fit exists** (`instrument_fit.py`, `plan_instrument_paths.py`).
+A tool -- diameter, working tip, curve or fixed bend, shaft -- is placed
+tip-first at each detected ostium and searched over orientation (Fibonacci
+sphere x roll, then shrinking cones, ordered by contact depth when nothing
+fits) for a placement that clears the airway wall along its whole length and
+leaves through a naris. Verdicts: fits / touches wall (where, how far short) /
+unreachable / no target, with the polyline for overlay. VH male: the
+maxillary seeker fits both antra (0.41 / 0.73 mm to spare at the ostium);
+the sphenoid seeker, with an assumed curve, leaves the airway 21 mm behind
+the tip. CQ500CT390: it touches the wall at all three ostia, which are
+narrower than a 2 mm tool -- the balloon question of goal 5, stated as
+geometry. THCA: 1.0 mm short at the left maxillary ostium. The roadmap's
+numbers are used where it gives them (frontal 2 mm; ET 45 deg bend, 18.5 mm
+tip); every other diameter and curve is flagged `assumed` in the output,
+and the Eustachian tube orifice has no detector, so that tool reports
+`no target`. Rigid only, airway wall only, no forbidden-structure list.
+
+**Solver and import.** THCA without its sphenoid oscillates at U 0.9 (inlet
+pressure +-1.5%, ~100-iteration period, wobble 3.2% vs the 3% bar; a
+continuation to 600 did not damp it and choked the outlet) and settles at
+U 0.7 (drift 0.75%, wobble 2.46%). The scaffold reads `SINUS_CFD_U_RELAX`
+and records it in `case_manifest.json`. One THCA chain hit a FATAL IO error
+at simpleFoam start-up (not reproduced by hand); a function object had left
+U-only time directories and the import matched one by cell count with no
+pressure history and reported OK -- a time directory without `p` is now
+never a solve, and a missing history is a refusal with the reason recorded,
+like every other refusal. CQ500CT390 rebuilt under all of it: 5.8 mL stripped, surface 33.10 vs 33.13 mL voxel, dP 20.52 Pa, R 0.0684 -- the same number as before to three figures, as it should be on a scan whose sphenoid does not resolve.
+
 ### Queue
 
 Tagged by what unblocks each item: **[CODE]** implementable now, **[LABEL]**
@@ -582,38 +653,27 @@ needs a better scan.
 
 **Goal 1/3 correctness**
 
-3. **[CODE]** Sphenoid air is inside the CFD domain (THCA: 9.1 mL). `merge_zone`
-   is a posterior half-space, so it holds the sphenoid as well as the
-   nasopharynx. Needs a merge zone bounded by the choanal aperture. Narrowing the
-   veto to "half-space not itself behind a neck" was tried and **rejected** — it
-   carved the nasopharynx instead (bodies bounded at 6.5–11.5 mm openings).
-4. **[CODE]** CQ500CT390's right maxillary antrum is never found. Its left is
+3. **[CODE]** CQ500CT390's right maxillary antrum is never found. Its left is
    found at 1.36 mL. Likely opacified or below the FOV — screen before fixing.
-5. **[DATA]** CQ500CT390's naris ports are not at the nostrils. The FOV is
+4. **[DATA]** CQ500CT390's naris ports are not at the nostrils. The FOV is
    brain-framed and the nostrils sit at or below its bottom edge, so the ports
    fall back to the airway's anterior opening ~33 mm higher. Flow path still
    passes, but "flow from the nares" is not literally true for that case.
 
 **Goal 4 — the biggest gap**
 
-6. **[CODE]** Instrument-fit checking does not exist. A centreline is not a path.
-   Needs clearance against each tool's real geometry: frontal seeker **2 mm
-   diameter** curved, maxillary and sphenoid seekers with their own curvature,
-   ET seeker ~4 in shaft with a **45° bend** and **18.5 mm** working tip past the
-   bend. This is a geometric feasibility problem, not a shortest-path problem.
-7. **[LABEL]** Frontal and sphenoid ostia resolve on **no** usable case — those
-   recesses are sub-millimetre. Operator marks on the frontal recess would give
-   `probable_ostium` something to be scored against.
+5. **[DATA]** Instrument fit runs on assumed tool numbers. `instrument_fit.py` places each seeker rigidly at its ostium (§9i); the roadmap gives the frontal seeker's 2 mm and the ET seeker's 45 deg / 18.5 mm, nothing else. Needed: the real diameter, tip length and curve radius of the maxillary, sphenoid and frontal seekers, the ET seeker's shaft diameter, and a list of structures a tool must not lever against (skull base, orbit, sphenopalatine region) so clearance is checked against them, not only the airway wall. **[CODE]** on top: an Eustachian tube orifice detector (torus tubarius on the lateral nasopharynx wall), so the ET seeker has a target; today it reports `no target`.
+6. **[LABEL]** Frontal ostia resolve on no usable case; the sphenoid now resolves on VH male (4.47 mL, 4.90 mm ostium) and nowhere else. On THCA (1.5 mm slices) the right maxillary / posterior ethmoid / sphenoid air is one 35 mL `complex` with joins over 4 mm wide; on CQ500CT390 the frontal ostia are 1.97 / 2.11 mm. A sub-millimetre sinus-protocol scan (the screen found 346 at 0.62 mm) is the way to a frontal recess; labels on THCA cannot create walls the voxels do not hold.
 
 **Goal 5**
 
-8. **[CFD]** Run the pre/post pair through CFD. `virtual_surgery.py` already
+7. **[CFD]** Run the pre/post pair through CFD. `virtual_surgery.py` already
    writes the edited label; nothing has been solved on one.
 
 **Data**
 
-9. **[DATA]** The corrected screen (`assess_dicom_incoming.py`: SliceThickness, hole-filled silhouette, `--report`/`--csv`) is running over `data/incoming` and persisting every verdict to `outputs/incoming_screen.json`. Final tally 2026-09-03: 411 scans measured, 381 viable (346 at 0.62 mm, 31 at 1.0 mm; median 70 mL internal air); 29 rejected for too few slices, 1 for no internal air. Next: promote the viable cases to NRRD and run `qa_patency` on each.
-
+8. **[DATA]** The corrected screen (`assess_dicom_incoming.py`: SliceThickness, hole-filled silhouette, `--report`/`--csv`) is running over `data/incoming` and persisting every verdict to `outputs/incoming_screen.json`. Final tally 2026-09-03: 411 scans measured, 381 viable (346 at 0.62 mm, 31 at 1.0 mm; median 70 mL internal air); 29 rejected for too few slices, 1 for no internal air. Next: promote the viable cases to NRRD and run `qa_patency` on each.
+9. **[CFD]** THCA settles only at U 0.7 (wobble 2.46%, just inside the 3% bar) on the sphenoid-free domain, flat at 0.9 with the sphenoid in. The cause is not found: the stripped air is all at sinus level (nothing near the outlet), checkMesh is OK (max skew 3.07, non-orthogonality 65), aspect ratio 21.8. Candidates: the new cavity wall at the sphenoethmoidal recess, or a genuinely unsteady separation the steady solver cannot represent. Test: a transient run (pimpleFoam, a few hundred ms) on the same mesh; if the inlet pressure oscillates there too, report a mean with its band rather than a settled number.
 
 ---
 
