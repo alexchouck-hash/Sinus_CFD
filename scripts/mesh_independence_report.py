@@ -24,7 +24,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from compute_nasal_resistance import resistance_from_postprocessing  # noqa: E402
+from compute_nasal_resistance import RHO_AIR_KG_M3, resistance_from_postprocessing  # noqa: E402
 
 
 def _cell_count(foam_dir: Path) -> int | None:
@@ -41,7 +41,7 @@ def main() -> int:
     p.add_argument("--case", default="P001")
     p.add_argument("--foam-root", type=Path, default=REPO_ROOT / "foam")
     p.add_argument("--levels", default="1,2,3")
-    p.add_argument("--rho", type=float, default=1.14)
+    p.add_argument("--rho", type=float, default=RHO_AIR_KG_M3)
     p.add_argument("--tol", type=float, default=0.05, help="relative-change convergence tolerance")
     args = p.parse_args()
 

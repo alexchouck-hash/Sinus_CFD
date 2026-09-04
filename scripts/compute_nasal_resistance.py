@@ -26,6 +26,12 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+# ONE air density for every reporter. The importer (openfoam_import) and the
+# sweep / mesh-independence / cooling scripts used to disagree (1.2 vs 1.14),
+# which made the same run read 16.72 Pa in one table and 15.89 Pa in another.
+from sinus_cfd.openfoam_import import RHO_AIR_KG_M3  # noqa: E402
 
 # Published total nasal resistance, quiet breathing (both cavities in parallel).
 # ~0.15-0.30 Pa·s/mL is the commonly cited healthy range; obstruction runs higher.
@@ -54,7 +60,7 @@ def _latest_value(fo_dir: Path) -> float | None:
     return last_val
 
 
-def resistance_from_postprocessing(pp: Path, rho: float = 1.14) -> dict | None:
+def resistance_from_postprocessing(pp: Path, rho: float = RHO_AIR_KG_M3) -> dict | None:
     """
     Compute nasal resistance from a postProcessing/ directory.
 
@@ -89,7 +95,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--case", default="VisibleHuman_Head")
     p.add_argument("--foam-root", type=Path, default=None)
-    p.add_argument("--rho", type=float, default=1.14, help="air density kg/m³ (~37 °C)")
+    p.add_argument("--rho", type=float, default=RHO_AIR_KG_M3, help="air density kg/m³ (same constant as the importer)")
     args = p.parse_args()
 
     foam = args.foam_root or (REPO_ROOT / "foam" / args.case)

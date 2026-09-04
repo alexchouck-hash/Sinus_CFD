@@ -27,7 +27,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from compute_nasal_resistance import resistance_from_postprocessing  # noqa: E402
+from compute_nasal_resistance import RHO_AIR_KG_M3, resistance_from_postprocessing  # noqa: E402
 
 
 def _plot(rows: list[dict], out_path: Path, case: str) -> None:
@@ -67,7 +67,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--case", default="P001")
     p.add_argument("--foam-root", type=Path, default=None)
-    p.add_argument("--rho", type=float, default=1.14)
+    p.add_argument("--rho", type=float, default=RHO_AIR_KG_M3)
     args = p.parse_args()
 
     foam = args.foam_root or (REPO_ROOT / "foam" / args.case)

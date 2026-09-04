@@ -32,10 +32,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from compute_nasal_resistance import _latest_value  # noqa: E402
+from compute_nasal_resistance import RHO_AIR_KG_M3, _latest_value  # noqa: E402
 
 # Air at ~body temperature.
-RHO_AIR = 1.14        # kg/m³
+RHO_AIR = RHO_AIR_KG_M3  # kg/m³, the importer's constant
 CP_AIR = 1005.0       # J/(kg·K)
 
 
