@@ -266,6 +266,7 @@ def choanal_landmark_from_bone(
     lab, n = ndi.label(bone)
     landmark_y: int | None = None
     palate_ok = False
+    palate_z: float | None = None
     if n:
         counts = np.bincount(lab.ravel())
         counts[0] = 0
@@ -291,6 +292,7 @@ def choanal_landmark_from_bone(
                 continue
             landmark_y = y_post
             palate_ok = True
+            palate_z = float(np.where(comp)[0].mean())   # the nasal floor, in slices
             notes.append(f"palate CC {cid} vox={int(counts[cid])} landmark_y={landmark_y}")
             break
 
@@ -351,6 +353,7 @@ def choanal_landmark_from_bone(
     meta = {
         "landmark_y": int(landmark_y),
         "palate_ok": bool(palate_ok),
+        "palate_z": palate_z,
         "vomer_y": vomer_y,
         "notes": notes,
     }
@@ -516,8 +519,15 @@ def dead_end_sinus_strip(
     merge_zone: np.ndarray | None = None,
     naris_seeds: list[tuple[int, int, int]] | None = None,
     superior_is_high_z: bool | None = None,
+    floor_z: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Split the flooded airway into (passage, sinus) by a dead-end test.
+
+    ``floor_z`` (slice index of the hard palate, from the bone landmark) with
+    ``superior_is_high_z`` vetoes merge-zone air below the nasal floor as
+    pharynx. The naris seeds are NOT used for that: on CQ500CT390 the ports
+    are not at the nostrils (brain-framed FOV), and the seed-based anterior
+    terminal there cost two real sinus bodies (6.5 -> 2.2 mL).
 
     A sinus is a **roomy chamber whose only route to any opening squeezes
     through a neck**. Because openings sit at both ends of the airway (nares and
@@ -607,16 +617,15 @@ def dead_end_sinus_strip(
     # stripping them changes the outlet region of a whole-head domain (THCA:
     # the trachea patch went from 3.3x to 13x hot faces after 5.8 mL of
     # pharyngeal pocket was removed beside it).
-    if superior_is_high_z is not None and naris_seeds:
-        z_n = float(np.mean([float(s[0]) for s in naris_seeds]))
+    if superior_is_high_z is not None and floor_z is not None:
         zidx = np.arange(air.shape[0])[:, None, None]
-        below = (zidx < z_n) if superior_is_high_z else (zidx > z_n)
+        below = (zidx < floor_z) if superior_is_high_z else (zidx > floor_z)
         pharynx = merge_zone & below & ~veto
         if pharynx.any():
             veto = veto | pharynx
             notes.append(
                 f"nasopharynx veto: +{pharynx.sum() * vox_ml:.1f} mL behind the landmark "
-                "below the naris plane vetoed as pharynx (no sinus lies below the nasal floor)")
+                "below the palate vetoed as pharynx (no sinus lies below the nasal floor)")
     behind = air & (bott > 0) & (edt > SINUS_SEED_RATIO * bott) & ~veto
     struct = np.ones((3, 3, 3), dtype=bool)
     lab, n = ndi.label(behind, struct)

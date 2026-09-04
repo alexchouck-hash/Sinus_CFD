@@ -939,9 +939,13 @@ def extract_ct_nasal_airway(
         strip_domain = (
             flood_domain.astype(bool) if flood_domain is not None else flooded
         )
+        # No naris seeds here: the extent slab is the anterior terminal, as it
+        # always was. The seed-based terminal lost two sinus bodies on
+        # CQ500CT390, whose ports are not at the nostrils.
         _strip_passage, sinus_full, n_tp = dead_end_sinus_strip(
             strip_domain, spacing_xyz, merge_zone=merge_zone,
-            naris_seeds=[snap_l, snap_r], superior_is_high_z=superior_is_high_z,
+            superior_is_high_z=superior_is_high_z,
+            floor_z=(gate_meta.get("palate_z") if gate_meta.get("palate_ok") else None),
         )
         notes.extend(n_tp)
         # The strip's verdict is on the WHOLE flood domain. A sinus behind the

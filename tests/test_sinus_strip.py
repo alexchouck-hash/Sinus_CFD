@@ -577,14 +577,13 @@ def test_air_below_the_naris_plane_behind_the_landmark_is_never_sinus():
     air = _tube_with_sphenoid_like_chamber()      # chamber at z 6..21, tube at z 10..17
     ny = air.shape[1]
     merge = air & (np.arange(ny)[None, :, None] >= 40)
-    seeds = [(14, 5, 14), (14, 5, 17)]
-    # superior is LOW z here, so the chamber (z up to 21) is partly "below" the
-    # nares (z 14): pretend the whole chamber is inferior by putting the nares high
-    seeds_hi = [(3, 5, 14), (3, 5, 17)]
-    _p, sinus_above, _n = dead_end_sinus_strip(air, ISO, merge_zone=merge, naris_seeds=seeds_hi,
+    # the palate (nasal floor) at slice 3: with superior = high z the chamber
+    # (z 6..21) is above the floor and is stripped; with superior = low z the
+    # same chamber is below the floor -- pharynx, kept
+    _p, sinus_above, _n = dead_end_sinus_strip(air, ISO, merge_zone=merge, floor_z=3.0,
                                                superior_is_high_z=True)
-    assert sinus_above[14, 55, 34]                 # above the nares: stripped
-    _p, sinus_below, notes = dead_end_sinus_strip(air, ISO, merge_zone=merge, naris_seeds=seeds_hi,
+    assert sinus_above[14, 55, 34]
+    _p, sinus_below, notes = dead_end_sinus_strip(air, ISO, merge_zone=merge, floor_z=3.0,
                                                   superior_is_high_z=False)
-    assert not sinus_below.any(), notes            # below the nares: pharynx, kept
-    assert any("below the naris plane" in n for n in notes), notes
+    assert not sinus_below.any(), notes
+    assert any("below the palate" in n for n in notes), notes
