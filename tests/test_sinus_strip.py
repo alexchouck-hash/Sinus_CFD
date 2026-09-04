@@ -495,3 +495,55 @@ def test_merge_only_fuses_bodies_that_are_actually_adjacent():
     kept = _merge_split_sinuses(far, ISO, notes)
     assert len(kept) == 2, f"welded bodies 104 mm apart: {notes}"
     assert {round(r["volume_ml"], 2) for r in kept} == {16.0, 1.5}
+
+
+# --------------------------------------------------------------------------
+# merge zone bounded by connectivity to the outlet, not a half-space
+# --------------------------------------------------------------------------
+
+
+def _tube_with_sphenoid_like_chamber():
+    """A through tube plus a roomy chamber BEHIND the landmark whose only neck
+    opens in FRONT of it -- the sphenoid: behind the choanae, draining forward."""
+    air = np.zeros((28, 60, 40), dtype=bool)
+    air[10:18, 4:56, 12:20] = True          # main tube
+    air[8:20, 36:50, 24:38] = True          # chamber, entirely at y >= 36
+    # neck from the tube at y=30 back to y=35, meeting the chamber's front
+    # corner diagonally at y=36: every neck voxel is in FRONT of the landmark
+    air[13:15, 30:36, 20:24] = True
+    return air
+
+
+def test_chamber_behind_landmark_draining_forward_is_stripped():
+    air = _tube_with_sphenoid_like_chamber()
+    ny = air.shape[1]
+    merge = air & (np.arange(ny)[None, :, None] >= 36)   # posterior half-space
+    passage, sinus, notes = dead_end_sinus_strip(air, ISO, merge_zone=merge)
+    assert sinus[14, 43, 31], notes          # the chamber is sinus ...
+    assert passage[14, 50, 16], notes        # ... the tube behind the landmark stays
+    assert passage[14, 55, 16]
+    assert any("is not nasopharynx" in n for n in notes), notes
+
+
+def test_merge_zone_that_misses_the_opening_is_kept_whole_with_a_warning():
+    from sinus_cfd.auto_airway import merge_zone_reaching_opening
+    air = _tube_with_side_chamber()
+    merge = np.zeros_like(air)
+    merge[8:20, 34:48, 24:38] = True
+    opening = np.zeros_like(air)
+    opening[:, 55, :] = air[:, 55, :]
+    kept, notes = merge_zone_reaching_opening(merge, opening, 0.001)
+    assert (kept == merge).all()
+    assert notes and "WARN" in notes[0]
+
+
+def test_nasopharynx_that_reaches_the_opening_keeps_the_whole_veto():
+    from sinus_cfd.auto_airway import merge_zone_reaching_opening
+    air = _tube_with_sphenoid_like_chamber()
+    ny = air.shape[1]
+    merge = air & (np.arange(ny)[None, :, None] >= 36)
+    opening = np.zeros_like(air)
+    opening[:, 55, :] = air[:, 55, :]
+    kept, notes = merge_zone_reaching_opening(merge, opening, 0.001)
+    assert kept[14, 40, 16] and kept[14, 55, 16]
+    assert not kept[14, 43, 31]

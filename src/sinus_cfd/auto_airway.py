@@ -450,6 +450,39 @@ def _opening_slabs(
     return air & (idx <= y0 + t), air & (idx >= y1 - t)
 
 
+def merge_zone_reaching_opening(
+    merge_zone: np.ndarray, opening: np.ndarray, vox_ml: float
+) -> tuple[np.ndarray, list[str]]:
+    """Keep only the 26-connected parts of ``merge_zone`` that touch ``opening``.
+
+    Air behind the choanal landmark that cannot reach the outlet without
+    leaving the half-space is not nasopharynx (a sphenoid, a posterior ethmoid
+    cell) and must not carry the nasopharynx's veto. If no part touches the
+    opening the zone is returned untouched with a WARN: losing the veto would
+    let the dead-end test strip the nasopharynx, which is worse than keeping a
+    sphenoid.
+    """
+    notes: list[str] = []
+    merge_zone = merge_zone.astype(bool)
+    if not merge_zone.any():
+        return merge_zone, notes
+    lab, n = ndi.label(merge_zone, np.ones((3, 3, 3), dtype=bool))
+    hit = np.unique(lab[merge_zone & opening.astype(bool)])
+    hit = hit[hit > 0]
+    if hit.size == 0:
+        notes.append("WARN: merge zone does not touch the posterior opening; "
+                     "keeping the whole half-space as nasopharynx")
+        return merge_zone, notes
+    kept = np.isin(lab, hit)
+    dropped = merge_zone & ~kept
+    if dropped.any():
+        notes.append(
+            f"merge zone: {int(n)} parts behind the landmark, "
+            f"{hit.size} reach the opening; {dropped.sum() * vox_ml:.1f} mL "
+            f"behind the landmark is not nasopharynx and may be stripped")
+    return kept, notes
+
+
 def dead_end_sinus_strip(
     air: np.ndarray,
     spacing_xyz: tuple[float, float, float],
@@ -526,15 +559,20 @@ def dead_end_sinus_strip(
     # A basin must also survive the extent slabs: on a full airway those ARE the
     # openings, and a sinus must not touch them either.
     terminal = terminal | ant_slab | post_slab
-    # KNOWN LIMITATION. merge_zone is a posterior HALF-SPACE, so it holds more
-    # than the nasopharynx: the sphenoid sits behind the choanae too, and the veto
-    # hands it back to the flow domain (THCA: 9.1 mL, both sphenoids, inside
-    # passage_lumen). Narrowing the veto to "half-space that is not itself behind
-    # a neck" was tried and REJECTED -- it carved the nasopharynx instead,
-    # producing bodies bounded at 6.5-11.5 mm openings (an ostium is 0.2-6 mm) and
-    # an unnamed 3.0 mL midline body on VH Male. Fixing this needs a merge zone
-    # bounded by the choanal aperture, not a half-space; until then a sphenoid
-    # behind the landmark stays in the domain rather than risk removing airway.
+    # merge_zone arrives as a posterior HALF-SPACE, which holds more than the
+    # nasopharynx: the sphenoid sits behind the choanae too, and the veto handed
+    # it back to the flow domain (THCA: 9.1 mL, both sphenoids, inside
+    # passage_lumen). Narrowing the veto by calibre ("half-space that is not
+    # itself behind a neck") was tried and REJECTED -- it carved the nasopharynx
+    # (bodies bounded at 6.5-11.5 mm openings). The nasopharynx is instead
+    # defined by CONNECTIVITY: the part of the half-space that reaches the
+    # posterior opening without leaving the half-space. The sphenoid's only air
+    # route to the nasopharynx runs forward through its ostium into the nasal
+    # cavity, in front of the landmark, so it is not connected inside the
+    # half-space and loses the veto; the nasopharynx contains the opening and
+    # keeps it whole, with no calibre judgement anywhere.
+    merge_zone, mz_notes = merge_zone_reaching_opening(merge_zone, post | post_slab, vox_ml)
+    notes.extend(mz_notes)
     behind = air & (bott > 0) & (edt > SINUS_SEED_RATIO * bott) & ~merge_zone
     struct = np.ones((3, 3, 3), dtype=bool)
     lab, n = ndi.label(behind, struct)
