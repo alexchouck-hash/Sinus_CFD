@@ -546,6 +546,11 @@ def import_openfoam_to_grid(
     foam_root = Path(foam_root or (repo / "foam" / case_id))
     outputs_root = Path(outputs_root or (repo / "outputs" / case_id))
     notes: list[str] = []
+    # A refused import must not leave an earlier verdict behind. VH female's
+    # "settled, 434 Pa" meta from a run under a looser outlet bound survived the
+    # next import's refusal, and anything reading flow_meta would have reported
+    # a number the guard had just rejected.
+    (outputs_root / f"{case_id}_flow_meta.json").unlink(missing_ok=True)
 
     mesh_dir = foam_root / "constant" / "polyMesh"
     for req in ("points", "faces", "owner"):
