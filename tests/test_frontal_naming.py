@@ -143,3 +143,26 @@ def test_without_spacing_the_gate_is_skipped():
     out = refine_frontal_by_antral_roof(recs, lab, True, [])
     assert all("mm_above_antral_roof" not in r for r in out)
     assert all(r["name"] != "unknown" for r in out)
+
+
+def test_a_large_high_body_is_a_complex_not_a_frontal_sinus():
+    """THCA at 1.5 mm slices: a 35 mL right-sided mass (maxillary + ethmoid +
+    sphenoid air, unseparated) sat mostly above the antral roof and was
+    renamed frontal. A frontal sinus is not 35 mL."""
+    lab, recs = _scene()
+    recs[2]["volume_ml"] = 35.0
+    notes = []
+    out = refine_frontal_by_antral_roof(recs, lab, True, notes)
+    by_id = {r["body_ids"][0]: r for r in out}
+    assert by_id[3]["name"] == "complex", by_id[3]
+    assert any("not a frontal sinus" in n for n in notes), notes
+
+
+def test_a_small_body_with_antral_level_air_is_not_frontal():
+    lab, recs = _scene()
+    lab[16:44, 6:16, 26:36] = 3        # extend body 3 down to antral height
+    recs[2]["volume_ml"] = 6.0        # ~40% of it now lies at or below the roof
+    notes = []
+    out = refine_frontal_by_antral_roof(recs, lab, True, notes)
+    by_id = {r["body_ids"][0]: r for r in out}
+    assert by_id[3]["name"] != "frontal", by_id[3]

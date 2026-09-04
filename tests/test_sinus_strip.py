@@ -537,3 +537,35 @@ def test_wide_chamber_on_the_route_behind_the_landmark_stays():
     merge = air & (np.arange(ny)[None, :, None] >= 40)
     passage, sinus, notes = dead_end_sinus_strip(air, ISO, merge_zone=merge)
     assert not sinus.any(), notes
+
+
+# --------------------------------------------------------------------------
+# bodies joined through a neck are split before naming
+# --------------------------------------------------------------------------
+
+
+def _ball(shape, c, r):
+    z, y, x = np.mgrid[: shape[0], : shape[1], : shape[2]]
+    return (z - c[0]) ** 2 + (y - c[1]) ** 2 + (x - c[2]) ** 2 <= r * r
+
+
+def test_two_chambers_joined_by_a_neck_are_two_bodies():
+    from sinus_cfd.patency import _split_midline_straddlers
+    shape = (50, 80, 50)
+    a = _ball(shape, (25, 18, 35), 10)        # both on the same side (x > midline 25)
+    b = _ball(shape, (25, 56, 35), 10)
+    z, y, x = np.mgrid[: shape[0], : shape[1], : shape[2]]
+    neck = ((z - 25) ** 2 + (x - 35) ** 2 <= 1.5 ** 2) & (y >= 26) & (y <= 48)
+    mask = a | b | neck
+    lab, n = _split_midline_straddlers(mask, ISO, x_midline=25)
+    assert n == 2, n
+    assert lab[25, 18, 35] != lab[25, 56, 35]
+
+
+def test_a_lobulated_single_sinus_with_a_wide_waist_stays_one_body():
+    from sinus_cfd.patency import _split_midline_straddlers
+    shape = (50, 70, 50)
+    a = _ball(shape, (25, 26, 35), 8)
+    b = _ball(shape, (25, 38, 35), 8)         # overlapping: waist radius ~5.3 mm
+    lab, n = _split_midline_straddlers(a | b, ISO, x_midline=25)
+    assert n == 1, n

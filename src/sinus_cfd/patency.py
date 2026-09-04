@@ -40,6 +40,15 @@ OSTIUM_MAX_DIAMETER_MM = 6.0
 SPLIT_MIN_VOLUME_ML = 5.0
 SPLIT_MIN_SIDE_FRACTION = 0.25
 SPLIT_ERODE_MAX_MM = 4.0
+# Neck split, for bodies that do NOT straddle the midline: a body of at least
+# SPLIT_NECK_MIN_VOLUME_ML that falls apart at an erosion radius of at most
+# SPLIT_NECK_MAX_MM into pieces of at least SPLIT_NECK_MIN_PIECE_ML each is two
+# sinuses joined through a neck (THCA: the right maxillary and the sphenoid,
+# 26-connected through posterior ethmoid air, read as one 35 mL "frontal").
+# A lobulated single sinus has a wide waist and does not separate that early.
+SPLIT_NECK_MAX_MM = 3.0
+SPLIT_NECK_MIN_VOLUME_ML = 2.0
+SPLIT_NECK_MIN_PIECE_ML = 1.0
 # A paranasal sinus drains INTO the nasal cavity, so it lies against it. Air this
 # far from the passage is not a sinus. Measured across all 5 cases: every genuine
 # body is 0.0-11.2 mm from the passage, while CQ500CT390 produced a 0.40 mL body
@@ -103,6 +112,14 @@ FRONTAL_ABOVE_ANTRAL_ROOF_FRAC = 0.5
 # the two non-sinuses that were being named "maxillary L" on VH male -- neck air
 # and skull-base air -- sit at -58.2 and -109.0 mm. 45 mm splits the gap.
 SINUS_MAX_BELOW_ANTRAL_ROOF_MM = 45.0
+# A frontal sinus is small (typically 4-7 mL, rarely above ~15) and sits
+# entirely above the antral roof. A body above these limits that the height
+# rule would call frontal is a sinus COMPLEX -- maxillary, ethmoid and
+# sphenoid air not separated at the scan's resolution (THCA, 1.5 mm slices:
+# a 35 mL right-sided mass, 8% of it below the antral roof, read as
+# "frontal"). It is reported as `complex`, not hidden under a wrong name.
+FRONTAL_MAX_VOLUME_ML = 20.0
+FRONTAL_MAX_BELOW_ROOF_ML = 1.0
 
 
 def inside_edt_mm(mask, spacing_xyz):
@@ -270,8 +287,11 @@ def _split_midline_straddlers(mask, spacing_xyz, x_midline):
     until the body falls apart, then hand the pieces back their territory by
     watershed, which puts the boundary at the narrowest link between them.
 
-    Returns a labelled array. Only bodies that straddle the midline are split,
-    so a genuinely single sinus and a cluster of ethmoid cells are left alone.
+    Returns a labelled array. A body is split when it straddles the midline
+    (any erosion radius up to SPLIT_ERODE_MAX_MM) or when, on one side, it
+    separates at a neck of radius <= SPLIT_NECK_MAX_MM into pieces of at
+    least SPLIT_NECK_MIN_PIECE_ML -- two sinuses joined through a neck. A
+    genuinely single sinus has a wide waist and is left alone.
     """
     lab, n = ndi.label(mask, STRUCT26)
     if n == 0:
@@ -286,20 +306,24 @@ def _split_midline_straddlers(mask, spacing_xyz, x_midline):
         xs = np.where(b)[2]
         left = float((xs > x_midline).mean())
         straddles = min(left, 1.0 - left) >= SPLIT_MIN_SIDE_FRACTION
-        if vol < SPLIT_MIN_VOLUME_ML or not straddles:
+        midline_rule = vol >= SPLIT_MIN_VOLUME_ML and straddles
+        neck_rule = vol >= SPLIT_NECK_MIN_VOLUME_ML
+        if not (midline_rule or neck_rule):
             nxt += 1
             out[b] = nxt
             continue
+        r_max = SPLIT_ERODE_MAX_MM if midline_rule else SPLIT_NECK_MAX_MM
+        piece_ml = 0.3 if midline_rule else SPLIT_NECK_MIN_PIECE_ML
         edt_b = inside_edt_mm(b, spacing_xyz)
         markers = None
         step = max(min(sz, sy, sx), 0.25)
         r = step
-        while r <= SPLIT_ERODE_MAX_MM:
+        while r <= r_max:
             core = b & (edt_b >= r)
             cl, cn = ndi.label(core, STRUCT26)
             if cn >= 2:
                 csz = ndi.sum(core, cl, range(1, cn + 1))
-                keep = [k + 1 for k in range(cn) if csz[k] * vox_ml >= 0.3]
+                keep = [k + 1 for k in range(cn) if csz[k] * vox_ml >= piece_ml]
                 if len(keep) >= 2:
                     markers = np.zeros_like(cl)
                     for j, k in enumerate(keep, start=1):
@@ -493,6 +517,21 @@ def refine_frontal_by_antral_roof(
                         "paranasal sinus (neck or skull-base air)"
                     )
                 r["name"] = "unknown"
+                continue
+        vol = float(r.get("volume_ml") or 0.0)
+        below_ml = (1.0 - frac) * vol
+        if frac >= FRONTAL_ABOVE_ANTRAL_ROOF_FRAC or r["name"] == "frontal":
+            if vol > FRONTAL_MAX_VOLUME_ML or below_ml > FRONTAL_MAX_BELOW_ROOF_ML:
+                if notes is not None:
+                    notes.append(
+                        f"{r['name']} {r['side']} ({vol:.2f} mL) is not a frontal sinus: "
+                        f"{vol:.1f} mL with {below_ml:.1f} mL below the antral roof "
+                        f"(limits {FRONTAL_MAX_VOLUME_ML:.0f} mL / "
+                        f"{FRONTAL_MAX_BELOW_ROOF_ML:.0f} mL) -- a sinus complex not "
+                        "separated at this resolution"
+                    )
+                r["name"] = "complex"
+                r["complex_reason"] = "maxillary/ethmoid/sphenoid air not separable at this resolution"
                 continue
         if frac >= FRONTAL_ABOVE_ANTRAL_ROOF_FRAC and r["name"] != "frontal":
             if notes is not None:
