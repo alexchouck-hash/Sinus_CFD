@@ -124,3 +124,22 @@ def test_run_that_hit_its_cap_is_not_marked_converged(tmp_path):
     v = pressure_drop_verdict(root)
     assert v["converged_by_residual"] is False
     assert v["converged_at_iteration"] is None
+
+
+def test_time_dir_without_p_is_not_a_solve(tmp_path):
+    """A U-only time directory (a function object's output after a solver
+    that died at start-up) must not be matched by cell count."""
+    from sinus_cfd.openfoam_import import select_time_dir_matching_cells
+    n = 5
+    body = ("FoamFile\n{\n    version 2.0;\n    format ascii;\n    class volVectorField;\n"
+            "    object U;\n}\n\ninternalField nonuniform List<vector>\n"
+            f"{n}\n(\n" + "\n".join("(1 0 0)" for _ in range(n)) + "\n)\n;\n")
+    for t, with_p in (("50", False), ("100", False)):
+        d = tmp_path / t
+        d.mkdir()
+        (d / "U").write_text(body, encoding="utf-8")
+        if with_p:
+            (d / "p").write_text("x", encoding="utf-8")
+    assert select_time_dir_matching_cells(tmp_path, n) is None
+    (tmp_path / "50" / "p").write_text("x", encoding="utf-8")
+    assert select_time_dir_matching_cells(tmp_path, n) == "50"

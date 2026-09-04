@@ -480,6 +480,11 @@ def select_time_dir_matching_cells(foam_case: Path, n_cells: int) -> str | None:
     for name in _time_dirs_desc(foam_case):
         if float(name) == 0.0:
             continue  # the initial condition is not a solve
+        if not (foam_case / name / "p").is_file():
+            # THCA 2026-09-04: simpleFoam died at start-up with a FATAL IO
+            # error, a function object had written U-only time directories,
+            # and the import matched one by cell count. A solve writes p.
+            continue
         try:
             u = read_foam_vector_field(foam_case / name / "U")
         except Exception:
@@ -971,10 +976,15 @@ def import_openfoam_to_grid(
     if pressure_drop is not None:
         pressure_drop["outlet_patch"] = outlet_patch
     if pressure_drop is None:
-        notes.append(
-            "WARNING: no postProcessing/p_*/surfaceFieldValue.dat history; "
-            "pressure-drop convergence UNVERIFIED for this import."
-        )
+        # Every scaffold writes this history. Its absence means the solve did
+        # not run (or ran somewhere else), and an import without a settled
+        # pressure drop is not a measurement -- refuse, do not warn.
+        out_npz.unlink(missing_ok=True)
+        reason = (f"[{case_id}] no postProcessing/p_*/surfaceFieldValue.dat history under "
+                  f"{foam_root}: the solve did not run to a recorded pressure drop; "
+                  "nothing to import.")
+        _record_refusal(outputs_root, case_id, reason)
+        raise ValueError(reason)
     else:
         d = pressure_drop["drift_rel_change"]
         drift_txt = "n/a (too few samples)" if d != d else f"{100 * d:.2f}%"
