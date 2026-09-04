@@ -451,23 +451,39 @@ def _opening_slabs(
 
 
 def merge_zone_reaching_opening(
-    merge_zone: np.ndarray, opening: np.ndarray, vox_ml: float
+    merge_zone: np.ndarray, opening: np.ndarray, vox_ml: float,
+    air: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[str]]:
-    """Keep only the 26-connected parts of ``merge_zone`` that touch ``opening``.
+    """Keep only the parts of ``merge_zone`` connected to ``opening`` behind the landmark.
 
     Air behind the choanal landmark that cannot reach the outlet without
     leaving the half-space is not nasopharynx (a sphenoid, a posterior ethmoid
-    cell) and must not carry the nasopharynx's veto. If no part touches the
-    opening the zone is returned untouched with a WARN: losing the veto would
-    let the dead-end test strip the nasopharynx, which is worse than keeping a
-    sphenoid.
+    cell) and must not carry the nasopharynx's veto. Connectivity is judged in
+    ``air`` restricted to the half-space the merge zone spans, not in the
+    merge zone alone: the zone is built on nasal-box air while the strip's
+    airway carries the glued pharynx behind the box, where the opening is
+    (THCA: the zone never touched the opening and the veto fell back whole).
+    If no part touches the opening the zone is returned untouched with a
+    WARN: losing the veto would let the dead-end test strip the nasopharynx,
+    which is worse than keeping a sphenoid.
     """
     notes: list[str] = []
     merge_zone = merge_zone.astype(bool)
     if not merge_zone.any():
         return merge_zone, notes
-    lab, n = ndi.label(merge_zone, np.ones((3, 3, 3), dtype=bool))
-    hit = np.unique(lab[merge_zone & opening.astype(bool)])
+    zone = merge_zone
+    if air is not None:
+        air = air.astype(bool)
+        y_m = np.where(merge_zone)[1]
+        y_a = np.where(air)[1]
+        idx = np.arange(air.shape[1])[None, :, None]
+        if y_m.mean() >= y_a.mean():          # posterior is high y
+            zone = air & (idx >= int(y_m.min()))
+        else:
+            zone = air & (idx <= int(y_m.max()))
+        zone |= merge_zone
+    lab, n = ndi.label(zone, np.ones((3, 3, 3), dtype=bool))
+    hit = np.unique(lab[zone & opening.astype(bool)])
     hit = hit[hit > 0]
     if hit.size == 0:
         notes.append("WARN: merge zone does not touch the posterior opening; "
@@ -477,7 +493,7 @@ def merge_zone_reaching_opening(
     dropped = merge_zone & ~kept
     if dropped.any():
         notes.append(
-            f"merge zone: {int(n)} parts behind the landmark, "
+            f"merge zone: {int(n)} air parts behind the landmark, "
             f"{hit.size} reach the opening; {dropped.sum() * vox_ml:.1f} mL "
             f"behind the landmark is not nasopharynx and may be stripped")
     return kept, notes
@@ -571,7 +587,7 @@ def dead_end_sinus_strip(
     # cavity, in front of the landmark, so it is not connected inside the
     # half-space and loses the veto; the nasopharynx contains the opening and
     # keeps it whole, with no calibre judgement anywhere.
-    merge_zone, mz_notes = merge_zone_reaching_opening(merge_zone, post | post_slab, vox_ml)
+    merge_zone, mz_notes = merge_zone_reaching_opening(merge_zone, post | post_slab, vox_ml, air=air)
     notes.extend(mz_notes)
     behind = air & (bott > 0) & (edt > SINUS_SEED_RATIO * bott) & ~merge_zone
     struct = np.ones((3, 3, 3), dtype=bool)

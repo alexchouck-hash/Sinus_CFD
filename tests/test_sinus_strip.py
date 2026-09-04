@@ -547,3 +547,19 @@ def test_nasopharynx_that_reaches_the_opening_keeps_the_whole_veto():
     kept, notes = merge_zone_reaching_opening(merge, opening, 0.001)
     assert kept[14, 40, 16] and kept[14, 55, 16]
     assert not kept[14, 43, 31]
+
+
+def test_merge_zone_connects_to_the_opening_through_air_beyond_it():
+    """The zone is box-limited; the opening sits in glued air behind the box.
+    Connectivity must run through the airway, not the zone alone."""
+    from sinus_cfd.auto_airway import merge_zone_reaching_opening
+    air = _tube_with_sphenoid_like_chamber()
+    ny = air.shape[1]
+    y = np.arange(ny)[None, :, None]
+    merge = air & (y >= 36) & (y < 46)         # box ends at y=46; opening is at y=55
+    opening = np.zeros_like(air)
+    opening[:, 55, :] = air[:, 55, :]
+    kept, notes = merge_zone_reaching_opening(merge, opening, 0.001, air=air)
+    assert kept[14, 40, 16], notes             # nasopharynx part of the zone kept
+    assert not kept[14, 43, 31], notes         # chamber part dropped
+    assert not any("WARN" in n for n in notes), notes
