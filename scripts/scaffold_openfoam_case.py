@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
@@ -558,6 +559,15 @@ snGradSchemes
     )
 
     # ---- system/fvSolution ----
+    # U under-relaxation. 0.9 under SIMPLEC settles every case here except
+    # THCA once its sphenoid was stripped: a +-1.5% limit-cycle in the inlet
+    # pressure (wobble 3.2% vs the 3% bar) that 0.7 damps to 2.5%. Per-case
+    # override via SINUS_CFD_U_RELAX; the value is recorded in the manifest.
+    u_relax = os.environ.get("SINUS_CFD_U_RELAX", "0.9")
+    try:
+        float(u_relax)
+    except ValueError:
+        raise SystemExit(f"SINUS_CFD_U_RELAX={u_relax!r} is not a number")
     _write(
         system / "fvSolution",
         """
@@ -622,7 +632,8 @@ relaxationFactors
         ".*"            0.9;
     }
 }
-""",
+""".replace("U               0.9;", f"U               {u_relax};")
+   .replace('".*"            0.9;', f'".*"            {u_relax};'),
     )
 
     # ---- system/decomposeParDict (optional multi-core) ----
@@ -1078,6 +1089,7 @@ wsl -d $distro -u root -- bash -lc "cd '$caseUnix' && chmod +x Allrun Allclean &
         "bounds_m": {"min": bmin.tolist(), "max": bmax.tolist()},
         "locationInMesh_m": loc.tolist(),
         "stl_scaled_from_mm": True,
+        "u_relaxation": float(u_relax),
     }
     (foam_root / "case_manifest.json").write_text(
         json.dumps(man, indent=2), encoding="utf-8"
