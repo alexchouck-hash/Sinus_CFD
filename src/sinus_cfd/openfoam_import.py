@@ -544,6 +544,15 @@ def persist_outlet_viewer_marker(bc_path: Path, marker_mm) -> dict[str, Any]:
     return {"ports": touched, "marker_mm": [float(v) for v in marker_mm]}
 
 
+def _record_refusal(outputs_root: Path, case_id: str, reason: str) -> None:
+    """A refused import leaves ONE file: the reason, machine-readable, where the
+    flow meta would have been. Anything tabulating results reads it instead of
+    grepping logs; a later successful import removes it."""
+    (outputs_root / f"{case_id}_flow_refused.json").write_text(
+        json.dumps({"case_id": case_id, "refused": True, "reason": reason}, indent=2),
+        encoding="utf-8")
+
+
 def import_openfoam_to_grid(
     case_id: str = "VisibleHuman_Head",
     foam_root: Path | str | None = None,
@@ -563,6 +572,7 @@ def import_openfoam_to_grid(
     # next import's refusal, and anything reading flow_meta would have reported
     # a number the guard had just rejected.
     (outputs_root / f"{case_id}_flow_meta.json").unlink(missing_ok=True)
+    (outputs_root / f"{case_id}_flow_refused.json").unlink(missing_ok=True)
 
     mesh_dir = foam_root / "constant" / "polyMesh"
     for req in ("points", "faces", "owner"):
@@ -930,21 +940,34 @@ def import_openfoam_to_grid(
         outlet_name = outlet_patch_name
     if outlet_patch is not None:
         if outlet_patch["max_over_mean"] > OUTLET_HOT_FACE_MAX_RATIO:
-            raise ValueError(
+            # The field was already written above; a refused import must not
+            # leave it behind as if it were a measurement (VH female's 434 Pa
+            # sat in outputs/ for half an hour that way).
+            out_npz.unlink(missing_ok=True)
+            reason = (
                 f"[{case_id}] outlet patch '{outlet_name}' is choked: max face speed is "
                 f"{outlet_patch['max_over_mean']:.0f}x the patch mean "
                 f"({outlet_patch['max_m_s']:.1f} vs {outlet_patch['mean_m_s']:.2f} m/s, "
                 f"{outlet_patch['hot_faces']} faces above 5x; limit "
                 f"{OUTLET_HOT_FACE_MAX_RATIO:.0f}x). The pressure drop is set by the cap, "
-                "not the airway. Move the outlet (auto_process_head --outlet nasopharynx) "
-                "and re-solve."
+                "not the airway. If the outlet is still the trachea, move it "
+                "(auto_process_head --outlet nasopharynx) and re-solve; if it is already "
+                "the choana, the outlet section itself is too small for the flow at this "
+                "resolution and the case cannot be measured."
             )
+            _record_refusal(outputs_root, case_id, reason)
+            raise ValueError(reason)
         notes.append(
             f"Outlet patch '{outlet_name}': {outlet_patch['n_faces']} faces, max/mean "
             f"{outlet_patch['max_over_mean']:.1f}x, {outlet_patch['hot_faces']} above 5x -- clean."
         )
 
-    pressure_drop = pressure_drop_verdict(foam_root)
+    try:
+        pressure_drop = pressure_drop_verdict(foam_root)
+    except ValueError as exc:
+        out_npz.unlink(missing_ok=True)   # same rule: no field survives a refusal
+        _record_refusal(outputs_root, case_id, str(exc))
+        raise
     if pressure_drop is not None:
         pressure_drop["outlet_patch"] = outlet_patch
     if pressure_drop is None:
