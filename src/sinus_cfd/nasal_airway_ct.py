@@ -943,7 +943,11 @@ def extract_ct_nasal_airway(
             strip_domain, spacing_xyz, merge_zone=merge_zone
         )
         notes.extend(n_tp)
-        sinus_detour = sinus_full & flooded
+        # The strip's verdict is on the WHOLE flood domain. A sinus behind the
+        # nasal box's posterior face (the sphenoid, THCA: 8.9 mL core) is still
+        # a sinus: keep it in sinus_detour so drainage names it and the export
+        # excludes it, instead of clipping the record to the box.
+        sinus_detour = sinus_full.copy()
         passage = flooded & ~sinus_detour
         # The strip must never delete a cavity. It cannot by construction (a
         # basin reaching an opening is rejected), but keep the guard so a future
@@ -956,10 +960,15 @@ def extract_ct_nasal_airway(
             )
             passage = flooded
             sinus_detour = np.zeros_like(flooded)
+            sinus_full = np.zeros_like(flooded)
         left = left_ant & passage
         right = right_ant & passage
         if merge_zone is not None:
-            passage = left | right | merge_zone
+            # The merge zone is a half-space: it held the sphenoid, and OR-ing
+            # it back wholesale undid the strip's verdict behind the landmark
+            # (THCA 2026-09-04: the strip removed the sphenoid, this line put
+            # it back). Only merge-zone air the strip did not call sinus.
+            passage = left | right | (merge_zone & ~sinus_full)
         else:
             passage = left | right
         # Glue the whole-head nasopharynx/trachea continuation back on. The
@@ -970,7 +979,9 @@ def extract_ct_nasal_airway(
         # the box and connected to the passage is added, so the sinuses --
         # which are inside the box -- stay stripped.
         if flood_domain is not None:
-            outside = flood_domain.astype(bool) & ~box
+            # ... and never glue back what the strip called sinus: the sphenoid
+            # can lie behind the box's posterior face, exactly where this looks.
+            outside = flood_domain.astype(bool) & ~box & ~sinus_full
             if outside.any():
                 s26 = np.ones((3, 3, 3), dtype=bool)
                 lab_g, _n = ndi.label(passage | outside, s26)
