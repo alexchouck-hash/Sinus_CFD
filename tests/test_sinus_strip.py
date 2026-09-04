@@ -569,3 +569,22 @@ def test_a_lobulated_single_sinus_with_a_wide_waist_stays_one_body():
     b = _ball(shape, (25, 38, 35), 8)         # overlapping: waist radius ~5.3 mm
     lab, n = _split_midline_straddlers(a | b, ISO, x_midline=25)
     assert n == 1, n
+
+
+def test_air_below_the_naris_plane_behind_the_landmark_is_never_sinus():
+    """A dead-end pocket behind the landmark but below the nares (a piriform
+    fossa) stays passage; the same pocket above the nares is stripped."""
+    air = _tube_with_sphenoid_like_chamber()      # chamber at z 6..21, tube at z 10..17
+    ny = air.shape[1]
+    merge = air & (np.arange(ny)[None, :, None] >= 40)
+    seeds = [(14, 5, 14), (14, 5, 17)]
+    # superior is LOW z here, so the chamber (z up to 21) is partly "below" the
+    # nares (z 14): pretend the whole chamber is inferior by putting the nares high
+    seeds_hi = [(3, 5, 14), (3, 5, 17)]
+    _p, sinus_above, _n = dead_end_sinus_strip(air, ISO, merge_zone=merge, naris_seeds=seeds_hi,
+                                               superior_is_high_z=True)
+    assert sinus_above[14, 55, 34]                 # above the nares: stripped
+    _p, sinus_below, notes = dead_end_sinus_strip(air, ISO, merge_zone=merge, naris_seeds=seeds_hi,
+                                                  superior_is_high_z=False)
+    assert not sinus_below.any(), notes            # below the nares: pharynx, kept
+    assert any("below the naris plane" in n for n in notes), notes

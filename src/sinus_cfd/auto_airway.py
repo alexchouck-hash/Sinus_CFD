@@ -515,6 +515,7 @@ def dead_end_sinus_strip(
     spacing_xyz: tuple[float, float, float],
     merge_zone: np.ndarray | None = None,
     naris_seeds: list[tuple[int, int, int]] | None = None,
+    superior_is_high_z: bool | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Split the flooded airway into (passage, sinus) by a dead-end test.
 
@@ -600,6 +601,22 @@ def dead_end_sinus_strip(
     # not -- a sphenoid basin touches the veto only at its neck.
     veto, mz_notes = nasopharynx_veto(air, merge_zone, ant, post, edt, spacing_xyz, vox_ml)
     notes.extend(mz_notes)
+    # Anatomical prior: every paranasal sinus sits above the nasal floor. Air
+    # behind the landmark and BELOW the naris plane is pharynx (vallecula,
+    # piriform fossae) -- dead ends off the route, but not sinuses, and
+    # stripping them changes the outlet region of a whole-head domain (THCA:
+    # the trachea patch went from 3.3x to 13x hot faces after 5.8 mL of
+    # pharyngeal pocket was removed beside it).
+    if superior_is_high_z is not None and naris_seeds:
+        z_n = float(np.mean([float(s[0]) for s in naris_seeds]))
+        zidx = np.arange(air.shape[0])[:, None, None]
+        below = (zidx < z_n) if superior_is_high_z else (zidx > z_n)
+        pharynx = merge_zone & below & ~veto
+        if pharynx.any():
+            veto = veto | pharynx
+            notes.append(
+                f"nasopharynx veto: +{pharynx.sum() * vox_ml:.1f} mL behind the landmark "
+                "below the naris plane vetoed as pharynx (no sinus lies below the nasal floor)")
     behind = air & (bott > 0) & (edt > SINUS_SEED_RATIO * bott) & ~veto
     struct = np.ones((3, 3, 3), dtype=bool)
     lab, n = ndi.label(behind, struct)

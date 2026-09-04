@@ -940,7 +940,8 @@ def extract_ct_nasal_airway(
             flood_domain.astype(bool) if flood_domain is not None else flooded
         )
         _strip_passage, sinus_full, n_tp = dead_end_sinus_strip(
-            strip_domain, spacing_xyz, merge_zone=merge_zone
+            strip_domain, spacing_xyz, merge_zone=merge_zone,
+            naris_seeds=[snap_l, snap_r], superior_is_high_z=superior_is_high_z,
         )
         notes.extend(n_tp)
         # The strip's verdict is on the WHOLE flood domain. A sinus behind the
