@@ -301,6 +301,77 @@ def _largest_component(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     return max(parts, key=lambda m: len(m.faces))
 
 
+# A closed shell below this volume is a marching-cubes speck, not anatomy.
+# VH male's sealed solid produced shells of 74.1, 13.6, 9.5, 0.019 and 0.000 mL:
+# the outer wall, two maxillary antra as cavities, and two slivers.
+MIN_SHELL_VOLUME_MM3 = 20.0
+
+
+def _keep_solid_shells(mesh: trimesh.Trimesh, min_volume_mm3: float = MIN_SHELL_VOLUME_MM3) -> trimesh.Trimesh:
+    """Keep every closed shell above a sliver floor -- the outer wall AND the
+    walls of cavities inside it.
+
+    Replaces _largest_component at the two places it was applied to the solid
+    air body. With the sinuses excluded from the voxel solid they are cavities
+    inside it; marching cubes gives an outer shell plus one inner shell per
+    cavity, and keeping only the largest threw the inner walls away, so the
+    surface handed to snappyHexMesh wrapped the sinuses back in (VH male:
+    74.1 mL enclosed against a 51.8 mL voxel solid, 23.2 mL of that being the
+    two antra). The mesh-vs-voxel guard is what caught it.
+    """
+    try:
+        parts = mesh.split(only_watertight=False)
+    except Exception:
+        return mesh
+    if len(parts) <= 1:
+        return mesh
+    kept = [p for p in parts if abs(float(p.volume)) >= min_volume_mm3]
+    if not kept:
+        return max(parts, key=lambda m: len(m.faces))
+    return trimesh.util.concatenate(kept) if len(kept) > 1 else kept[0]
+
+
+def _orient_shells(
+    mesh: trimesh.Trimesh,
+    solid_closed: np.ndarray,
+    spacing: tuple[float, float, float],
+    origin: tuple[float, float, float],
+) -> trimesh.Trimesh:
+    """Point every shell's normals away from the fluid.
+
+    fix_normals orients each body outward from itself. For a cavity wall that
+    is INTO the fluid, so its signed volume adds instead of subtracting and the
+    mesh reports the cavity as air. A shell is a cavity wall if its centroid
+    lies in a hole of the voxel solid (fill_holes(solid) & ~solid) -- a voxel
+    test, so no ray-casting dependency. Those shells are flipped; the mesh's
+    signed volume is then outer minus cavities, which is what the voxel solid
+    measures and what the export's guard compares against.
+    """
+    try:
+        parts = mesh.split(only_watertight=False)
+    except Exception:
+        return mesh
+    if len(parts) <= 1:
+        return mesh
+    cav = ndi.binary_fill_holes(solid_closed.astype(bool)) & ~solid_closed.astype(bool)
+    if not cav.any():
+        return mesh
+    sx, sy, sz = spacing
+    ox, oy, oz = origin
+    out = []
+    for p in parts:
+        cm = p.vertices.mean(axis=0)
+        ix = int(round((cm[0] - ox) / sx)); iy = int(round((cm[1] - oy) / sy)); iz = int(round((cm[2] - oz) / sz))
+        inner = (0 <= iz < cav.shape[0] and 0 <= iy < cav.shape[1] and 0 <= ix < cav.shape[2]
+                 and bool(cav[iz, iy, ix]))
+        want_negative = inner
+        if (float(p.volume) < 0) != want_negative:
+            p = p.copy()
+            p.invert()
+        out.append(p)
+    return trimesh.util.concatenate(out) if len(out) > 1 else out[0]
+
+
 def _smoothed_field_mesh(
     solid_closed: np.ndarray,
     spacing: tuple[float, float, float],
@@ -351,7 +422,8 @@ def solid_mask_to_watertight_mesh(
         mesh = _mask_to_mesh(solid_closed, spacing, origin)
         notes.append(f"Smoothed-field marching cubes failed ({e}); used raw binary mask.")
 
-    mesh = _largest_component(mesh)
+    mesh = _keep_solid_shells(mesh)
+    mesh = _orient_shells(mesh, solid_closed, spacing, origin)
     try:
         mesh.process(validate=True)
     except Exception:
@@ -373,6 +445,7 @@ def solid_mask_to_watertight_mesh(
             break
         try:
             trimesh.repair.fix_normals(mesh)
+            mesh = _orient_shells(mesh, solid_closed, spacing, origin)
         except Exception:
             pass
 
@@ -390,6 +463,11 @@ def solid_mask_to_watertight_mesh(
             except Exception:
                 break
 
+    # Orient before the decimation comparison: with cavity walls kept, an
+    # unoriented mesh sums outer + inner (VH male: 93.2 mL) while the decimated
+    # copy is oriented (49.2 mL), and a good decimation was rejected as a 47%
+    # volume change.
+    mesh = _orient_shells(mesh, solid_closed, spacing, origin)
     was_wt = bool(mesh.is_watertight)
     n_faces_raw = len(mesh.faces)
     if n_faces_raw > target_faces:
@@ -400,7 +478,8 @@ def solid_mask_to_watertight_mesh(
                 f"keeping the full-resolution mesh ({n_faces_raw} faces)."
             )
         else:
-            simplified = _largest_component(simplified)
+            simplified = _keep_solid_shells(simplified)
+            simplified = _orient_shells(simplified, solid_closed, spacing, origin)
             # Re-fill after decimation (often opens small holes)
             for _ in range(4):
                 if bool(simplified.is_watertight):
@@ -429,6 +508,7 @@ def solid_mask_to_watertight_mesh(
                 )
     try:
         mesh.fix_normals()
+        mesh = _orient_shells(mesh, solid_closed, spacing, origin)
     except Exception:
         pass
 
