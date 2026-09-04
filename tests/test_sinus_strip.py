@@ -99,14 +99,18 @@ def test_both_openings_survive():
     assert (passage & air & (idx >= 54)).any()
 
 
-def test_merge_zone_is_never_sinus():
-    """A wide chamber inside the merge zone stays passage (strategy K5)."""
+def test_merge_zone_off_the_route_no_longer_protects_a_dead_end():
+    """Strategy K5 revised: the merge zone is where the nasopharynx may be, not
+    a declaration that everything in it is passage. A dead-end chamber hanging
+    off the route by a neck is sinus even when the half-space holds it -- that
+    is exactly the sphenoid. The nasopharynx itself is protected because the
+    route runs through it (see the detour tests below)."""
     air = _tube_with_side_chamber()
     merge = np.zeros_like(air)
-    merge[8:20, 34:48, 24:38] = True         # declare the chamber nasopharynx
+    merge[8:20, 34:48, 24:38] = True         # the chamber is inside the half-space
     passage, sinus, notes = dead_end_sinus_strip(air, ISO, merge_zone=merge)
-    assert not (sinus & merge).any(), notes
-    assert passage[14, 41, 31]
+    assert sinus[14, 41, 31], notes
+    assert passage[14, 50, 16] and passage[14, 10, 16]
 
 
 def test_plain_tube_yields_no_sinus():
@@ -497,69 +501,39 @@ def test_merge_only_fuses_bodies_that_are_actually_adjacent():
     assert {round(r["volume_ml"], 2) for r in kept} == {16.0, 1.5}
 
 
+
 # --------------------------------------------------------------------------
-# merge zone bounded by connectivity to the outlet, not a half-space
+# the nasopharynx veto follows the through-route, not the half-space
 # --------------------------------------------------------------------------
 
 
 def _tube_with_sphenoid_like_chamber():
-    """A through tube plus a roomy chamber BEHIND the landmark whose only neck
-    opens in FRONT of it -- the sphenoid: behind the choanae, draining forward."""
-    air = np.zeros((28, 60, 40), dtype=bool)
-    air[10:18, 4:56, 12:20] = True          # main tube
-    air[8:20, 36:50, 24:38] = True          # chamber, entirely at y >= 36
-    # neck from the tube at y=30 back to y=35, meeting the chamber's front
-    # corner diagonally at y=36: every neck voxel is in FRONT of the landmark
-    air[13:15, 30:36, 20:24] = True
+    """A through tube plus a roomy chamber BEHIND the landmark hanging off the
+    route by a neck -- the sphenoid: behind the choanae, a detour off the way."""
+    air = np.zeros((28, 80, 44), dtype=bool)
+    air[10:18, 4:76, 12:20] = True          # main tube, y 4..75
+    air[6:22, 40:64, 26:42] = True          # chamber, entirely at y >= 40, deep (24 mm)
+    air[13:15, 44:46, 20:26] = True         # 2x2 neck from the tube into the chamber
     return air
 
 
-def test_chamber_behind_landmark_draining_forward_is_stripped():
+def test_chamber_behind_landmark_off_the_route_is_stripped():
     air = _tube_with_sphenoid_like_chamber()
     ny = air.shape[1]
-    merge = air & (np.arange(ny)[None, :, None] >= 36)   # posterior half-space
+    merge = air & (np.arange(ny)[None, :, None] >= 40)   # posterior half-space
     passage, sinus, notes = dead_end_sinus_strip(air, ISO, merge_zone=merge)
-    assert sinus[14, 43, 31], notes          # the chamber is sinus ...
+    assert sinus[14, 55, 34], notes          # the chamber core is sinus ...
     assert passage[14, 50, 16], notes        # ... the tube behind the landmark stays
-    assert passage[14, 55, 16]
-    assert any("is not nasopharynx" in n for n in notes), notes
+    assert passage[14, 74, 16]
+    assert any("nasopharynx veto" in n for n in notes), notes
 
 
-def test_merge_zone_that_misses_the_opening_is_kept_whole_with_a_warning():
-    from sinus_cfd.auto_airway import merge_zone_reaching_opening
-    air = _tube_with_side_chamber()
-    merge = np.zeros_like(air)
-    merge[8:20, 34:48, 24:38] = True
-    opening = np.zeros_like(air)
-    opening[:, 55, :] = air[:, 55, :]
-    kept, notes = merge_zone_reaching_opening(merge, opening, 0.001)
-    assert (kept == merge).all()
-    assert notes and "WARN" in notes[0]
-
-
-def test_nasopharynx_that_reaches_the_opening_keeps_the_whole_veto():
-    from sinus_cfd.auto_airway import merge_zone_reaching_opening
-    air = _tube_with_sphenoid_like_chamber()
+def test_wide_chamber_on_the_route_behind_the_landmark_stays():
+    """A roomy chamber the tube passes THROUGH (the nasopharynx) is vetoed."""
+    air = np.zeros((28, 80, 44), dtype=bool)
+    air[10:18, 4:76, 12:20] = True
+    air[4:24, 44:60, 4:40] = True           # big chamber straddling the tube
     ny = air.shape[1]
-    merge = air & (np.arange(ny)[None, :, None] >= 36)
-    opening = np.zeros_like(air)
-    opening[:, 55, :] = air[:, 55, :]
-    kept, notes = merge_zone_reaching_opening(merge, opening, 0.001)
-    assert kept[14, 40, 16] and kept[14, 55, 16]
-    assert not kept[14, 43, 31]
-
-
-def test_merge_zone_connects_to_the_opening_through_air_beyond_it():
-    """The zone is box-limited; the opening sits in glued air behind the box.
-    Connectivity must run through the airway, not the zone alone."""
-    from sinus_cfd.auto_airway import merge_zone_reaching_opening
-    air = _tube_with_sphenoid_like_chamber()
-    ny = air.shape[1]
-    y = np.arange(ny)[None, :, None]
-    merge = air & (y >= 36) & (y < 46)         # box ends at y=46; opening is at y=55
-    opening = np.zeros_like(air)
-    opening[:, 55, :] = air[:, 55, :]
-    kept, notes = merge_zone_reaching_opening(merge, opening, 0.001, air=air)
-    assert kept[14, 40, 16], notes             # nasopharynx part of the zone kept
-    assert not kept[14, 43, 31], notes         # chamber part dropped
-    assert not any("WARN" in n for n in notes), notes
+    merge = air & (np.arange(ny)[None, :, None] >= 40)
+    passage, sinus, notes = dead_end_sinus_strip(air, ISO, merge_zone=merge)
+    assert not sinus.any(), notes

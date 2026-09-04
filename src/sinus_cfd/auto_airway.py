@@ -45,6 +45,14 @@ NARIS_TERMINAL_SLAB_MM = 1.5
 # Measured stable over 1.15-2.0 on both Visible Human and CQ500CT105; the
 # lateral (maxillary) basins do not move across that range.
 SINUS_SEED_RATIO = 2.0
+# The nasopharynx veto (strategy K5) protects only merge-zone air that lies
+# within this detour of the nares->outlet through-route: detour = d(naris) +
+# d(outlet) - shortest. THCA: nasopharynx core 0-20 mm, sphenoid core 14-62 mm
+# (its ostium region overlaps; its body does not).
+NASOPHARYNX_DETOUR_MAX_MM = 25.0
+# A basin is passage, not sinus, when at least this fraction of it is vetoed:
+# the nasopharynx is almost entirely on the route, a sphenoid only at its neck.
+VETO_REJECT_FRAC = 0.5
 # Local radius within this multiple of the widest-path radius means open
 # corridor -> passage marker. Raising it erodes the sinuses (VH 8.9 -> 4.8 mL
 # at 1.6), so it stays tight.
@@ -450,53 +458,56 @@ def _opening_slabs(
     return air & (idx <= y0 + t), air & (idx >= y1 - t)
 
 
-def merge_zone_reaching_opening(
-    merge_zone: np.ndarray, opening: np.ndarray, vox_ml: float,
-    air: np.ndarray | None = None,
+def nasopharynx_veto(
+    air: np.ndarray,
+    merge_zone: np.ndarray,
+    ant: np.ndarray,
+    post: np.ndarray,
+    edt: np.ndarray,
+    spacing_xyz: tuple[float, float, float],
+    vox_ml: float,
+    max_detour_mm: float = NASOPHARYNX_DETOUR_MAX_MM,
 ) -> tuple[np.ndarray, list[str]]:
-    """Keep only the parts of ``merge_zone`` connected to ``opening`` behind the landmark.
+    """Merge-zone air within ``max_detour_mm`` of the nares->outlet through-route.
 
-    Air behind the choanal landmark that cannot reach the outlet without
-    leaving the half-space is not nasopharynx (a sphenoid, a posterior ethmoid
-    cell) and must not carry the nasopharynx's veto. Connectivity is judged in
-    ``air`` restricted to the half-space the merge zone spans, not in the
-    merge zone alone: the zone is built on nasal-box air while the strip's
-    airway carries the glued pharynx behind the box, where the opening is
-    (THCA: the zone never touched the opening and the veto fell back whole).
-    If no part touches the opening the zone is returned untouched with a
-    WARN: losing the veto would let the dead-end test strip the nasopharynx,
-    which is worse than keeping a sphenoid.
+    detour(v) = d(v, nares) + d(v, outlet) - shortest nares->outlet length,
+    geodesic inside ``air``. Zero on the shortest route, small across the
+    nasopharynx (THCA core: median 7 mm, p90 20), large inside a sphenoid
+    (median 44 mm, minimum 14 at its neck). Applied only inside the merge zone:
+    the anterior cavity's contralateral side is also a long "detour" (the
+    reason the old through-path strip failed), and it is judged by the
+    dead-end test, not by this.
     """
     notes: list[str] = []
     merge_zone = merge_zone.astype(bool)
     if not merge_zone.any():
         return merge_zone, notes
-    zone = merge_zone
-    if air is not None:
-        air = air.astype(bool)
-        y_m = np.where(merge_zone)[1]
-        y_a = np.where(air)[1]
-        idx = np.arange(air.shape[1])[None, :, None]
-        if y_m.mean() >= y_a.mean():          # posterior is high y
-            zone = air & (idx >= int(y_m.min()))
-        else:
-            zone = air & (idx <= int(y_m.max()))
-        zone |= merge_zone
-    lab, n = ndi.label(zone, np.ones((3, 3, 3), dtype=bool))
-    hit = np.unique(lab[zone & opening.astype(bool)])
-    hit = hit[hit > 0]
-    if hit.size == 0:
-        notes.append("WARN: merge zone does not touch the posterior opening; "
-                     "keeping the whole half-space as nasopharynx")
+    d_ant = _geodesic_from_terminal(air, ant, edt, spacing_xyz)
+    d_post = _geodesic_from_terminal(air, post, edt, spacing_xyz)
+    tot = d_ant + d_post
+    finite = air & np.isfinite(tot)
+    if not finite.any():
+        notes.append("WARN: nares and outlet are not connected; whole merge zone vetoed")
         return merge_zone, notes
-    kept = np.isin(lab, hit)
-    dropped = merge_zone & ~kept
-    if dropped.any():
-        notes.append(
-            f"merge zone: {int(n)} air parts behind the landmark, "
-            f"{hit.size} reach the opening; {dropped.sum() * vox_ml:.1f} mL "
-            f"behind the landmark is not nasopharynx and may be stripped")
-    return kept, notes
+    shortest = float(tot[finite].min())
+    detour = np.where(finite, tot - shortest, np.inf)
+    veto = merge_zone & (detour <= max_detour_mm)
+    beyond = merge_zone & ~veto
+    notes.append(
+        f"nasopharynx veto: {veto.sum() * vox_ml:.1f} mL of the {merge_zone.sum() * vox_ml:.1f} mL "
+        f"merge zone lies within {max_detour_mm:.0f} mm detour of the through-route "
+        f"({shortest:.0f} mm); {beyond.sum() * vox_ml:.1f} mL behind the landmark is "
+        "off the route and eligible for the dead-end test")
+    return veto, notes
+
+
+def _geodesic_from_terminal(air, terminal, edt, spacing_xyz):
+    """Geodesic distance from the widest voxel of a terminal (an opening)."""
+    if not terminal.any():
+        return np.full(air.shape, np.inf, dtype=np.float64)
+    masked = np.where(terminal, edt, -1.0)
+    seed = np.unravel_index(int(np.argmax(masked)), air.shape)
+    return geodesic_distance_mm(air, tuple(int(v) for v in seed), spacing_xyz)
 
 
 def dead_end_sinus_strip(
@@ -576,20 +587,20 @@ def dead_end_sinus_strip(
     # openings, and a sinus must not touch them either.
     terminal = terminal | ant_slab | post_slab
     # merge_zone arrives as a posterior HALF-SPACE, which holds more than the
-    # nasopharynx: the sphenoid sits behind the choanae too, and the veto handed
-    # it back to the flow domain (THCA: 9.1 mL, both sphenoids, inside
-    # passage_lumen). Narrowing the veto by calibre ("half-space that is not
-    # itself behind a neck") was tried and REJECTED -- it carved the nasopharynx
-    # (bodies bounded at 6.5-11.5 mm openings). The nasopharynx is instead
-    # defined by CONNECTIVITY: the part of the half-space that reaches the
-    # posterior opening without leaving the half-space. The sphenoid's only air
-    # route to the nasopharynx runs forward through its ostium into the nasal
-    # cavity, in front of the landmark, so it is not connected inside the
-    # half-space and loses the veto; the nasopharynx contains the opening and
-    # keeps it whole, with no calibre judgement anywhere.
-    merge_zone, mz_notes = merge_zone_reaching_opening(merge_zone, post | post_slab, vox_ml, air=air)
+    # nasopharynx: the sphenoid sits behind the choanae too, and a whole-zone
+    # veto handed it back to the flow domain (THCA: 8.9 mL core). Narrowing
+    # the veto by calibre ("not itself behind a neck") was tried and REJECTED --
+    # it carved the nasopharynx, which IS a roomy chamber behind necks at both
+    # ends (choanae in front, larynx behind). Connectivity inside the half-space
+    # cannot separate them either: the sphenoethmoidal recess lies behind the
+    # landmark too. What separates them is the ROUTE: the nasopharynx is on the
+    # way from the nares to the outlet, the sphenoid is a detour off it. The veto
+    # is merge-zone air within NASOPHARYNX_DETOUR_MAX_MM of the through-route,
+    # and a basin is passage when most of it is vetoed, sinus when most of it is
+    # not -- a sphenoid basin touches the veto only at its neck.
+    veto, mz_notes = nasopharynx_veto(air, merge_zone, ant, post, edt, spacing_xyz, vox_ml)
     notes.extend(mz_notes)
-    behind = air & (bott > 0) & (edt > SINUS_SEED_RATIO * bott) & ~merge_zone
+    behind = air & (bott > 0) & (edt > SINUS_SEED_RATIO * bott) & ~veto
     struct = np.ones((3, 3, 3), dtype=bool)
     lab, n = ndi.label(behind, struct)
     if n == 0:
@@ -602,7 +613,7 @@ def dead_end_sinus_strip(
         return air.copy(), np.zeros_like(air), notes
     corridor = air & (bott > 0) & (edt <= SINUS_CORRIDOR_RATIO * bott)
     markers = np.zeros(air.shape, dtype=np.int32)
-    markers[corridor | terminal | merge_zone] = 1
+    markers[corridor | terminal | veto] = 1
     for k, old in enumerate(keep, start=2):
         markers[lab == old] = k
     try:
@@ -617,8 +628,8 @@ def dead_end_sinus_strip(
         basin = air & (ws == k)
         if not basin.any() or basin.sum() * vox_ml < SINUS_MIN_BODY_ML:
             continue
-        if (basin & terminal).any() or (basin & merge_zone).any():
-            n_rej += 1  # reaches an opening or the nasopharynx -> passage
+        if (basin & terminal).any() or (basin & veto).sum() > VETO_REJECT_FRAC * basin.sum():
+            n_rej += 1  # reaches an opening, or is mostly on the through-route -> passage
             continue
         sinus |= basin
         n_kept += 1
@@ -630,7 +641,7 @@ def dead_end_sinus_strip(
     notes.append(
         f"dead-end strip: {len(keep)} seeds, {n_kept} sinus / {n_rej} rejected; "
         f"sinus={sinus.sum() * vox_ml:.1f} mL passage={passage.sum() * vox_ml:.1f} mL "
-        f"(merge_zone={merge_zone.sum() * vox_ml:.1f} mL)"
+        f"(merge_zone={merge_zone.sum() * vox_ml:.1f} mL, veto={veto.sum() * vox_ml:.1f} mL)"
     )
     return passage, sinus, notes
 
