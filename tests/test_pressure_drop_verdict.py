@@ -100,3 +100,27 @@ def test_large_wobble_is_not_settled(tmp_path):
     right = [6.8, 7.3, 6.7, 7.2, 6.6, 7.3]
     with pytest.raises(ValueError, match="WOBBLES"):
         pressure_drop_verdict(_case(tmp_path, left, right))
+
+
+def test_residual_control_stop_is_recorded_and_settles_with_few_samples(tmp_path):
+    # CQ500CT390 on the sinus-free domain: simpleFoam tripped residualControl at
+    # 250, five samples, too few to judge drift. The solver's own verdict is
+    # recorded instead of leaving the reader with a nan.
+    flat = [10.0, 10.02, 10.01, 10.0, 10.01]
+    root = _case(tmp_path, flat, flat)
+    (root / "log.simpleFoam").write_text(
+        "Time = 250\n\nSIMPLE solution converged in 250 iterations\n\nEnd\n", encoding="utf-8")
+    v = pressure_drop_verdict(root)
+    assert v["stable"]
+    assert v["converged_by_residual"] is True
+    assert v["converged_at_iteration"] == 250
+    assert v["drift_rel_change"] != v["drift_rel_change"]  # nan: 5 samples < 2 windows
+
+
+def test_run_that_hit_its_cap_is_not_marked_converged(tmp_path):
+    flat = [10.0, 10.02, 10.01, 10.0, 10.01, 10.0]
+    root = _case(tmp_path, flat, flat)
+    (root / "log.simpleFoam").write_text("Time = 400\n\nEnd\n", encoding="utf-8")
+    v = pressure_drop_verdict(root)
+    assert v["converged_by_residual"] is False
+    assert v["converged_at_iteration"] is None

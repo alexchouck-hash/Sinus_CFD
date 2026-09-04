@@ -162,7 +162,19 @@ def pressure_drop_verdict(foam_root: Path) -> dict[str, Any] | None:
         "drift_rel_change": drift_worst,
         "stability_samples": n,
         "stable": False,
+        "converged_by_residual": False,
+        "converged_at_iteration": None,
     }
+    # simpleFoam stops early only when every residual is under residualControl;
+    # record that, because a run cut at 250 has too few samples to judge drift
+    # and the nan would otherwise read as "unknown" when the solver knew.
+    log = foam_root / "log.simpleFoam"
+    if log.is_file():
+        m = re.search(r"SIMPLE solution converged in (\d+) iterations",
+                      log.read_text(encoding="utf-8", errors="replace"))
+        if m:
+            out["converged_by_residual"] = True
+            out["converged_at_iteration"] = int(m.group(1))
     drift_ok = (drift_worst != drift_worst) or drift_worst <= DP_DRIFT_MAX_REL  # nan: too few samples to judge drift
     wobble_ok = worst <= DP_WOBBLE_MAX_REL
     out["stable"] = bool(drift_ok and wobble_ok)
@@ -941,9 +953,14 @@ def import_openfoam_to_grid(
             "pressure-drop convergence UNVERIFIED for this import."
         )
     else:
+        d = pressure_drop["drift_rel_change"]
+        drift_txt = "n/a (too few samples)" if d != d else f"{100 * d:.2f}%"
+        conv = (f"solver converged by residualControl at iteration "
+                f"{pressure_drop['converged_at_iteration']}; "
+                if pressure_drop.get("converged_by_residual") else "")
         notes.append(
-            f"Pressure drop settled: drift "
-            f"{100 * pressure_drop['drift_rel_change']:.2f}%, wobble "
+            f"Pressure drop settled: {conv}drift "
+            f"{drift_txt}, wobble "
             f"{100 * pressure_drop['wobble_rel_change']:.2f}% over "
             f"the last {pressure_drop['stability_samples']} samples. "
             f"dP={pressure_drop['dp_pa']:.2f} Pa at "
