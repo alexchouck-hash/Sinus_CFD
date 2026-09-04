@@ -36,6 +36,7 @@ def _case(tmp_path):
         d = tmp_path / name
         d.mkdir()
         _u_field(d / "U", n)
+        (d / "p").write_text("solved", encoding="utf-8")   # a solve writes p; U alone is not one
     (tmp_path / "constant").mkdir()
     (tmp_path / "system").mkdir()
     return tmp_path
