@@ -494,6 +494,13 @@ def refine_frontal_by_antral_roof(
         return recs
     ssup = 1.0 if superior_is_high_z else -1.0
     anchor_ids = {id(r) for r in anchors}
+    # The frontal sinus is in FRONT of the antra; the sphenoid is above the
+    # roof too, but behind them. Height alone renamed VH male's 4.47 mL
+    # midline sphenoid "frontal" (90% above the roof). A body no further
+    # forward than the most posterior antrum is not frontal.
+    anchor_post = [float(a.get("frac_posterior")) for a in anchors
+                   if a.get("frac_posterior") is not None]
+    post_limit = max(anchor_post) if anchor_post else None
     for r in recs:
         if id(r) in anchor_ids:
             continue  # an anchor defines the roof; it cannot sit above it
@@ -533,6 +540,15 @@ def refine_frontal_by_antral_roof(
                 r["name"] = "complex"
                 r["complex_reason"] = "maxillary/ethmoid/sphenoid air not separable at this resolution"
                 continue
+        behind_antra = (post_limit is not None and r.get("frac_posterior") is not None
+                        and float(r["frac_posterior"]) > post_limit)
+        if frac >= FRONTAL_ABOVE_ANTRAL_ROOF_FRAC and r["name"] != "frontal" and behind_antra:
+            if notes is not None:
+                notes.append(
+                    f"kept {r['name']} {r['side']} ({r['volume_ml']:.2f} mL): above the "
+                    f"antral roof but behind the antra (posterior {r['frac_posterior']:.2f} "
+                    f"> {post_limit:.2f}) -- not frontal")
+            continue
         if frac >= FRONTAL_ABOVE_ANTRAL_ROOF_FRAC and r["name"] != "frontal":
             if notes is not None:
                 notes.append(

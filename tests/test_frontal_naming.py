@@ -166,3 +166,28 @@ def test_a_small_body_with_antral_level_air_is_not_frontal():
     out = refine_frontal_by_antral_roof(recs, lab, True, notes)
     by_id = {r["body_ids"][0]: r for r in out}
     assert by_id[3]["name"] != "frontal", by_id[3]
+
+
+def test_a_high_body_behind_the_antra_is_not_renamed_frontal():
+    """VH male: a 4.47 mL midline sphenoid, 90% above the antral roof, is
+    behind both antra. Height alone called it frontal."""
+    lab, recs = _scene()
+    for r in recs[:2]:
+        r["frac_posterior"] = 0.45
+    recs[2]["name"] = "sphenoid"
+    recs[2]["frac_posterior"] = 0.85
+    notes = []
+    out = refine_frontal_by_antral_roof(recs, lab, True, notes)
+    by_id = {r["body_ids"][0]: r for r in out}
+    assert by_id[3]["name"] == "sphenoid", by_id[3]
+    assert any("behind the antra" in n for n in notes), notes
+
+
+def test_a_high_body_in_front_of_the_antra_is_still_renamed_frontal():
+    lab, recs = _scene()
+    for r in recs[:2]:
+        r["frac_posterior"] = 0.45
+    recs[2]["frac_posterior"] = 0.20
+    out = refine_frontal_by_antral_roof(recs, lab, True, [])
+    by_id = {r["body_ids"][0]: r for r in out}
+    assert by_id[3]["name"] == "frontal", by_id[3]
