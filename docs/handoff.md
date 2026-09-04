@@ -359,9 +359,9 @@ the 2026-08-24/30 fixes.
 | 1 | Import CT + auto-segment | **works** | `qa_patency.py --all`: flow path PASS on all 5 audited cases (VH F, VH M, THCA, CQ500CT105, CQ500CT390). Bounded domain, L/R split, sinus bodies named. |
 | — | Operator labelling | **works, low yield** | 22 ostium sheets marked. Ostium location validated to **2.5 mm median** — at the noise floor, since two operator marks of the *same* ostium differ by 4.5 mm. |
 | — | Neural net | **works, wrong target** | nnU-Net Dataset501 airway Dice **0.885** vs classical 0.260. But **0/130** NasalSeg cases connect both cavities to the nasopharynx, so the labels cannot teach CFD topology. Not a retraining problem. |
-| 2 | Mesh boundary | **works (was silently broken until 2026-08-30)** | `export_openfoam_geometry.py` writes a solid air body plus open inlet/outlet/wall STL patches. Foam cases for VH F, VH M, THCA, P001, CQ500CT390. Re-exporting CQ500CT390 produced a **6-face, 0.00 mL** "watertight" body against a 38.91 mL mask and reported it as good — see §9d. Now guarded: the surface is compared against the voxel mask and the export raises if they are >15% apart. |
+| 2 | Mesh boundary | **works; sinus-free at every layer since 2026-09-03** | `export_openfoam_geometry.py` writes a solid air body plus open inlet/outlet/wall STL patches. Foam cases for VH F, VH M, THCA, P001, CQ500CT390. Re-exporting CQ500CT390 produced a **6-face, 0.00 mL** "watertight" body against a 38.91 mL mask and reported it as good — see §9d. Now guarded: the surface is compared against the voxel mask and the export raises if they are >15% apart. |
 | 3 | Mesh refinement | **works** | snappyHexMesh + layers. `checkMesh` **Mesh OK** on 3 of 4; non-orthogonality max ~64.5, average 13.4–14.3. Independence study on P001 at 74.9k / 259k / 817k cells → R = 0.0541 / 0.0522 / **0.0520** Pa·s/mL. 259k is independent to 0.3%. |
-| 4 | Airflow nares → trachea | **works end to end on the current segmentation** | CQ500CT390 (living, 0.38 mm) went CT → segmentation → export → snappyHexMesh (312,652 cells) → simpleFoam → import on 2026-09-01: dP **7.87 Pa** at 18 L/min, R 0.0262 Pa·s/mL, per-side 7.41 / 8.33 Pa, inlet pressure flat to 0.26%, outlet flux 0.01% off the imposed value. Solver is OpenFOAM 2412 in WSL Ubuntu 24.04 (Docker Desktop is wedged — see §9e). The four July solves are still stale against their August masks; THCA's never settled at all. |
+| 4 | Airflow nares → trachea | **works end to end on sinus-free domains** | CQ500CT390 (living, 0.38 mm) went CT → segmentation → export → snappyHexMesh (312,652 cells) → simpleFoam → import on 2026-09-01: dP **7.87 Pa** at 18 L/min, R 0.0262 Pa·s/mL, per-side 7.41 / 8.33 Pa, inlet pressure flat to 0.26%, outlet flux 0.01% off the imposed value. Solver is OpenFOAM 2412 in WSL Ubuntu 24.04 (Docker Desktop is wedged — see §9e). The four July solves are still stale against their August masks; THCA's never settled at all. |
 | 5 | Sinus drainage | **works** | Per-sinus volume, ostium calibre and drains yes/no. Calibres 1.46–2.83 mm, inside the 0.2–6 mm anatomical range. Where no ostium resolves, `probable_ostium` returns a labelled hypothesis, never a number. |
 | 6 | Seeker paths to ostia | **centreline only** | `compute_surgical_guidance.py` produces naris→frontal paths and a high-\|u\| corridor. It models **no instrument geometry at all** — no diameter, no curvature, no bend, no clearance test. |
 | 7 | Virtual surgery | **geometry only** | `virtual_surgery.py` edits the airway and reports pre/post volume, MCA and L/R ratio. It writes an edited label so CFD *could* re-run; no pre/post CFD comparison has been run. |
@@ -396,21 +396,19 @@ iteration 50. So `endTime` is capped at 400 and convergence is judged by
 dP, per-side split and resistance and **raises** if the inlet pressure moved
 more than 1% over the last 3 samples.
 
-Re-solved on the current segmentation (2026-09-03), choanal outlet on every
-whole-head case, judged by drift / wobble / outlet patch:
+Re-solved on the sinus-free domains (2026-09-03, evening), choanal outlet on
+every whole-head case, judged by drift / wobble / outlet patch:
 
-| case | dP (Pa) | L / R (Pa) | R (Pa·s/mL) | drift | wobble | outlet | verdict |
-|------|---------|------------|-------------|-------|--------|--------|---------|
-| CQ500CT390 | 7.87 | 7.41 / 8.33 | 0.0262 | 0.05% | 0.26% | 1.8× | settled |
-| P001 | 16.72 | 21.99 / 11.46 | 0.0557 | 0.16% | 0.51% | 3.0× | settled — July gave 16.49 / 0.0550, agreement to 1.4% across the solver change |
-| VH male | 4.70 | 3.88 / 5.53 | 0.0157 | 0.38% | 0.85% | 2.5× | settled |
-| THCA | 15.51 | 14.76 / 16.27 | 0.0517 | 0.08% | 1.53% | 3.5× | settled at 800 |
-| VH female | — | — | — | 0.52% | 2.06% | **40.6×** | **refused — choked outlet** |
+| case | cells | max skew | dP (Pa) | L / R (Pa) | R (Pa·s/mL) | drift | wobble | outlet | verdict |
+|------|-------|----------|---------|------------|-------------|-------|--------|--------|---------|
+| CQ500CT390 | 358,234 | 4.86 | 20.55 | 19.37 / 21.73 | 0.0685 | 0.04% | 0.03% | 1.8× | settled |
+| P001 | 257,780 | 3.07 | 16.72 | 21.99 / 11.46 | 0.0557 | 0.16% | 0.51% | 3.0× | settled |
+| VH male | 271,010 | 2.67 | 5.97 | 4.53 / 7.40 | 0.0199 | 0.57% | 1.22% | 2.8× | settled |
+| THCA | 237,438 | 3.27 | 14.42 | 13.72 / 15.13 | 0.0481 | 0.09% | 0.16% | 3.4× | settled |
+| VH female | 162,566 | 4.56 | — | — | — | — | — | — | **refused — choked: max face speed is 9x the patch mean** |
 
-Every July number is superseded. VH female's 1 mm domain is the narrowest in
-the set (3.1 mm² minimum section, 8.4% smoothing shrink) and its outlet patch
-is choked even at the choana; a refused number is the right output for it.
-See §9g.
+Every earlier number, July and this morning's, is superseded: those
+domains held all of their sinus air (§9h). See §9g for the outlet story.
 
 **Magnitudes are not calibrated.** Physiological nasal resistance at 300 mL/s
 is roughly 0.1–0.3 Pa·s/mL; these sit 4–500× below it, and the two 1 mm
@@ -516,6 +514,61 @@ took July's `500/` over today's `400/`, and OpenFOAM writes a new history to
 time directories, `postProcessing/` and `log.*` before a solve. July results
 are snapshotted under the session scratchpad `july_foam/`.
 
+### 9h. The domain was never sinus-free (found and fixed 2026-09-03)
+
+Measured on the files each solve was built from, every CFD domain ever meshed
+here held **all** of its stripped sinus air: VH male 30.9 of 30.9 mL, THCA 36.3
+of 36.3, CQ500CT390 5.6 of 5.6. The roadmap forbids this (goal 1). Four
+re-entry points, each found by measuring the array the next stage received
+rather than trusting the previous stage's name, each fixed with a guard that
+refuses to pass on a contaminated array:
+
+1. **`analyze_passage` never read the stripped passage.** The line said
+   `...passage_lumen.nrrd).is_file() and False:` — hard-disabled — so it started
+   from the raw airway and then overwrote both `airway_mask.nrrd` and
+   `passage_lumen.nrrd` with its own lumen (which also put the drainage audit
+   on a different mask from the sinus bodies: 6.63 mm "maxillary ostia" on VH
+   male, real 2.83). Now starts from the stripped passage, says which lumen it
+   used, never writes `airway_mask.nrrd`.
+2. **The nostril-tunnel extension refilled the sinuses.** A stripped sinus is
+   a 3-D hole in the passage; the whole-lumen `binary_fill_holes` meant to
+   close pits in the painted tunnels put 93–97% of each body back (CQ500CT390:
+   0.29 → 5.60 mL). Closing and fill are confined to one voxel around the
+   paint; the stripped air is passed in as `exclude`; the analysis raises
+   before writing at >5%.
+3. **The export merged them back by default.** `include_sinuses=True` merged
+   every interior-air component touching the passage — the sinuses at their
+   ostia (VH male: 47.6 mL clean in, 75.5 mL out with 23.55 of 23.5 mL back).
+   Sinus-free is the default; `--include-sinuses` is the opt-in; the export
+   refuses at >5%.
+4. **The mesh seal refilled them after the export's own guard passed.** Two
+   whole-solid `binary_fill_holes` passes in `seal_solid_for_watertight_mesh`
+   (VH male: closing 0.91 mL, first fill 23.55 mL). The seal takes `exclude`;
+   the guard moved onto the *sealed* solid that is written and meshed.
+
+And a fifth, of a different kind: with the sinuses out, they are **cavities**
+in the solid, marching cubes gives an outer shell plus one inner shell each,
+and the mesher kept only the largest component — the surface wrapped the
+sinuses back in with no inner wall (VH male: 74.1 mL enclosed vs 51.8 voxel;
+inner shells 13.6 + 9.5 mL). Every closed shell above 20 mm³ is kept now,
+cavity walls are oriented away from the fluid, and the mesh-vs-voxel guard
+(added for the 6-face collapse) is what caught it. VH male's surface now
+encloses 49.23 mL against 51.82; CQ500CT390 33.17 against 33.31.
+
+CQ500CT390 measures what that fifth one was worth: on the export whose
+sinuses were wrapped back in without inner walls, simpleFoam tripped
+residualControl at 250 and reported dP 8.02 Pa (R 0.0267). With the inner
+walls back, 20.55 Pa (R 0.0685). A converged solve on the wrong domain is
+still the wrong number; the mesh-vs-voxel guard is what stands between them.
+
+Also fixed on the way: `_merge_split_sinuses` glued bodies 104 mm apart
+(previous commit); air more than 45 mm below the antral roof is not a sinus
+(VH male's neck and skull-base "maxillary L" bodies); a stale
+`*_solid_watertight.flag` let a chain whose export had just been refused fall
+through to solving the previous export.
+
+CQ500CT390: 6.79 → 4.86 max skewness, two faces remain, both now on the wall (one was on the left-nostril cap); VH female still one wall face at 4.56. The residual is the cap/wall corner geometry, not the layer template. VH female is refused at the choana regardless: the outlet patch's hottest face runs 9× its mean (limit 5×), so on that 1 mm cadaver the outlet section, not the airway, sets the pressure drop; the importer now leaves `<case>_flow_refused.json` with that reason and no field.
+
 ### Queue
 
 Tagged by what unblocks each item: **[CODE]** implementable now, **[LABEL]**
@@ -524,14 +577,8 @@ needs a better scan.
 
 **Blocking the end-to-end claim**
 
-1. **[CFD]** Calibrate magnitudes. Resistances are 4–500× below physiological.
-   First suspects, in order: planar nostril caps (no entrance loss), the nasal
-   valve unresolved at 1 mm, laminar treatment. Validate against a published
-   rhinomanometry case before any number leaves the viewer unlabelled.
-2. **[CODE]** The two highly-skew faces sit where the flat inlet cap meets the
-   curved wall. They pin the p residual floor at ~4e-3. A cap that follows the
-   lumen cross-section, or a short straight inlet extrusion, would remove them
-   and likely let `residualControl` fire on its own.
+1. **[CFD]** ~~Calibrate magnitudes~~ — **closed by evidence, one follow-up.** The "4–500× below physiological" compared a rest-breathing CFD resistance against rhinomanometry, which is measured at ~150 Pa driving pressure, ten times quiet breathing. The July sweep on P001 (`foam/P001/sweep`, `flow_sweep_report.py`) already answers it: R = 0.052 / 0.098 / 0.156 / 0.229 Pa·s/mL at 18 / 36 / 60 / 90 L/min, ΔP = 15.7 / 58.7 / 156 / 344 Pa — ΔP ∝ Q^1.9, the expected inertial nonlinearity. At 60 L/min (ΔP ≈ 156 Pa, the rhinomanometry driving pressure) R = 0.156, inside the published 0.10–0.35 band. The solver is laminar at ν = 1.5e-5, flow-rate inlets, p = 0 outlet; Re ≈ 300–1300 at rest, where laminar is defensible. **Follow-up:** re-run the sweep on the rebuilt, sinus-free P001 and quote R at 18 and 60 L/min side by side wherever a resistance is shown. **Done 2026-09-03 on the sinus-free P001** (`foam/P001_sweep`): R = 0.0557 / 0.1026 / 0.1685 / 0.2387 Pa·s/mL at 18 / 36 / 60 / 90 L/min, ΔP = 16.7 / 61.5 / 168.5 / 358 Pa, at ρ = 1.2 kg/m³ — the one constant every reporter now uses (the July figures above were at 1.14, which is why they read 5% lower). R at 60 L/min = 0.169, inside the band; the 18 L/min row reproduces the import's 16.72 Pa exactly.
+2. **[CODE]** The two highly-skew faces at the inlet-cap/wall corner. The layer template now names the open ports with `nSurfaceLayers 0` and adds `slipFeatureAngle 30` so the wall's prism stack can slide along a cap instead of pinning to it. Harmless on a clean case (THCA: Mesh OK, max skewness 3.23 before and after). CQ500CT390: 6.79 → 4.86 max skewness, two faces remain, both now on the wall (one was on the left-nostril cap); VH female still one wall face at 4.56. The residual is the cap/wall corner geometry, not the layer template. VH female is refused at the choana regardless: the outlet patch's hottest face runs 9× its mean (limit 5×), so on that 1 mm cadaver the outlet section, not the airway, sets the pressure drop; the importer now leaves `<case>_flow_refused.json` with that reason and no field.
 
 **Goal 1/3 correctness**
 
@@ -540,45 +587,32 @@ needs a better scan.
    nasopharynx. Needs a merge zone bounded by the choanal aperture. Narrowing the
    veto to "half-space not itself behind a neck" was tried and **rejected** — it
    carved the nasopharynx instead (bodies bounded at 6.5–11.5 mm openings).
-4. **[CODE]** Two non-sinuses still named `maxillary L` on VH male (neck air
-   1.89 mL, skull-base air 0.50 mL). The antral-roof anchor already measures them
-   at 58 and 109 mm below the roof against −20.2 mm for the lowest real sinus.
-   One threshold, not yet applied.
-5. **[CODE]** CQ500CT390's right maxillary antrum is never found. Its left is
+4. **[CODE]** CQ500CT390's right maxillary antrum is never found. Its left is
    found at 1.36 mL. Likely opacified or below the FOV — screen before fixing.
-6. **[DATA]** CQ500CT390's naris ports are not at the nostrils. The FOV is
+5. **[DATA]** CQ500CT390's naris ports are not at the nostrils. The FOV is
    brain-framed and the nostrils sit at or below its bottom edge, so the ports
    fall back to the airway's anterior opening ~33 mm higher. Flow path still
    passes, but "flow from the nares" is not literally true for that case.
 
 **Goal 4 — the biggest gap**
 
-7. **[CODE]** Instrument-fit checking does not exist. A centreline is not a path.
+6. **[CODE]** Instrument-fit checking does not exist. A centreline is not a path.
    Needs clearance against each tool's real geometry: frontal seeker **2 mm
    diameter** curved, maxillary and sphenoid seekers with their own curvature,
    ET seeker ~4 in shaft with a **45° bend** and **18.5 mm** working tip past the
    bend. This is a geometric feasibility problem, not a shortest-path problem.
-8. **[LABEL]** Frontal and sphenoid ostia resolve on **no** usable case — those
+7. **[LABEL]** Frontal and sphenoid ostia resolve on **no** usable case — those
    recesses are sub-millimetre. Operator marks on the frontal recess would give
    `probable_ostium` something to be scored against.
 
 **Goal 5**
 
-9. **[CFD]** Run the pre/post pair through CFD. `virtual_surgery.py` already
+8. **[CFD]** Run the pre/post pair through CFD. `virtual_surgery.py` already
    writes the edited label; nothing has been solved on one.
 
 **Data**
 
-10. **[DATA]** 421 CQ500 scans still unscreened for a patent airway. `data/incoming`
-    is now 32.0 GB after deleting 625 thick series (6.03 GB, all ≥3 mm). The
-    screen must be re-run — its `internal_air_ml` used the same convex hull that
-    counted room air as internal, so old verdicts are inflated and were never
-    persisted.
-11. **[CODE]** `assess_dicom_incoming.eff_spacing_mm` prefers DICOM
-    `SpacingBetweenSlices` (0018,0088), which CQ500 fills with **20.0 mm for a
-    series named CT 0.625mm**. Use `SliceThickness` (0018,0050). Also: CQ500
-    filenames are **not in slice order**, so any z-step measured from consecutive
-    files by name is wrong — a genuine 0.625 mm series measures as 3.75 mm.
+9. **[DATA]** The corrected screen (`assess_dicom_incoming.py`: SliceThickness, hole-filled silhouette, `--report`/`--csv`) is running over `data/incoming` and persisting every verdict to `outputs/incoming_screen.json`. Final tally 2026-09-03: 411 scans measured, 381 viable (346 at 0.62 mm, 31 at 1.0 mm; median 70 mL internal air); 29 rejected for too few slices, 1 for no internal air. Next: promote the viable cases to NRRD and run `qa_patency` on each.
 
 
 ---
