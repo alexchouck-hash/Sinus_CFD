@@ -251,12 +251,17 @@ def read_foam_label_list(path: Path) -> np.ndarray:
     return np.asarray([int(x) for x in nums], dtype=np.int64)
 
 
-# Largest face speed on the outlet patch, as a multiple of the patch mean. A
-# healthy outlet cap sees 2.5-3.5x (THCA, CQ500CT390, P001, both Visible Human
-# heads at the choana). The choked caudal trachea caps saw 57x (VH female) and
-# 8x (VH male, which also never settled). 10x sits between the populations with
-# the marginal case on the failing side.
-OUTLET_HOT_FACE_MAX_RATIO = 10.0
+# Largest face speed on the outlet patch, as a multiple of the patch mean.
+# Measured populations, every solve in this repo:
+#   clean caps      1.8, 2.5, 3.0, 3.5x      (CQ500CT390, VH male, P001, THCA)
+#   choked caps     8x, 8.9x, 41x, 57x        (VH male old trachea -- never settled;
+#                                              VH female choana on the sinus-free
+#                                              domain -- 119 faces above 5x, dP 434 Pa;
+#                                              VH female choana at 800 iters; VH
+#                                              female old trachea)
+# 5x separates them with the nearest members 1.4x apart on either side. The
+# earlier 10x let the 8.9x case through and reported its 434 Pa as settled.
+OUTLET_HOT_FACE_MAX_RATIO = 5.0
 
 
 def outlet_patch_velocity_stats(u_path: Path, patch: str) -> dict[str, float] | None:
